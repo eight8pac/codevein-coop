@@ -86,12 +86,13 @@ local function trueDeadAddr()
     if not f then return nil end
     local t = f:read("*a") or ""; f:close()
     local v = tonumber(t:match("%x+") or "", 16)
-    return (v and v ~= 0) and v or nil
+    return (v and v ~= 0) and v or nil, t:match("%x+%s+(%a)")
 end
 -- A marker left in the file from an earlier run made a join look like "pawn removed after a true death" and crashed the guest
 -- (2026-10-28 10:30). Clear it at load, and accept "no pawn" only after we saw our own pawn truly die in this run.
 do local f = io.open(WIN64 .. "\\plugins\\CoopNative.truedead", "w") if f then f:write("0"); f:close() end end
 local sawOwnTrueDeath, lastWorldName = false, nil
+local lastMineAddr, lastFallAt = nil, -1000
 local TRUEDEAD_FILE = WIN64 .. "\\plugins\\CoopNative.truedead"
 local function isTrueDead(helper, p)
     if try(function() return helper:IsDeath(p) end) then return true end
@@ -129,6 +130,23 @@ local function fieldWindow(gs, helper)
             sawOwnTrueDeath = false
             local f = io.open(TRUEDEAD_FILE, "w"); if f then f:write("0"); f:close() end
             log("keep dying: new world, pending true death forgotten")
+        end
+    end
+    -- Fall deaths (session 9): the host decides them and removes our pawn at once, and our own game never vetoed a death, so
+    -- there is no marker here. Our pawn vanishing in the same world within 10 s of falling fast counts as our true death (the host
+    -- waits 1.5 s, then plays the dissolve for 2.5 s before removing the body).
+    if keepDyingOn then
+        if valid(mine) then
+            local vz = try(function() return mine:GetVelocity().Z end)
+            if type(vz) == "number" and vz < -1200 then lastFallAt = os.clock() end
+            lastMineAddr = try(function() return mine:GetAddress() end)
+        elseif lastMineAddr then
+            if not sawOwnTrueDeath and os.clock() - lastFallAt < 10 and aliveOther then
+                sawOwnTrueDeath = true
+                local f = io.open(TRUEDEAD_FILE, "w"); if f then f:write(string.format("%X F", lastMineAddr)); f:close() end
+                log("keep dying: our pawn was removed right after a fall -> true death, spectating")
+            end
+            lastMineAddr = nil
         end
     end
     if keepDyingOn and valid(mine) and deadMine then
@@ -489,14 +507,32 @@ local function sendMenuClass()
     log(string.format("vestige menu: WDT_CheckpointMenu_C class at 0x%X sent to CoopNative", addr))
 end
 
+-- Vestige restoration with a session (vestige_keep=1, R4 stage 2): CoopNative answers "no session" to the restoration screen's
+-- IsCreateSession / GetOnlineOtherPlayerNum; Lua hands over that screen's class once ("restclass <hex>"), like the menu class.
+-- CoopNative.cmd holds one command, so wait while another one is still pending.
+local restClassSent = false
+local function sendRestoreClass()
+    if restClassSent or not iniHas("vestige_keep=1") then return end
+    local m = FindFirstOf("BP_BCRestorationUIComponent_C")
+    local cls = valid(m) and try(function() return m:GetClass() end) or nil
+    local addr = cls and try(function() return cls:GetAddress() end)
+    if not addr then return end
+    local pending = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "r")
+    if pending then pending:close(); return end
+    local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "w")
+    if c then c:write(string.format("restclass %X", addr)); c:close(); restClassSent = true end
+    log(string.format("vestige restoration: BP_BCRestorationUIComponent_C class at 0x%X sent to CoopNative", addr))
+end
+
 -- Keep a guest dying instead of dead (keep_dying=1, both PCs, R5 v2). Patching the guest's death sequence after a respawn left him
 -- without input (session 8), so CoopNative vetoes the final death for the characters listed in CoopNative.protect while the host
 -- lives: on the host the guests' pawns (the host decides e.g. fall deaths, TryExecuteDeath), on the guest his own pawn (his game
 -- decides an expired dying countdown itself, DeathProcess). The guest stays in the revivable dying state and his death sequence never
 -- starts. On the host's next Mistle rest every dying guest is set to full health (first revive attempt).
-local lastProtect, keepErr
+local lastProtect, keepErr, teleportErr
 local oldPawns = {}   -- {p, n, at}: dissolved pawns to remove after the respawn
-local trueDeadAt, pendingRespawn = {}, false
+local tdSeen, pendingRespawn = {}, false   -- tdSeen[addr] = {at, down}: first sighting of a true-death marker
+local guestFallAt = {}                     -- host: guest pawn address -> last time it fell fast (os.clock)
 local TRUEDEAD_PATH = WIN64 .. "\\plugins\\CoopNative.truedead"
 -- The revive window running out dissolves the character (bIsDisappearExpression; the ExecuteDisappearExpression thunk was not the
 -- path, session 8), and a guest revived after it stayed invisible on both PCs. Undo it on revival: switch the dissolve off (a
@@ -509,6 +545,87 @@ local function makeVisible(helper, p, who)
     local after = tostring(try(function() return p.bIsDisappearExpression end)) .. "/" .. tostring(try(function() return helper:IsVanish(p) end))
     log("keep dying: " .. who .. " make " .. name(p) .. " visible: disappear/vanish " .. before .. " -> " .. after ..
         " (multicast " .. tostring(a) .. ", flag " .. tostring(b) .. ", meshes " .. tostring(c) .. ")")
+end
+-- Group teleport v1 (group_teleport=1, host; session 9). The host teleports through his Mistle menu as usual; CoopNative notes
+-- RequestPlayerSpawnToCheckPoint in CoopNative.teleport. Once the host's new pawn is up (a new pawn, or 8 s at the latest), each
+-- guest with a living pawn gets a fresh pawn next to the host (RequestPlayerSpawn with the appear effect, as the group respawn)
+-- and his old pawn is removed 5 s later. A guest who is spectating stays so until the host's next rest.
+local TELEPORT_PATH = WIN64 .. "\\plugins\\CoopNative.teleport"
+do local f = io.open(TELEPORT_PATH, "r"); if f then f:close(); os.remove(TELEPORT_PATH) end end
+local pendingTp = nil   -- {at, oldHost, newSeenAt}
+-- Post-boss outro (session 9): hand CoopNative the DeferredTeleportDriver objects and the guests' pawns/controllers every 2 s
+-- (CoopNative.tpinfo), so its tpdump/tpfree commands work while the host hangs and Lua does not run.
+local lastTpInfo, tpInfoAt = nil, -1000
+local function sendTpInfo()
+    if os.clock() - tpInfoAt < 2 then return end
+    tpInfoAt = os.clock()
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not valid(gs) or try(function() return gs.Role end) ~= 3 then return end
+    local lines = {}
+    for _, d in ipairs(FindAllOf("DeferredTeleportDriver") or {}) do
+        local a = valid(d) and try(function() return d:GetAddress() end)
+        if a then lines[#lines + 1] = string.format("driver %X", a) end
+    end
+    for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+        if valid(c) and not try(function() return c:IsLocalController() end) then
+            local a = try(function() return c:GetAddress() end)
+            if a then lines[#lines + 1] = string.format("guest %X", a) end
+            local p = try(function() return c.Pawn end)
+            local pa = valid(p) and try(function() return p:GetAddress() end)
+            if pa then lines[#lines + 1] = string.format("guest %X", pa) end
+            local ps = try(function() return c.PlayerState end)
+            local psa = valid(ps) and try(function() return ps:GetAddress() end)
+            if psa then lines[#lines + 1] = string.format("guest %X", psa) end
+        end
+    end
+    local text = table.concat(lines, "\n")
+    if text == lastTpInfo then return end
+    lastTpInfo = text
+    local f = io.open(WIN64 .. "\\plugins\\CoopNative.tpinfo", "w"); if f then f:write(text); f:close() end
+    log("tp info: " .. #lines .. " line(s) for CoopNative (" .. text:gsub("\n", ", ") .. ")")
+end
+local function groupTeleport()
+    local f = io.open(TELEPORT_PATH, "r")
+    if f then
+        local what = f:read("*a") or ""; f:close(); os.remove(TELEPORT_PATH)
+        if not iniHas("group_teleport=1") then
+        elseif what:find("^start") then
+            local pc0 = localPC()
+            local m0 = valid(pc0) and try(function() return pc0.Pawn end) or nil
+            pendingTp = { at = os.clock(), oldHost = valid(m0) and try(function() return m0:GetAddress() end) or nil }
+            log("group teleport: host teleports, guests follow once the host has arrived")
+        elseif what:find("^arrived") and pendingTp then
+            pendingTp.arrivedAt = os.clock()
+            log("group teleport: host's characters re-spawned at the target")
+        end
+    end
+    if not pendingTp then return end
+    if os.clock() - pendingTp.at > 60 then log("group teleport: host did not arrive within 60 s, given up"); pendingTp = nil; return end
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not valid(gs) or try(function() return gs.Role end) ~= 3 then return end
+    local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+    local pc = localPC()
+    local mine = valid(pc) and try(function() return pc.Pawn end) or nil
+    if not valid(mine) or try(function() return helper:IsDeath(mine) end) or try(function() return helper:IsDying(mine) end) then return end
+    local addr = try(function() return mine:GetAddress() end)
+    -- arrived: CoopNative saw the characters re-spawn, and the host's pawn is a new one (the address alone changed during loading)
+    local arrived = pendingTp.arrivedAt and addr and addr ~= pendingTp.oldHost
+    if not arrived then return end
+    pendingTp.newSeenAt = pendingTp.newSeenAt or os.clock()
+    if os.clock() - pendingTp.newSeenAt < 3 then return end   -- let the host's area finish loading
+    pendingTp = nil
+    -- by remote controller: right after the teleport the host's old pawn still exists and was taken for a guest (spawned twice)
+    local n = 0
+    for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+        local p = valid(c) and not try(function() return c:IsLocalController() end) and try(function() return c.Pawn end) or nil
+        if valid(p) and name(p):find("BP_Player_C", 1, true) and not try(function() return helper:IsDeath(p) end) then
+            if respawnGuest(helper, p, mine, true) then
+                oldPawns[#oldPawns + 1] = { p = p, n = name(p), at = os.clock() }
+                n = n + 1
+            end
+        end
+    end
+    log("group teleport: " .. n .. " guest(s) brought to the host")
 end
 local function keepDying(rested)
     local list = {}
@@ -530,6 +647,8 @@ local function keepDying(rested)
                 for _, p in ipairs(others) do
                     local a = try(function() return p:GetAddress() end)
                     if a then list[#list + 1] = string.format("%X", a) end
+                    local vz = try(function() return p:GetVelocity().Z end)
+                    if a and type(vz) == "number" and vz < -1200 then guestFallAt[a] = os.clock() end
                 end
             end
         else
@@ -580,7 +699,8 @@ local function keepDying(rested)
     end
     -- host: after a true death the dying pawn could still be revived by the partner (IsNeverRevive is not asked, session 8) and it
     -- has dissolved anyway: remove it 3 s after the true death; the guest spectates without a pawn until our next rest
-    local td = trueDeadAddr()
+    local td, tdSrc = trueDeadAddr()
+    if not td then tdSeen = {} end
     if isHost and td and line ~= "0" then
         for _, p in ipairs(FindAllOf("BP_Player_C") or {}) do
             local a = valid(p) and name(p) ~= name(mine) and try(function() return p:GetAddress() end)
@@ -588,13 +708,35 @@ local function keepDying(rested)
                 -- 2026-10-28 10:44: Io revived him 2 s after the true death and the removal (then 3 s) deleted his living, controlled
                 -- pawn: his game crashed. Remove only a pawn that is still down, almost at once, and detach his controller first.
                 local down = try(function() return helper:IsDying(p) end) or try(function() return helper:IsDeath(p) end)
-                if not down then
-                    trueDeadAt[a] = nil
+                local st = tdSeen[a]
+                if not st then st = { at = os.clock(), down = down }; tdSeen[a] = st end
+                local function cancel(why)
+                    tdSeen[a] = nil
                     local f = io.open(TRUEDEAD_PATH, "w"); if f then f:write("0"); f:close() end
-                    log("keep dying: " .. name(p) .. " was revived before the body was removed; true death cancelled")
-                else
-                    trueDeadAt[a] = trueDeadAt[a] or os.clock()
-                    if os.clock() - trueDeadAt[a] > 0.5 then
+                    log("keep dying: " .. name(p) .. " " .. why)
+                end
+                -- session 9: a death request while standing (source T) is an enemy hit (he goes down right after; his true death
+                -- comes when the revive window runs out) or a fall (vanilla kills at once; the veto left him standing at the bottom)
+                local fall = false
+                if tdSrc == "T" then
+                    -- a fall only if we saw him falling fast just before; a hit that takes longer to put him down waits
+                    local fell = guestFallAt[a] and st.at - guestFallAt[a] < 4
+                    -- a fall can also leave him down (session 9: Io revived him in a pit), so after a fast fall "down" is a fall
+                    -- death too, at once; standing, wait 1.5 s as before
+                    if down and not fell then cancel("went down after the hit; true death when his revive window runs out")
+                    elseif fell and (down or st.dissolveAt or os.clock() - st.at > 1.5) then
+                        -- owner, session 9: vanishing on impact looked wrong; play the game's dissolve first (both PCs), then remove
+                        if not st.dissolveAt then
+                            st.dissolveAt = os.clock()
+                            local okd = pcall(function() p:Multicast_SetEnableDisappearExpression(true) end)
+                            log("keep dying: fall death of " .. name(p) .. " -> dissolve " .. tostring(okd) .. ", body removed in 2.5 s")
+                        elseif os.clock() - st.dissolveAt > 2.5 then fall = true end
+                    elseif not fell and os.clock() - st.at > 10 then cancel("death request without going down or falling; ignored") end
+                elseif not down then
+                    cancel("was revived before the body was removed; true death cancelled")
+                end
+                if fall or (tdSrc ~= "T" and tdSeen[a] and down and st.down) then
+                    if fall or os.clock() - st.at > 0.5 then
                         local un = false
                         for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
                             if valid(c) and not try(function() return c:IsLocalController() end) and try(function() return name(c.Pawn) end) == name(p) then
@@ -602,9 +744,9 @@ local function keepDying(rested)
                             end
                         end
                         local ok = pcall(function() p:K2_DestroyActor() end)
-                        log("keep dying: true death of " .. name(p) .. " -> unpossess " .. tostring(un) .. ", body removed " .. (ok and "ok" or "FAILED") .. "; back on the host's next rest")
+                        log("keep dying: " .. (fall and "fall death" or "true death") .. " of " .. name(p) .. " -> unpossess " .. tostring(un) .. ", body removed " .. (ok and "ok" or "FAILED") .. "; back on the host's next rest")
                         pendingRespawn = true
-                        trueDeadAt[a] = nil
+                        tdSeen[a] = nil
                         local f = io.open(TRUEDEAD_PATH, "w"); if f then f:write("0"); f:close() end
                     end
                 end
@@ -904,11 +1046,15 @@ LoopAsync(200, function()
         local okc, ec = pcall(combatProbe)
         if not okc and not combatErr then combatErr = true; log("combat probe ERROR " .. tostring(ec):sub(1, 160)) end
         pcall(sendMenuClass)
+        pcall(sendRestoreClass)
         local okc2, ec2 = pcall(probeCommands)
         if not okc2 then log("probe command ERROR " .. tostring(ec2):sub(1, 160)) end
         whoTick = whoTick + 1; if whoTick % 50 == 1 then pcall(whoIsWho) end
         local okr, er = pcall(groupRespawn, rested)
         local okk, ek = pcall(keepDying, rested)
+        pcall(sendTpInfo)
+        local okt, et = pcall(groupTeleport)
+        if not okt and not teleportErr then teleportErr = true; log("group teleport ERROR " .. tostring(et):sub(1, 160)) end
         if not okk and not keepErr then keepErr = true; log("keep dying ERROR " .. tostring(ek):sub(1, 160)) end
         if not okr and not respawnErr then respawnErr = true; log("group respawn ERROR " .. tostring(er):sub(1, 160)) end
     end)

@@ -40,6 +40,12 @@ Everything goes into `<game dir>\CodeVein\Binaries\Win64`.
                     switch partner is disabled there; level-up in progress (see Status)
    levelup_relay=1  host: apply a guest's level-up (sent as Server_AddExp(0) per level) to the host's copy of him
    vestige_menu=1   host only, research: the Mistle menu sees "no signal" so its memory/vestige entries are enabled
+   vestige_keep=1   host only, untested: the vestige restoration screen sees "no session", so a memory keeps the session
+   group_teleport=1 host only: after the host's Mistle teleport the guest is spawned next to him (also into another stage)
+   teleport_skip_fields=<id>,<id>  host: teleport destinations (FieldID, logged on every teleport) that keep vanilla
+                    behaviour; Home Base is a separate map and needs to be listed here (its ID is not known yet)
+   keep_outro=1     both PCs, research: a boss kill no longer sends the guest home (the host's outro then waits, see Status)
+   scenario_trace=1 log only: trace the cutscene/deferred-teleport UFunctions (this broke a boss intro; off by default)
    trace_death=1    log only: native trace of death/fade/spawn UFunctions (diagnostics)
    group_rest=1     host only, untested: heal every living player when the host rests (CoopProbe)
    ```
@@ -76,11 +82,25 @@ Works (two PCs, experiments):
   level-up is replaced by a direct call of the HumanContextIF level-up (0x1405A2E20) on his own component, with the
   authority-like check 0x140456A00 forced true for his pawn during the call (the level getter otherwise derives the old level
   from his player data). He then sends `Server_AddExp(0)` once per level; the host sets the level of its copy with the setter
-  (base+0x88) under the same force and recomputes the stats, so his max HP updates. Gifts: unlocking works on his side,
-  equipping still does not (next).
+  (base+0x88) under the same force and recomputes the stats, so his max HP updates. Gifts work (vanilla), once he switches to
+  the blood code the gift belongs to.
+- `group_teleport` (works, also into a completely different stage): a Mistle teleport is not a move but
+  `CheckPointUIComponent:RequestPlayerSpawnToCheckPoint`, a fresh spawn at the target (the world is one map with streamed stages).
+  It ends co-op twice: `SwitchToEndCoop` from 0x146678D02 (with an "ending co-op / distress signal" message shown by
+  0x14083A630 just before) and, on entering a stage where multiplayer is off, from 0x146D627CF plus a second step 0x1409F1BA0
+  ("multiplayer is not possible in this area"). With those vetoed or skipped, the host arrives (CoopNative sees the characters
+  re-spawn) and the guest is spawned next to him with `RequestPlayerSpawn`. The guest sees the world unload around him for a few
+  seconds (fade to do). Home Base is a separate map: teleporting there this way drops the host into a pit.
+- Falls (`keep_dying`): a fall now leads straight to spectating (no revive window): the host plays the dissolve and removes the body.
 
-In progress: enemy reset on a co-op rest (works once per session), vestige restoration (menu entries enabled; the restoration screen
-still refuses), falls while protected (survive at the bottom; to become an immediate true death), 3+ players, group teleport (vote).
+In progress: the post-boss outro with a guest connected (`keep_outro`: the boss intro and the outro start fine, but the host then
+waits on a loading screen until the guest leaves; the outro's deferred-teleport driver is done, so the wait is in the large-poly
+model loading before the memory; the boss blood code only comes after that memory), enemy reset on a co-op rest (works once per
+session), resting together crashes, vestige restoration (menu entries enabled; the restoration screen still refuses), the guest's
+Mistle menu while the host rests (crash), 3+ players, a teleport vote.
+
+Diagnostics: CoopNative logs a freeze watchdog report when the game thread stops for 8 s, and `tools/threadstacks.c` is a
+read-only sampler of a running process's thread stacks (for hangs that are not freezes).
 Guest progression and shared boss rewards: see issue #1 (CoopProgress).
 
 ## Contributing
