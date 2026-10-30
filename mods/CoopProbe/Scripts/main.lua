@@ -566,13 +566,28 @@ local function sendTpInfo()
         local a = valid(d) and try(function() return d:GetAddress() end)
         if a then lines[#lines + 1] = string.format("driver %X", a) end
     end
+    local mpc = localPC()
+    local mp = valid(mpc) and try(function() return mpc.Pawn end) or nil
+    for _, fc in ipairs(FindAllOf("BP_FadeUIComponent_C") or {}) do
+        local own = valid(fc) and try(function() return fc:GetOwner() end)
+        if valid(own) and valid(mpc) and name(own) == name(mpc) then
+            local fa = try(function() return fc:GetAddress() end)
+            if fa then lines[#lines + 1] = string.format("fade %X", fa) end
+        end
+    end
+    for _, o in ipairs({ mpc, mp }) do
+        local oa = valid(o) and try(function() return o:GetAddress() end)
+        if oa then lines[#lines + 1] = string.format("host %X", oa) end
+    end
+    local mpa = valid(mp) and try(function() return mp:GetAddress() end)
+    if mpa then lines[#lines + 1] = string.format("hpawn %X", mpa) end
     for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
         if valid(c) and not try(function() return c:IsLocalController() end) then
             local a = try(function() return c:GetAddress() end)
             if a then lines[#lines + 1] = string.format("guest %X", a) end
             local p = try(function() return c.Pawn end)
             local pa = valid(p) and try(function() return p:GetAddress() end)
-            if pa then lines[#lines + 1] = string.format("guest %X", pa) end
+            if pa then lines[#lines + 1] = string.format("guest %X", pa); lines[#lines + 1] = string.format("gpawn %X", pa) end
             local ps = try(function() return c.PlayerState end)
             local psa = valid(ps) and try(function() return ps:GetAddress() end)
             if psa then lines[#lines + 1] = string.format("guest %X", psa) end
@@ -969,7 +984,59 @@ local function guestLevelWatch()
     local f = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "w")
     if f then f:write(string.format("lvlinfo %X", lvlWatch.a)); f:close() end
 end
+-- Test helper (host, test copy only; session 10 prep): "bosshp1" in CoopProbe.cmd sets the bosses of the running fight to 1
+-- health, so the next hit kills them through the normal death path. Boss lookup after Rikka230's CoopDevTools: the boss areas
+-- whose CurrentPhase is 1 or 2 and their Enemies; if none is listed, every living spawned boss (a second phase is not listed).
+local function bossesInFight()
+    local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+    local found, fighting = {}, false
+    for _, a in ipairs(FindAllOf("BossAreaBase") or {}) do
+        local phase = valid(a) and try(function() return a.CurrentPhase end)
+        if phase == 1 or phase == 2 then
+            fighting = true
+            pcall(function()
+                a.Enemies:ForEach(function(_, e)
+                    local x = e:get()
+                    if valid(x) and try(function() return helper:IsBoss(x) end) and not try(function() return helper:IsDeath(x) end) then
+                        found[#found + 1] = x
+                    end
+                end)
+            end)
+        end
+    end
+    if fighting and #found == 0 then
+        for _, x in ipairs(FindAllOf("EnemyCommonBase") or {}) do
+            if valid(x) and try(function() return helper:IsBoss(x) end) and not try(function() return helper:IsDeath(x) end) then
+                found[#found + 1] = x
+            end
+        end
+    end
+    return found, helper
+end
+-- Guest in the post-boss cutscene (guest_outro=1, guest; session 10): the boss intro reaches the guest through the boss area's
+-- MulticastExecuteFlowDiagramWithCallback(PrePhase1Event); the post-boss cutscene (FinishEvent, type 3) never started on his side.
+-- When CoopNative reports the boss battle's finish (CoopNative.outro = the area's address), call the multicast with type 3 on that
+-- area here: on a client a multicast called locally runs locally, so his game starts the same cutscene as the host.
+local OUTRO_PATH = WIN64 .. "\\plugins\\CoopNative.outro"
+do local f = io.open(OUTRO_PATH, "r"); if f then f:close(); os.remove(OUTRO_PATH) end end
+local function guestOutro()
+    local f = io.open(OUTRO_PATH, "r"); if not f then return end
+    local t = f:read("*a") or ""; f:close(); os.remove(OUTRO_PATH)
+    if not iniHas("guest_outro=1") then return end
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not valid(gs) or try(function() return gs.Role end) == 3 then return end   -- guests only
+    local want = tonumber(t:match("%x+") or "", 16)
+    for _, a in ipairs(FindAllOf("BossAreaBase") or {}) do
+        if valid(a) and try(function() return a:GetAddress() end) == want then
+            local ok, e = pcall(function() a:MulticastExecuteFlowDiagramWithCallback(3) end)
+            log("guest outro: " .. name(a) .. ":MulticastExecuteFlowDiagramWithCallback(FinishEvent) -> " .. (ok and "called" or ("ERROR " .. tostring(e):sub(1, 140))))
+            return
+        end
+    end
+    log("guest outro: boss area 0x" .. t .. " not found")
+end
 local function probeCommands()
+    pcall(guestOutro)
     guestLevelWatch()
     guestRestRequest()
     resyncAfterMenu()
@@ -991,6 +1058,35 @@ local function probeCommands()
         local f = a and io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "w")
         if f then f:write(string.format("levelup %X 1 0", a)); f:close() end
         log("levelme: " .. (f and "sent" or "no checkpoint component"))
+    elseif c == "memrespawn" or c == "memrespawn2" then
+        -- Memory with a guest (session 10): the museum spawns the host's memory character but never starts it (its tick is not
+        -- registered, no BeginPlay), so its appear never ends and the memory's loading fade stays. Give the host a fresh character
+        -- at the same spot with RequestPlayerSpawn (the path the group respawn uses; its characters tick and appear normally).
+        local gs = FindFirstOf("BP_AppGameState_C")
+        if not valid(gs) or try(function() return gs.Role end) ~= 3 then log("memrespawn: host only"); return end
+        local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+        local pc = localPC()
+        local old = valid(pc) and try(function() return pc.Pawn end) or nil
+        if not valid(old) then log("memrespawn: no pawn on the host controller"); return end
+        local loc = try(function() return old:K2_GetActorLocation() end)
+        local rot = try(function() return old:K2_GetActorRotation() end)
+        if not loc or not rot then log("memrespawn: no location"); return end
+        local at = { X = loc.X, Y = loc.Y, Z = loc.Z + 20 }
+        local r = { Pitch = 0, Yaw = rot.Yaw, Roll = 0 }
+        -- memrespawn2: SkipAppear = true (no PlayerSpawner; the group respawn spawns the guest this way and those characters start)
+        local skip = c == "memrespawn2"
+        local ok, e = pcall(function() helper:RequestPlayerSpawn(old, pc, at, r, r, true, skip) end)
+        log(c .. ": RequestPlayerSpawn(host controller, skipAppear " .. tostring(skip) .. ") at " .. string.format("%.0f %.0f %.0f", at.X, at.Y, at.Z) .. " -> " ..
+            (ok and "called" or ("ERROR " .. tostring(e):sub(1, 140))) .. "; old pawn " .. name(old))
+    elseif c == "bosshp1" then
+        local gs = FindFirstOf("BP_AppGameState_C")
+        if not valid(gs) or try(function() return gs.Role end) ~= 3 then log("bosshp1: host only"); return end
+        local list, helper = bossesInFight()
+        if #list == 0 then log("bosshp1: no boss fight running") end
+        for _, x in ipairs(list) do
+            local ok, e = pcall(function() helper:SetHealth(x, 1) end)
+            log("bosshp1: " .. name(x) .. " -> 1 health " .. (ok and "ok" or ("ERROR " .. tostring(e):sub(1, 120))))
+        end
     elseif c == "lvlinfo" then
         -- level-up check values of every player's HumanContextComponent (CoopNative logs level, max, cost, haze)
         local addrs = {}

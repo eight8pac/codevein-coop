@@ -44,7 +44,11 @@ Everything goes into `<game dir>\CodeVein\Binaries\Win64`.
    group_teleport=1 host only: after the host's Mistle teleport the guest is spawned next to him (also into another stage)
    teleport_skip_fields=<id>,<id>  host: teleport destinations (FieldID, logged on every teleport) that keep vanilla
                     behaviour; Home Base is a separate map and needs to be listed here (its ID is not known yet)
-   keep_outro=1     both PCs, research: a boss kill no longer sends the guest home (the host's outro then waits, see Status)
+   keep_outro=1     both PCs: a boss kill no longer sends the guest home; the outro's four "partner ready" checks are
+                    answered for the host, and the memory's character-setup lock is reset so the host's memory starts
+   guest_outro=1    guest: when the boss dies, his game starts the boss area's post-boss cutscene too (he watches it with
+                    the host)
+   scenario_trace_names=A,B  log only: trace single cutscene waits by name
    scenario_trace=1 log only: trace the cutscene/deferred-teleport UFunctions (this broke a boss intro; off by default)
    trace_death=1    log only: native trace of death/fade/spawn UFunctions (diagnostics)
    group_rest=1     host only, untested: heal every living player when the host rests (CoopProbe)
@@ -93,14 +97,28 @@ Works (two PCs, experiments):
   seconds (fade to do). Home Base is a separate map: teleporting there this way drops the host into a pit.
 - Falls (`keep_dying`): a fall now leads straight to spectating (no revive window): the host plays the dissolve and removes the body.
 
-In progress: the post-boss outro with a guest connected (`keep_outro`: the boss intro and the outro start fine, but the host then
-waits on a loading screen until the guest leaves; the outro's deferred-teleport driver is done, so the wait is in the large-poly
-model loading before the memory; the boss blood code only comes after that memory), enemy reset on a co-op rest (works once per
+Post-boss outro and memory with the guest connected (`keep_outro`, `guest_outro`, two-PC tests 2026-10-30):
+- The outro (large-poly cutscene) waited for "partner ready" flags the guest never sets: four `IsOnlineMultiplay` calls in the
+  scenario manager (+0x20C..+0x212 checks, return addresses 0x14705DE3F, 0x1470613D3, 0x147050AB8, 0x14705DD11; found with
+  `tools/scanflags.py`) are answered "not multiplayer" for the host. The guest watches the outro because his game starts the boss
+  area's FinishEvent itself (`MulticastExecuteFlowDiagramWithCallback(3)`, the same path the intro uses). Skipping works.
+- The memory is run by `MuseumUtilityManager` / `MuseumUtilityActor` (its start logic is Denuvo-VM code). It hung on a global
+  counter `NumInCharacterSetupBeforeAppBeginPlay` ([0x14413C404], with a "blocked until frame" value at [0x14413C410]): characters
+  wait for AppBeginPlay until it is 0, and in co-op it never reached 0, so the host's memory character never started (tick not
+  registered, appear unfinished, loading screen). CoopNative resets it once 2 s into the memory (and skips the engine check on
+  the later underflow); the host then plays the memory normally.
+- Not yet: the guest runs his own copy of the memory and its scenes (out of sync, his own story flags: boss/fog wall stay on his
+  side); next is one source (block his own memory, mirror the host's scenes, his pawn walking along or the spectate camera), story
+  progress for the guest (CoopProgress), then vestige restoration.
+
+In progress: enemy reset on a co-op rest (works once per
 session), resting together crashes, vestige restoration (menu entries enabled; the restoration screen still refuses), the guest's
 Mistle menu while the host rests (crash), 3+ players, a teleport vote.
 
-Diagnostics: CoopNative logs a freeze watchdog report when the game thread stops for 8 s, and `tools/threadstacks.c` is a
-read-only sampler of a running process's thread stacks (for hangs that are not freezes).
+Diagnostics: CoopNative logs a freeze watchdog report when the game thread stops for 8 s; `tools/threadstacks.c` samples a running
+process's thread stacks (hangs that are not freezes), `tools/memread.c` / `tools/memwrite.c` read and write a running test copy's
+memory, `tools/minidump.py` reads crash dumps, `tools/findwrites64.py` finds code that writes a global, `tools/scanflags.py` finds
+`IsOnlineMultiplay` checks followed by flag compares. A `bosshp1` CoopProbe command sets a running boss fight to 1 health (tests).
 Guest progression and shared boss rewards: see issue #1 (CoopProgress).
 
 ## Contributing
