@@ -78,7 +78,12 @@ static volatile LONG g_levelup_n, g_levelup_pending, g_guest_levelups;
 static volatile LONG g_levelup_relay;   // set from the ini in read_settings
 static volatile LONG g_vestige_keep;    // vestige_keep=1: the restoration screen sees no session (R4 stage 2, session 9)
 static volatile uintptr_t g_restore_class;  // BP_BCRestorationUIComponent_C class, sent by CoopProbe ("restclass <hex>")
-static volatile LONG g_keep_outro;      // keep_outro=1: flip bWithDisconnect to false (memory sequence research, session 8)
+static volatile LONG g_keep_outro;        // keep_outro=1: keep the guest through a boss kill (outro/memory work, sessions 8-10)
+static volatile LONG g_guest_outro;       // guest_outro=1 (guest): play the outro along, block his own copy of the memory
+static volatile LONG g_guest_mem_block;   // guest_memory_block=1: block the guest's own memory copy (step a); off = both run it (step 2)
+static volatile LONG g_partner_override = 1;
+static volatile ULONGLONG g_memory_start_at;   // PlayMemoryResidue seen (both PCs): option A answers the partner checks for 15 min
+static volatile LONG g_memstart_tp = 1;   // memory_start_teleport=0: no group teleport of the guest at the memory start (step 2)   // outro_partner_override=0: the four "partner ready" answers off (session 10)
 // Player 0 on the host (session 10): the museum (memory) asks GetPlayerController(ctx, 0) whether "the player" is ready and stayed
 // "not ready" on the host while a guest was connected. If the host's controller list put the guest first, index 0 would be the
 // guest. The host's own controller and pawn come from CoopNative.tpinfo ("host <pc>", then "host <pawn>"); every index-0 answer
@@ -246,6 +251,14 @@ static volatile LONG g_unfade_pending, g_unfade_usage = 102;
 #define ADDR_UI_REQUEST_UNFADE 0x1409CC650ULL
 typedef void (*uiunfade_fn)(void *ctx, void *caller, uint8_t usage, uint8_t down_count, float time);
 static volatile LONG g_memunfade_pending, g_memunfade_usage = 106;
+// Item 8 (2026-10-30): on a group teleport the guest saw his world unload around him ("going through nothingness"). CoopProbe on the
+// guest sends "tpfade <pawn> 1" when the host's character is replaced (teleport) and "tpfade <pawn> 0" once his own new character
+// stands next to the host (or after 25 s); the game thread then runs the game's own teleport fade (usage 48, as the vanilla
+// teleport 0x1466A7EF3 calls it) / the unfade for it, with his pawn as world context.
+#define ADDR_UI_REQUEST_TELEPORT_FADE 0x1409CC360ULL
+typedef void (*uitpfade_fn)(void *ctx, void *caller, uint8_t usage, uint8_t flag);
+static volatile LONG g_tpfade_pending = -1;
+static volatile uintptr_t g_tpfade_ctx;
 static volatile uintptr_t g_memory_actor;
 static volatile ULONGLONG g_memory_at;   // PlayMemoryResidue seen (v4 keeps the appear lock open for 3 minutes after it)   // ctx of the last WaitForMemoryResidueFinished (the scenario actor), for memunfade
 static int readable(uintptr_t a, size_t len);
@@ -387,6 +400,66 @@ static uint64_t detour_assert_fatal(void *a, void *b, void *c, void *d, void *e,
     return g_orig_assert_fatal(a, b, c, d, e, f, g, h);
 }
 
+// Memory step (a) (session 10): with guest_outro the guest's game plays the host's outro and at its end starts its OWN memory
+// (PlayMemoryResidue -> impl 0x14090B120(scenario actor, FString*)): a second story copy on its own timer, scenes in his own world
+// state. On the guest that call is not run; instead his scenario actor's +0x430 bit 0x100 is set, which keeps his flow in
+// WaitForMemoryResidueFinished (done when the bit is clear), and it is cleared when his own pawn is replaced after the memory (the
+// host brings him back) or after 10 minutes. CoopProbe writes his pawn to CoopNative.mypawn.
+// callers of the last solid fades with usage 104 (cutscene covers); the fade trace fills it (see note_cover)
+static volatile uintptr_t g_cover_ctx[4];
+static volatile LONG g_cover_n;
+typedef uint8_t (*playmem_fn)(void *actor, void *symbol);
+static playmem_fn g_orig_play_memory;
+static volatile uintptr_t g_guest_mem_actor, g_guest_mem_pawn;
+static volatile ULONGLONG g_guest_mem_at;
+static uintptr_t read_my_pawn(void) {
+    char b[64];
+    if (!read_small_file("CoopNative.mypawn", b, sizeof b)) return 0;
+    return (uintptr_t)strtoull(b, NULL, 16);
+}
+static char g_dir[MAX_PATH];   // tentative definition (also further down)
+// tell CoopProbe on the guest that the host's memory runs (1) / ended (0): it puts his camera on the host and hides his pawn
+static void write_guestmem(int on) {
+    char path[MAX_PATH];
+    snprintf(path, sizeof path, "%sCoopNative.guestmem", g_dir);
+    FILE *f = _fsopen(path, "w", _SH_DENYNO);
+    if (f) { fprintf(f, "%d", on); fclose(f); }
+}
+static uint8_t detour_play_memory(void *actor, void *symbol) {
+    if (g_guest_outro && g_guest_mem_block && actor && readable((uintptr_t)actor + 0x430, 4)) {
+        *(volatile uint32_t *)((uintptr_t)actor + 0x430) |= 0x100;
+        g_guest_mem_actor = (uintptr_t)actor; g_guest_mem_at = GetTickCount64(); g_guest_mem_pawn = read_my_pawn();
+        write_guestmem(1);
+        logf_("memory (a): the guest's own PlayMemoryResidue NOT run; his flow waits (actor 0x%llX, pawn 0x%llX)",
+              (unsigned long long)(uintptr_t)actor, (unsigned long long)g_guest_mem_pawn);
+        // his flow covers the screen right before this call (RequestSolidFade(actor, 104), seen in the solo fade trace from
+        // 0x146FD0E6A); his own memory would have lifted it. Lift it here (UIHelper RequestUnfade impl, we are on the game thread).
+        ((uiunfade_fn)ADDR_UI_REQUEST_UNFADE)(actor, actor, 104, 0, 0.3f);
+        ((uiunfade_fn)ADDR_UI_REQUEST_UNFADE)(actor, actor, 104, 1, 0.3f);
+        // (unfading the cutscene model actor's cover as well crashed the guest at 18:59:09: a null call right after it -> only the
+        //  scenario actor's own cover is lifted)
+        logf_("memory (a): unfade 104 requested for the guest's screen (scenario actor)");
+        return 1;
+    }
+    return g_orig_play_memory(actor, symbol);
+}
+static void guest_memory_watch(void) {
+    uintptr_t a = g_guest_mem_actor;
+    if (!a) return;
+    ULONGLONG now = GetTickCount64();
+    uintptr_t pawn = read_my_pawn();
+    int replaced = now - g_guest_mem_at > 15000 && pawn && g_guest_mem_pawn && pawn != g_guest_mem_pawn;
+    if (!g_guest_mem_pawn && pawn) g_guest_mem_pawn = pawn;
+    // the memory start's group teleport replaces his pawn once in the first seconds: take that one as the memory pawn
+    if (now - g_guest_mem_at < 15000 && pawn) g_guest_mem_pawn = pawn;
+    if (replaced || now - g_guest_mem_at > 600000) {
+        g_guest_mem_actor = 0;
+        if (readable(a + 0x430, 4)) *(volatile uint32_t *)(a + 0x430) &= ~0x100u;
+        write_guestmem(0);
+        logf_("memory (a): released the guest's flow (%s)", replaced ? "his pawn was replaced after the memory" : "timeout");
+    }
+}
+
 // "Loading in progress?" (0x1407ACD30 -> body 0x146D16E10, session 10): a new character's appear sequence only finishes (and
 // lifts the memory's loading fade) when this answers 0. It answers 1 for: world +0x4A0 pending, 0x1407ACE50(world, 0),
 // 0x140456550(), 0x141EED8C0(), 0x140E38C30(), or any streaming level of the context's world (+0x88 array, +0x90 count) with
@@ -497,6 +570,15 @@ static void detour_get_state(void *context, void *stack, void *result) {
             ((uiunfade_fn)ADDR_UI_REQUEST_UNFADE)((void *)actor, (void *)actor, usage, 1, 0.3f);
             logf_("memunfade: returned");
         } else logf_("memunfade: no memory actor");
+    }
+    {
+        LONG tf = InterlockedExchange(&g_tpfade_pending, -1);
+        uintptr_t c = g_tpfade_ctx;
+        if (tf >= 0 && c && readable(c, 8)) {
+            if (tf) ((uitpfade_fn)ADDR_UI_REQUEST_TELEPORT_FADE)((void *)c, (void *)c, 48, 0);
+            else ((uiunfade_fn)ADDR_UI_REQUEST_UNFADE)((void *)c, (void *)c, 48, 0, 0.5f);
+            logf_("tpfade: %s (context 0x%llX)", tf ? "teleport fade requested" : "unfade requested", (unsigned long long)c);
+        } else if (tf >= 0) logf_("tpfade: no valid context");
     }
     if (g_levelup_pending && InterlockedExchange(&g_levelup_pending, 0)) run_levelup();
     if (g_syncall_pending && InterlockedExchange(&g_syncall_pending, 0)) run_syncall();
@@ -688,6 +770,30 @@ static int from_mistle_prompt(uintptr_t caller) {
 // co-op checks, so the check behind the rest action itself shows up when the player presses E.
 #define MAX_CALLERS 64
 static volatile LONG64 g_seen[3][MAX_CALLERS];
+// Item 6 research (2026-10-30): enemies do not respawn on a co-op rest; the reset callers above were not even called at the last
+// rests. For 120 s after each rest start, log every distinct caller of IsOnlineMultiplay / MultiPlayersCheck with its answer (also
+// solo, where they answer false), so a solo rest and a co-op rest can be compared.
+static volatile LONG64 g_rest_seen[2][MAX_CALLERS];
+static volatile ULONGLONG g_rest_log_from;
+static void note_rest_caller(int which, uintptr_t caller, int answer) {
+    static const char *names[2] = {"IsOnlineMultiplay", "MultiPlayersCheck"};
+    if (!g_rest_log_from || GetTickCount64() - g_rest_log_from > 120000) return;
+    LONG64 key = (LONG64)(caller | ((uintptr_t)(answer & 1) << 63));
+    for (int i = 0; i < MAX_CALLERS; i++) {
+        LONG64 v = g_rest_seen[which][i];
+        if (v == key) return;
+        if (v == 0 && InterlockedCompareExchange64(&g_rest_seen[which][i], key, 0) == 0) {
+            logf_("rest window: %s from 0x%llX -> %d (+%llu ms)", names[which], (unsigned long long)caller, answer,
+                  (unsigned long long)(GetTickCount64() - g_rest_log_from));
+            return;
+        }
+    }
+}
+static void start_rest_log(const char *why) {
+    for (int w = 0; w < 2; w++) for (int i = 0; i < MAX_CALLERS; i++) g_rest_seen[w][i] = 0;
+    g_rest_log_from = GetTickCount64();
+    logf_("rest window: logging co-op checks for 120 s (%s)", why);
+}
 static void note_caller(int which, uintptr_t caller) {
     static const char *names[3] = {"IsOnlineMultiplay", "MultiPlayersCheck", "PromptBlock1"};
     for (int i = 0; i < MAX_CALLERS; i++) {
@@ -711,6 +817,7 @@ static closesession_fn g_orig_close_session;
 static volatile LONG g_guest_rest;
 static uint64_t detour_close_session(void *ctx, uint8_t bits) {
     uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    if (bits == 8 && caller >= 0x146A1CB70ULL && caller < 0x146A1CB70ULL + 0x800) start_rest_log("CloseOnlineSession(8) from the Mistle input");
     if (g_guest_rest && bits == 8 && caller >= 0x146A1CB70ULL && caller < 0x146A1CB70ULL + 0x800) {
         logf_("CloseOnlineSession(8) from the Mistle input 0x%llX  *** SKIPPED (guest_rest) ***", (unsigned long long)caller);
         return 1;
@@ -728,11 +835,20 @@ typedef void (*mistleinput_fn)(void *mistle, uint8_t pressed, void *character);
 static mistleinput_fn g_orig_mistle_input;
 static void detour_mistle_input(void *mistle, uint8_t pressed, void *character) {
     if (g_guest_rest && pressed == 1 && mistle && readable((uintptr_t)mistle + 0x660, 1) && *((uint8_t *)mistle + 0x660) == 2) {
+        // item 7 (2026-10-30 20:51): his game crashed (inside UE4SS, null read) opening the menu while the host sat at the Mistle.
+        // ACheckPointBase.InputterHolder (+0x6C0) = the character using it; while that is someone else, open nothing
+        uintptr_t holder = readable((uintptr_t)mistle + 0x6C0, 8) ? *(uintptr_t *)((uintptr_t)mistle + 0x6C0) : 0;
+        if (holder && holder != (uintptr_t)character) {
+            logf_("Mistle input at 0x%llX: in use by 0x%llX (the host rests) -> menu NOT opened", (unsigned long long)(uintptr_t)mistle,
+                  (unsigned long long)holder);
+            return;
+        }
         char path[MAX_PATH];
         snprintf(path, sizeof path, "%sCoopNative.restreq", g_dir);
         FILE *f = _fsopen(path, "w", _SH_DENYNO);
         if (f) { fputs("1", f); fclose(f); }
-        logf_("Mistle input at 0x%llX  *** vanilla rest SKIPPED (guest_rest), menu requested ***", (unsigned long long)(uintptr_t)mistle);
+        logf_("Mistle input at 0x%llX  *** vanilla rest SKIPPED (guest_rest), menu requested *** (holder 0x%llX)", (unsigned long long)(uintptr_t)mistle,
+              (unsigned long long)holder);
         return;
     }
     g_orig_mistle_input(mistle, pressed, character);
@@ -772,15 +888,43 @@ static volatile ULONGLONG g_last_poly_log;
 static uint8_t detour_multiplay(void *ctx) {
     uint8_t r = g_orig_multiplay(ctx);
     uintptr_t caller = (uintptr_t)__builtin_return_address(0);
-    if (r && g_keep_outro && (caller == OUTRO_POLY_CALLER || caller == OUTRO_POLY_END_CALLER || caller == OUTRO_POLY_FIN_CALLER ||
+    note_rest_caller(0, caller, r);
+    // option A (session 10): the outro keeps the game's own sync (outro_partner_override=0); from the memory start on (15 min:
+    // memory, its scenes, the cutscene out of it) the checks are answered again, so neither game waits for the other's copy
+    int memwin = g_memory_start_at && GetTickCount64() - g_memory_start_at < 900000;
+    if (r && g_keep_outro && (g_partner_override || memwin) && (caller == OUTRO_POLY_CALLER || caller == OUTRO_POLY_END_CALLER || caller == OUTRO_POLY_FIN_CALLER ||
                               caller == OUTRO_POLY_X_CALLER)) {
         ULONGLONG now = GetTickCount64();
         if (now - g_last_poly_log > 2000) { g_last_poly_log = now; logf_("outro: large-poly check at 0x%llX answered \"not multiplayer\" (keep_outro)", (unsigned long long)caller); }
         return 0;
     }
+    // item 10 (2026-10-30 21:13): pressing "Restore Vestige" with a guest showed "unavailable in multiplayer"; the only new
+    // IsOnlineMultiplay caller at that moment was 0x14713D46D. With vestige_keep it is answered "not multiplayer"
+    // 21:22: the next one (0x147143D7B, 0.9 s later) blocked the screen from opening; both sit in the restoration code, so the whole
+    // stretch 0x14713D000..0x147145000 is answered (each new caller logged once)
+    if (r && g_vestige_keep && caller >= 0x14713D000ULL && caller < 0x147145000ULL) {
+        static uintptr_t seen_v[16];
+        int known = 0;
+        for (int i = 0; i < 16 && seen_v[i]; i++) if (seen_v[i] == caller) known = 1;
+        if (!known) { for (int i = 0; i < 16; i++) if (!seen_v[i]) { seen_v[i] = caller; break; }
+            logf_("vestige: check at 0x%llX answered \"not multiplayer\" (vestige_keep)", (unsigned long long)caller); }
+        return 0;
+    }
     if (r && g_rest_in_coop) {
         if (from_mistle_prompt(caller)) { InterlockedIncrement(&g_rest_overrides); return 0; }
         if ((caller == REST_RESET_CALLER1 || caller == REST_RESET_CALLER2) && in_rest_window()) {
+            // item 6b (2026-10-30): the guest's rest should reset the enemies too; log the call chain of the reset (once per caller
+            // and rest) to find an entry point the host can run on the guest's request
+            static ULONGLONG bt_logged[2];
+            int k = caller == REST_RESET_CALLER2;
+            if (bt_logged[k] != g_rest_started) {
+                bt_logged[k] = g_rest_started;
+                void *frames[24];
+                USHORT n = RtlCaptureStackBackTrace(1, 24, frames, NULL);
+                char bt[24 * 20] = "";
+                for (USHORT i = 0; i < n; i++) { char one[20]; snprintf(one, sizeof one, " %llX", (unsigned long long)(uintptr_t)frames[i]); strcat_s(bt, sizeof bt, one); }
+                logf_("enemy reset: caller 0x%llX (ctx 0x%llX) backtrace:%s", (unsigned long long)caller, (unsigned long long)(uintptr_t)ctx, bt);
+            }
             InterlockedIncrement(&g_reset_overrides); return 0;
         }
         note_caller(0, caller);
@@ -800,6 +944,7 @@ static check_fn g_orig_multi_players, g_orig_prompt_block1;
 static uint8_t detour_multi_players(void *a) {
     uint8_t r = g_orig_multi_players(a);
     uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    note_rest_caller(1, caller, r);
     if (r && g_rest_in_coop) {
         if (from_mistle_prompt(caller)) { InterlockedIncrement(&g_rest_overrides); return 0; }
         note_caller(1, caller);
@@ -992,6 +1137,9 @@ static void run_commands(void) {
         tp_tokens(1);
     } else if (strncmp(buf, "tpunlock", 8) == 0) {
         tp_tokens(2);
+    } else if (strncmp(buf, "tpfade ", 7) == 0) {
+        unsigned long long ctx = 0; int on = 0;
+        if (sscanf(buf + 7, "%llx %d", &ctx, &on) == 2) { g_tpfade_ctx = (uintptr_t)ctx; InterlockedExchange(&g_tpfade_pending, on ? 1 : 0); }
     } else if (sscanf(buf, "restclass %llx", &a) == 1) {
         g_restore_class = (uintptr_t)a;
         logf_("vestige_keep: BP_BCRestorationUIComponent_C class = 0x%llX", a);
@@ -1037,6 +1185,14 @@ static void read_settings(void) {
     if (InterlockedExchange(&g_group_teleport, gtp) != gtp) logf_("setting group_teleport = %ld", gtp);
     LONG vkeep = have_ini && strstr(buf, "vestige_keep=1") != NULL;
     if (InterlockedExchange(&g_vestige_keep, vkeep) != vkeep) logf_("setting vestige_keep = %ld", vkeep);
+    LONG gmb = have_ini && strstr(buf, "guest_memory_block=1") != NULL;
+    if (InterlockedExchange(&g_guest_mem_block, gmb) != gmb) logf_("setting guest_memory_block = %ld", gmb);
+    LONG mst = !(have_ini && strstr(buf, "memory_start_teleport=0") != NULL);
+    if (InterlockedExchange(&g_memstart_tp, mst) != mst) logf_("setting memory_start_teleport = %ld", mst);
+    LONG pov = !(have_ini && strstr(buf, "outro_partner_override=0") != NULL);
+    if (InterlockedExchange(&g_partner_override, pov) != pov) logf_("setting outro_partner_override = %ld", pov);
+    LONG gout = have_ini && strstr(buf, "guest_outro=1") != NULL;
+    if (InterlockedExchange(&g_guest_outro, gout) != gout) logf_("setting guest_outro = %ld", gout);
     LONG kout = have_ini && strstr(buf, "keep_outro=1") != NULL;
     if (InterlockedExchange(&g_keep_outro, kout) != kout) logf_("setting keep_outro = %ld", kout);
     LONG grest = have_ini && strstr(buf, "guest_rest=1") != NULL;
@@ -1050,6 +1206,10 @@ static void read_settings(void) {
 // Returns 1 hooked, 0 not executable yet (retry later), -1 refused for good. Every address is hard-coded for Code Vein
 // 1.53.93354 (exe SHA-256 8fa550fe...); the first 16 bytes must match what was measured there, or the hook is skipped, so a
 // different build (e.g. on another player's PC) cannot get a patch at the wrong place.
+// Startup batching (session 10): MH_EnableHook pauses all game threads each time (~0.1 s per hook, ~7 s for the startup set);
+// during the startup set the hooks are only created, then enabled together with MH_EnableHook(MH_ALL_HOOKS).
+static int g_hook_batch;
+static int g_diag_hooks;
 static int install(const char *name, uint64_t addr, const char *expect16, void *detour, void **orig) {
     const uint8_t *p = (const uint8_t *)(uintptr_t)addr;
     MEMORY_BASIC_INFORMATION mbi;
@@ -1066,8 +1226,8 @@ static int install(const char *name, uint64_t addr, const char *expect16, void *
         return -1;
     }
     MH_STATUS s = MH_CreateHook((LPVOID)p, detour, orig);
-    if (s == MH_OK) s = MH_EnableHook((LPVOID)p);
-    logf_("%s: hook at 0x%llX -> %s", name, (unsigned long long)addr, MH_StatusToString(s));
+    if (s == MH_OK && !g_hook_batch) s = MH_EnableHook((LPVOID)p);
+    logf_("%s: hook at 0x%llX -> %s%s", name, (unsigned long long)addr, MH_StatusToString(s), g_hook_batch ? " (queued)" : "");
     return s == MH_OK ? 1 : -1;
 }
 
@@ -1320,12 +1480,20 @@ static void detour_flow_diagram(void *ctx, void *stack, void *result) {
 }
 
 static exec_fn g_orig_server_addexp;
+#define GUEST_REST_MAGIC (-2601)
+static volatile ULONGLONG g_guest_rest_req_at;
 static void detour_server_addexp(void *ctx, void *stack, void *result) {
     // RPCs run through ProcessEvent: no bytecode (FFrame+0x20 == 0), the parameters are at FFrame+0x28 (Locals), Value first
     int value = 1;
     if (stack && readable((uintptr_t)stack + 0x20, 16) && *(uintptr_t *)((uintptr_t)stack + 0x20) == 0) {
         uintptr_t locals = *(uintptr_t *)((uintptr_t)stack + 0x28);
         if (locals && readable(locals, 4)) value = *(int *)locals;
+    }
+    // item 6b: the guest's rest asks the host for an enemy reset with Server_AddExp(-2601) (a value no real exp gain has); swallowed
+    if (value == GUEST_REST_MAGIC) {
+        g_guest_rest_req_at = GetTickCount64();
+        logf_("guest rest request (Server_AddExp(%d) from component 0x%llX): enemy reset wanted", value, (unsigned long long)(uintptr_t)ctx);
+        return;
     }
     if (g_levelup_relay && value != 0) logf_("Server_AddExp(%d) from component 0x%llX", value, (unsigned long long)(uintptr_t)ctx);
     if (g_levelup_relay && value == 0) {
@@ -1460,8 +1628,8 @@ static void gift_note(int i, void *c, void *st) {
     // session 10: the memory moves the host into its own area and waits for the guest, who never arrives (his game has no memory
     // ground, he falls). Treat the memory start like a host teleport: group teleport spawns the guest next to the host's memory
     // character once it is up (same "start"/"arrived" markers as a Mistle teleport).
-    if (strstr(g_gift_name[i], "PlayMemoryResidue")) g_memory_at = GetTickCount64();
-    if (g_keep_outro && g_group_teleport && strstr(g_gift_name[i], "PlayMemoryResidue")) {
+    if (strstr(g_gift_name[i], "PlayMemoryResidue")) { g_memory_at = GetTickCount64(); g_memory_start_at = g_memory_at; }
+    if (g_keep_outro && g_group_teleport && g_memstart_tp && strstr(g_gift_name[i], "PlayMemoryResidue")) {
         logf_("memory start: guest follows like a group teleport");
         write_teleport_marker("start");
         InterlockedExchange(&g_tp_pending, 1);
@@ -1603,8 +1771,13 @@ static const char *g_fade_expect[FADE_N] = {"\xE9\x4B\xCC\x99\x06\xCC\xCC\xCC\xC
 typedef uint64_t (*fade_fn)(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h);
 static fade_fn g_fade_orig[FADE_N];
 static volatile LONG g_fade_count[FADE_N];
+static void note_cover(int i, void *ctx, void *usage) {
+    if (strcmp(g_fade_name[i], "RequestSolidFade") == 0 && ((uintptr_t)usage & 0xFF) == 104)
+        g_cover_ctx[InterlockedIncrement(&g_cover_n) & 3] = (uintptr_t)ctx;
+}
 #define FADE_DETOUR(i) static uint64_t fade_det_##i(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) { \
     uintptr_t ret = (uintptr_t)__builtin_return_address(0); \
+    note_cover(i, a, c); \
     uint64_t r = g_fade_orig[i](a, b, c, d, e, f, g, h); \
     if (InterlockedIncrement(&g_fade_count[i]) <= 300) \
         logf_("FADE %s(ctx 0x%llX, caller 0x%llX, usage %u, flag %u) from 0x%llX", g_fade_name[i], (unsigned long long)(uintptr_t)a, \
@@ -1623,6 +1796,7 @@ static DWORD WINAPI worker(LPVOID unused) {
     MH_STATUS s = MH_Initialize();
     logf_("MH_Initialize -> %s", MH_StatusToString(s));
     if (s != MH_OK) return 0;
+    g_hook_batch = 1;
     install("GetRescueSignalState", ADDR_EXEC_GET_RESCUE_SIGNAL_STATE,
             "\xE9\x1B\x56\xCB\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_get_state, (void **)&g_orig_get_state);
     install("IsOnlineMultiplay", ADDR_IS_ONLINE_MULTIPLAY_BODY,
@@ -1655,7 +1829,15 @@ static DWORD WINAPI worker(LPVOID unused) {
             install(n, g_gift_addr[i], g_gift_expect[i], g_gift_det[i], (void **)&g_gift_orig[i]);
         }
     }
-    for (int i = 0; i < FADE_N; i++) install(g_fade_name[i], g_fade_addr[i], g_fade_expect[i], g_fade_det[i], (void **)&g_fade_orig[i]);
+    // Cleanup (2026-10-30, item 4): the pure log hooks (fade trace, GetPlayerController and the
+    // IsPlayerPlayable logger) are installed only with diag_hooks=1; hooks that also fix something stay on (the late scenario hooks
+    // find the museum actor and the memory end, the loading check holds v3)
+    {
+        char ini[2048];
+        g_diag_hooks = read_small_file("CoopNative.ini", ini, sizeof ini) && strstr(ini, "diag_hooks=1");
+        logf_("diag_hooks = %d", g_diag_hooks);
+    }
+    if (g_diag_hooks) for (int i = 0; i < FADE_N; i++) install(g_fade_name[i], g_fade_addr[i], g_fade_expect[i], g_fade_det[i], (void **)&g_fade_orig[i]);
     for (int i = 0; i < SYNC_N; i++) install(g_sync_name[i], g_sync_addr[i], g_sync_expect[i], g_sync_det[i], (void **)&g_sync_orig[i]);
     install("InCharge", ADDR_IN_CHARGE,
             "\xE9\xDB\xEE\x94\x05\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_in_charge, (void **)&g_orig_in_charge);
@@ -1665,13 +1847,15 @@ static DWORD WINAPI worker(LPVOID unused) {
             "\xE9\x3B\x5C\x93\x05\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_lock_acquire, (void **)&g_orig_lock_acquire);
     install("AppearLockRelease", 0x140448D40ULL,
             "\xE9\x1B\xCF\x93\x05\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_lock_release, (void **)&g_orig_lock_release);
+    install("PlayMemoryResidueImpl", 0x14090B120ULL,
+            "\xE9\xAB\x7B\x76\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_play_memory, (void **)&g_orig_play_memory);
     install("AssertFatal", 0x140C3EEC0ULL,
             "\xE9\x5B\xAE\x8B\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_assert_fatal, (void **)&g_orig_assert_fatal);
     install("AppearFinish", 0x1405B07B0ULL,
             "\xE9\x1B\x39\xD9\x05\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_appear_finish, (void **)&g_orig_appear_finish);
     install("LoadingInProgressCheck", 0x1407ACD30ULL,
             "\xE9\xDB\xA0\x56\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_busy, (void **)&g_orig_busy);
-    install("GetPlayerController", ADDR_GET_PLAYER_CONTROLLER,
+    if (g_diag_hooks) install("GetPlayerController", ADDR_GET_PLAYER_CONTROLLER,
             "\xE9\x2B\xCE\xE3\x0C\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_get_player_controller, (void **)&g_orig_get_player_controller);
     install("GetPlayerCharacter", ADDR_GET_PLAYER_CHAR,
             "\xE9\x8B\xD1\xE3\x0C\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_get_player_char, (void **)&g_orig_get_player_char);
@@ -1714,10 +1898,30 @@ static DWORD WINAPI worker(LPVOID unused) {
     LONG shown = -2;
     int dumps = 0;
     ULONGLONG last_hb = 0;
+    {
+        MH_STATUS es = MH_EnableHook(MH_ALL_HOOKS);
+        g_hook_batch = 0;
+        logf_("startup hooks enabled together -> %s", MH_StatusToString(es));
+    }
     for (unsigned tick = 0;; tick++) {
         Sleep(200);
         read_settings();
         run_commands();
+        guest_memory_watch();
+        // memory end on the host (polish 2b): the museum actor is freed at the end; its vtable changes -> group teleport back
+        {
+            static uintptr_t mus_seen, mus_vt;
+            uintptr_t m = g_museum_actor;
+            if (m && m != mus_seen && readable(m, 8)) { mus_seen = m; mus_vt = *(uintptr_t *)m; }
+            if (m && m == mus_seen && g_memory_at && (!readable(m, 8) || *(uintptr_t *)m != mus_vt)) {
+                g_memory_at = 0; g_museum_actor = 0;
+                if (g_keep_outro && g_group_teleport) {
+                    logf_("memory end (museum actor gone): v5 off; guest follows the host back like a group teleport");
+                    write_teleport_marker("start");
+                    InterlockedExchange(&g_tp_pending, 1);
+                }
+            }
+        }
         // v5 (session 10, proven live 12:45:13 with tools/memwrite): during the memory the host's memory character sits unstarted
         // (PrimaryActorTick +0x28: registered +0x35 = 0) holding its +0xB83 appear lock, and the lock counter never reaches 0 (one more
         // +0xB83/+0xB84 holder left over). Clearing that character's +0xB83, the counters [0x14413C404] / [0x14413C40C] and setting
@@ -1753,10 +1957,12 @@ static DWORD WINAPI worker(LPVOID unused) {
         if (tick % 5) continue;   // the rest once per second
         tp_watch();
         // session 10: after any boss kill (solo too), for a solo baseline of the memory
-        if (g_bosskill_at && !g_late_installed && InterlockedExchange(&g_late_installed, 1) == 0) {
-            logf_("late scenario trace: installing %d hooks after the boss kill", LATE_N);
+        // (the late hooks also find the museum actor and the memory end: always installed; only the IsPlayerPlayable logger is diag)
+        // item 10 (2026-10-30): a vestige restoration plays a memory without a boss kill: also install them at a memory start
+        if ((g_bosskill_at || g_memory_at) && !g_late_installed && InterlockedExchange(&g_late_installed, 1) == 0) {
+            logf_("late scenario trace: installing %d hooks (%s)", LATE_N, g_bosskill_at ? "after the boss kill" : "memory start");
             for (int i = 0; i < LATE_N; i++) install(g_late_name[i], g_late_addr[i], g_late_expect[i], g_late_det[i], (void **)&g_late_orig[i]);
-            install("MuseumUtilityActor:IsPlayerPlayable", ADDR_EXEC_PLAYER_PLAYABLE,
+            if (g_diag_hooks) install("MuseumUtilityActor:IsPlayerPlayable", ADDR_EXEC_PLAYER_PLAYABLE,
                     "\xE9\x1B\xA1\xCF\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_playable, (void **)&g_orig_playable);
         }
         // museum field dump every 3 s for 3 minutes after it began (raw reads on the worker)
