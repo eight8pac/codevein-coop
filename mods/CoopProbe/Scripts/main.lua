@@ -498,10 +498,18 @@ end
 local menuClassSent = false
 local function sendMenuClass()
     if menuClassSent or not iniHas("vestige_menu=1") then return end
-    local m = FindFirstOf("WDT_CheckpointMenu_C")
-    local cls = valid(m) and try(function() return m:GetClass() end) or nil
-    local addr = cls and try(function() return cls:GetAddress() end)
+    -- item 3 (2026-10-30): the class object exists as soon as the widget blueprint is loaded, before the first menu instance; look it
+    -- up by path so the first Mistle menu is not greyed (it was handed over only after the first menu existed)
+    local cls = StaticFindObject("/Game/UserInterface/CheckPointMenu/WDT_CheckpointMenu.WDT_CheckpointMenu_C")
+    if not valid(cls) then
+        local m = FindFirstOf("WDT_CheckpointMenu_C")
+        cls = valid(m) and try(function() return m:GetClass() end) or nil
+    end
+    local addr = valid(cls) and try(function() return cls:GetAddress() end)
     if not addr then return end
+    -- CoopNative.cmd holds one command: wait while another one (restclass etc.) is still pending
+    local pending = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "r")
+    if pending then pending:close(); return end
     local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "w")
     if c then c:write(string.format("menuclass %X", addr)); c:close(); menuClassSent = true end
     log(string.format("vestige menu: WDT_CheckpointMenu_C class at 0x%X sent to CoopNative", addr))
@@ -609,6 +617,13 @@ local function groupTeleport()
             local m0 = valid(pc0) and try(function() return pc0.Pawn end) or nil
             pendingTp = { at = os.clock(), oldHost = valid(m0) and try(function() return m0:GetAddress() end) or nil }
             log("group teleport: host teleports, guests follow once the host has arrived")
+            -- item 8 v2: host -> guest message (PlayerController:ClientMessage is a client RPC): the guest fades now, at the start
+            for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+                if valid(c) and not try(function() return c:IsLocalController() end) then
+                    local okm = pcall(function() c:ClientMessage("CoopTeleportFade", FName("None"), 0) end)
+                    log("group teleport: fade message to " .. name(c) .. " " .. tostring(okm))
+                end
+            end
         elseif what:find("^arrived") and pendingTp then
             pendingTp.arrivedAt = os.clock()
             log("group teleport: host's characters re-spawned at the target")
@@ -743,6 +758,8 @@ local function keepDying(rested)
                         -- owner, session 9: vanishing on impact looked wrong; play the game's dissolve first (both PCs), then remove
                         if not st.dissolveAt then
                             st.dissolveAt = os.clock()
+                            -- (2026-10-30: Death:Multicast_MigrationToDeath(true) here changed nothing visible on the guest and
+                            --  made his pawn count as revived -> no removal, no respawn at the host's rest; removed again)
                             local okd = pcall(function() p:Multicast_SetEnableDisappearExpression(true) end)
                             log("keep dying: fall death of " .. name(p) .. " -> dissolve " .. tostring(okd) .. ", body removed in 2.5 s")
                         elseif os.clock() - st.dissolveAt > 2.5 then fall = true end
@@ -864,22 +881,167 @@ local function disableGuestMenuEntries()
         end
     end
 end
--- tell CoopNative our own HumanContextComponent (for the direct level-up call), written when the menu opens
-local function writeMyComponent()
+-- Item 8 (2026-10-30): group teleport fade on the guest. When the host's character is replaced while it was alive (the host
+-- teleported; his characters are re-spawned at the target) and the new one stands more than 30 m from the old spot (cutscenes and
+-- the memory also re-spawn him, but close by) our screen gets the game's teleport fade, lifted once our own character
+-- has been replaced too (group respawn next to the host), 1.5 s later, or after 25 s. CoopNative runs it on the game thread.
+local tpfHost, tpfHostAlive, tpfMine, tpfOnAt, tpfMineAt = nil, false, nil, nil, nil
+local tpfHostPos, tpfWaitFrom, tpfWaitAt = nil, nil, nil   -- (unused since v2)
+-- v2 (owner 21:1x: the fade came only after the jank, and once his screen went dark for 5 s while standing): the host sends
+-- ClientMessage("CoopTeleportFade") at the start of its teleport; the distance trigger is gone
+local tpfMessageAt = nil
+pcall(function()
+    RegisterHook("/Script/Engine.PlayerController:ClientMessage", function(ctx, s)
+        local text = try(function() return s:get():ToString() end)
+        if text == "CoopTeleportFade" then tpfMessageAt = os.clock() end
+    end)
+end)
+local function tpfadeSend(ctx, on)
+    local pending = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "r")
+    if pending then pending:close(); return false end
+    local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "w")
+    if not c then return false end
+    c:write(string.format("tpfade %X %d", ctx, on and 1 or 0)); c:close()
+    return true
+end
+local function guestTeleportFade()
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not valid(gs) or try(function() return gs.Role end) == 3 then return end
     local pc = localPC()
     local mine = valid(pc) and try(function() return pc.Pawn end) or nil
-    for _, c in ipairs(FindAllOf("HumanContextComponent") or {}) do
-        if valid(c) and valid(mine) and name(try(function() return c:GetOwner() end)) == name(mine) then
-            local a = try(function() return c:GetAddress() end)
-            local f = a and io.open(WIN64 .. "\\plugins\\CoopNative.mycomp", "w")
-            if f then f:write(string.format("%X", a)); f:close(); log(string.format("guest rest: own HumanContextComponent 0x%X handed to CoopNative", a)) end
+    local mineName = valid(mine) and name(mine) or nil
+    local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+    local host
+    for _, p in ipairs(FindAllOf("BP_Player_C") or {}) do
+        if valid(p) and name(p) ~= mineName then host = p end
+    end
+    local hostName = valid(host) and name(host) or nil
+    if tpfOnAt then
+        if mineName and mineName ~= tpfMine and not tpfMineAt then tpfMineAt = os.clock() end
+        local done = (tpfMineAt and os.clock() - tpfMineAt > 1.5) or os.clock() - tpfOnAt > 25
+        local ctx = valid(mine) and try(function() return mine:GetAddress() end)
+        if done and ctx and tpfadeSend(ctx, false) then
+            log("teleport fade: lifted (" .. (tpfMineAt and "our new character is next to the host" or "timeout") .. ")")
+            tpfOnAt, tpfMineAt = nil, nil
+        end
+    elseif tpfMessageAt then
+        local ctx = valid(mine) and try(function() return mine:GetAddress() end)
+        if os.clock() - tpfMessageAt > 5 then tpfMessageAt = nil
+        elseif ctx and tpfadeSend(ctx, true) then
+            log("teleport fade: host's message -> fade")
+            tpfOnAt, tpfMine, tpfMessageAt = os.clock(), mineName, nil
+        end
+    elseif false then
+        if tpfHost and tpfHostAlive and hostName ~= tpfHost and tpfHostPos and not tpfWaitAt then
+            tpfWaitFrom, tpfWaitAt = tpfHostPos, os.clock()
+        end
+        if tpfWaitAt then
+            local pos = valid(host) and try(function() return host:K2_GetActorLocation() end)
+            if pos then
+                local dx, dy, dz = pos.X - tpfWaitFrom.X, pos.Y - tpfWaitFrom.Y, pos.Z - tpfWaitFrom.Z
+                local far = dx * dx + dy * dy + dz * dz > 3000 * 3000
+                local ctx = valid(mine) and try(function() return mine:GetAddress() end)
+                if not far then tpfWaitAt = nil
+                elseif ctx and tpfadeSend(ctx, true) then
+                    log(string.format("teleport fade: host character replaced by %s %.0f m away -> fade", tostring(hostName),
+                        math.sqrt(dx * dx + dy * dy + dz * dz) / 100))
+                    tpfOnAt, tpfMine, tpfWaitAt = os.clock(), mineName, nil
+                end
+            elseif os.clock() - tpfWaitAt > 8 then tpfWaitAt = nil end
         end
     end
+    tpfHost = hostName
+    local hp = valid(host) and try(function() return host:K2_GetActorLocation() end)
+    if hp then tpfHostPos = { X = hp.X, Y = hp.Y, Z = hp.Z } end
+    tpfHostAlive = valid(host) and not try(function() return helper:IsDeath(host) end) and not try(function() return helper:IsDying(host) end)
+end
+
+-- Memory spectating (session 10, step c): while the host's memory runs (CoopNative.guestmem = 1, written by CoopNative when our own
+-- memory copy is blocked) our camera follows the host's character and our own pawn is hidden (it floats there without control).
+-- When it ends (0) the camera goes back to our pawn and it is shown again.
+local GUESTMEM_PATH = WIN64 .. "\\plugins\\CoopNative.guestmem"
+do local f = io.open(GUESTMEM_PATH, "w"); if f then f:write("0"); f:close() end end
+local memSpectating, memHiddenPawn, memSpecAt = false, nil, -1000
+local function guestMemorySpectate()
+    if os.clock() - memSpecAt < 1 then return end
+    memSpecAt = os.clock()
+    local f = io.open(GUESTMEM_PATH, "r"); if not f then return end
+    local on = (f:read("*a") or ""):match("1") ~= nil; f:close()
+    local pc = localPC()
+    if not valid(pc) then return end
+    local mine = try(function() return pc.Pawn end)
+    if on then
+        local target
+        for _, p in ipairs(FindAllOf("BP_Player_C") or {}) do
+            if valid(p) and not (valid(mine) and name(p) == name(mine)) and not try(function() return p.bHidden end) then target = p end
+        end
+        if valid(target) then
+            local vt = try(function() return pc:GetViewTarget() end)
+            if not valid(vt) or name(vt) ~= name(target) then
+                pcall(function() pc:SetViewTargetWithBlend(target, 0.5, 0, 0, false) end)
+                log("memory spectate: camera -> " .. name(target))
+            end
+        end
+        if valid(mine) and memHiddenPawn ~= name(mine) then
+            local ok = pcall(function() mine:SetActorHiddenInGame(true) end)
+            memHiddenPawn = name(mine)
+            log("memory spectate: own pawn " .. name(mine) .. " hidden " .. tostring(ok))
+        end
+        memSpectating = true
+    elseif memSpectating then
+        memSpectating = false
+        if valid(mine) then
+            pcall(function() mine:SetActorHiddenInGame(false) end)
+            pcall(function() pc:SetViewTargetWithBlend(mine, 0.3, 0, 0, false) end)
+        end
+        log("memory spectate: ended, camera back to " .. (valid(mine) and name(mine) or "?"))
+        memHiddenPawn = nil
+    end
+end
+-- memory step (a): on the guest, tell CoopNative our own pawn (every 2 s, on change) so it can release our held memory flow once the
+-- host brings us back after the memory
+local lastMyPawn, myPawnAt = nil, -1000
+local function writeMyPawn()
+    if os.clock() - myPawnAt < 2 then return end
+    myPawnAt = os.clock()
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not valid(gs) or try(function() return gs.Role end) == 3 then return end
+    local pc = localPC()
+    local p = valid(pc) and try(function() return pc.Pawn end) or nil
+    local a = valid(p) and try(function() return p:GetAddress() end) or nil
+    if a and a ~= lastMyPawn then
+        lastMyPawn = a
+        local f = io.open(WIN64 .. "\\plugins\\CoopNative.mypawn", "w"); if f then f:write(string.format("%X", a)); f:close() end
+    end
+end
+-- 2026-10-30 (guest crashes 20:51 and 21:24 at the Mistle, inside UE4SS, null+0x18): looping over every HumanContextComponent and
+-- asking each for its owner hit half-destroyed components of characters replaced by a teleport/respawn. Take our own component
+-- straight from our character (BP_Player.HumanContext) instead.
+local function ownHumanContext()
+    local pc = localPC()
+    local mine = valid(pc) and try(function() return pc.Pawn end) or nil
+    if not valid(mine) then return nil end
+    local c = try(function() return mine.HumanContext end)
+    return valid(c) and c or nil
+end
+-- tell CoopNative our own HumanContextComponent (for the direct level-up call), written when the menu opens
+local function writeMyComponent()
+    local c = ownHumanContext()
+    if not c then return nil end
+    local a = try(function() return c:GetAddress() end)
+    local f = a and io.open(WIN64 .. "\\plugins\\CoopNative.mycomp", "w")
+    if f then f:write(string.format("%X", a)); f:close(); log(string.format("guest rest: own HumanContextComponent 0x%X handed to CoopNative", a)) end
+    return c
 end
 local function guestRestRequest()
     local f = io.open(RESTREQ, "r"); if not f then return end
     f:close(); os.remove(RESTREQ)
-    pcall(writeMyComponent)
+    local okc, comp = pcall(writeMyComponent)
+    -- item 6b (2026-10-30): ask the host for an enemy reset (its CoopNative takes Server_AddExp(-2601) as "the guest rested")
+    if okc and valid(comp) then
+        local oks = pcall(function() comp:Server_AddExp(-2601) end)
+        log("guest rest: enemy reset asked from the host " .. tostring(oks))
+    end
     local opened = openCheckpointMenu(1)
     disableUntil, disabledLogged = os.clock() + 3, false
     menuWatch = opened and true or false
@@ -909,10 +1071,7 @@ local function guestLevelUpRelay()
     local n = tonumber((f:read("*a") or ""):match("%d+") or "0") or 0; f:close(); os.remove(LEVELUP_FILE)
     local pc = localPC()
     local mine = valid(pc) and try(function() return pc.Pawn end) or nil
-    local comp
-    for _, c in ipairs(FindAllOf("HumanContextComponent") or {}) do
-        if valid(c) and valid(mine) and name(try(function() return c:GetOwner() end)) == name(mine) then comp = c end
-    end
+    local comp = ownHumanContext()
     local sent = 0
     if valid(comp) then
         for _ = 1, n do if pcall(function() comp:Server_AddExp(0) end) then sent = sent + 1 end end
@@ -970,11 +1129,8 @@ local function guestLevelWatch()
         wf:close(); os.remove(WIN64 .. "\\plugins\\CoopNative.lvlwatch")
         local pc = localPC()
         local mine = valid(pc) and try(function() return pc.Pawn end) or nil
-        for _, c in ipairs(FindAllOf("HumanContextComponent") or {}) do
-            if valid(c) and valid(mine) and name(try(function() return c:GetOwner() end)) == name(mine) then
-                lvlWatch = { a = try(function() return c:GetAddress() end), at = os.clock(), step = 0 }
-            end
-        end
+        local c = ownHumanContext()
+        if c then lvlWatch = { a = try(function() return c:GetAddress() end), at = os.clock(), step = 0 } end
     end
     if not lvlWatch or not lvlWatch.a then return end
     local due = LVL_STEPS[lvlWatch.step + 1]
@@ -1037,6 +1193,9 @@ local function guestOutro()
 end
 local function probeCommands()
     pcall(guestOutro)
+    pcall(writeMyPawn)
+    pcall(guestMemorySpectate)
+    pcall(guestTeleportFade)
     guestLevelWatch()
     guestRestRequest()
     resyncAfterMenu()
@@ -1087,6 +1246,35 @@ local function probeCommands()
             local ok, e = pcall(function() helper:SetHealth(x, 1) end)
             log("bosshp1: " .. name(x) .. " -> 1 health " .. (ok and "ok" or ("ERROR " .. tostring(e):sub(1, 120))))
         end
+    elseif c == "baseinfo" then
+        -- Home Base mode research (item 1): the game's "restricted action in base" info (weapon visibility, attack, dash, menu, ...)
+        -- per player, plus the field manager's IsInHideout and each player's anim instance bIsBaseMode
+        local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+        local fields = {"FieldType", "HeadUpDisplayType", "LimitMoveType", "bCanDash", "bCanAttack", "bWeaponVisibility", "bCanStep",
+            "UseItemType", "bCanFieldMenu", "CameraType", "ClothType", "bToxicGuardMaskInnerVisibility", "bToxicGuardMaskOuterVisibility",
+            "bJinkakuVisibility", "CameraLightIntensity", "bNowAvatarCustomizing", "bSpecialGimmickActive"}
+        for _, p in ipairs(FindAllOf("BP_Player_C") or {}) do
+            if valid(p) then
+                local out = {}
+                local ok, e = pcall(function() helper:GetRestrictedActionInBaseInfo(p, out) end)
+                local info = out.OutInfo or out
+                local parts = {}
+                for _, k in ipairs(fields) do
+                    local v = try(function() return info[k] end)
+                    if v ~= nil then parts[#parts + 1] = k .. "=" .. tostring(v) end
+                end
+                local anim = try(function() return p.Mesh:GetAnimInstance() end)
+                local bm = valid(anim) and try(function() return anim.bIsBaseMode end)
+                log("baseinfo: " .. name(p) .. (ok and "" or (" ERROR " .. tostring(e):sub(1, 100))) .. " bIsBaseMode=" .. tostring(bm)
+                    .. " " .. table.concat(parts, " "))
+            end
+        end
+        local fm = FindFirstOf("AppFieldManager")
+        if valid(fm) then
+            local out = {}
+            local ok, r = pcall(function() return fm:IsInHideout(fm) end)
+            log("baseinfo: IsInHideout -> " .. tostring(ok) .. " " .. tostring(r) .. " " .. tostring(out.ReturnValue))
+        end
     elseif c == "lvlinfo" then
         -- level-up check values of every player's HumanContextComponent (CoopNative logs level, max, cost, haze)
         local addrs = {}
@@ -1128,9 +1316,29 @@ local function probeCommands()
 end
 
 local last = ""
+-- World-change guard (2026-10-30, item 5): polling session functions while a map travel tears the old world down crashed the game
+-- (18:55, the owner joining the brother's world: null read inside IsSendRescueSignal from a Lua poll). Session polls pause from a
+-- ClientTravel until the new world's game state has existed for 5 s (or 30 s at most), and for 5 s after any game state change.
+local wgTravelAt, wgGs, wgGsAt = -1000, nil, -1000
+pcall(function()
+    RegisterHook("/Script/Engine.PlayerController:ClientTravelInternal", function() wgTravelAt = os.clock() end)
+end)
+local function worldSettled()
+    local gs = FindFirstOf("BP_AppGameState_C")
+    local ok, a = pcall(function() return gs:IsValid() and gs:GetAddress() end)
+    a = ok and a or nil
+    if a ~= wgGs then
+        wgGs, wgGsAt = a, os.clock()
+        if wgTravelAt > 0 and os.clock() - wgTravelAt < 30 then wgTravelAt = -1000 end
+    end
+    if not a then return false end
+    if os.clock() - wgTravelAt < 30 then return false end
+    return os.clock() - wgGsAt > 5
+end
+
 LoopAsync(200, function()
     ExecuteInGameThread(function()
-        local line = try(stateLine) or "state error"
+        local line = worldSettled() and (try(stateLine) or "state error") or last
         if line ~= last then log("STATE " .. line); last = line end
         local w = try(spectateWindow) or false
         writeWindow(w)

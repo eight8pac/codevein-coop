@@ -202,8 +202,29 @@ local okDestroy, errDestroy = pcall(function()
 end)
 log("DestroyOnlineSessionLatent hook " .. (okDestroy and "registered" or ("FAILED " .. tostring(errDestroy))))
 
+-- World-change guard (2026-10-30, item 5): polling session functions while a map travel tears the old world down crashed the game
+-- (18:55, the owner joining the brother's world: null read inside IsSendRescueSignal from a Lua poll). Session polls pause from a
+-- ClientTravel until the new world's game state has existed for 5 s (or 30 s at most), and for 5 s after any game state change.
+local wgTravelAt, wgGs, wgGsAt = -1000, nil, -1000
+pcall(function()
+    RegisterHook("/Script/Engine.PlayerController:ClientTravelInternal", function() wgTravelAt = os.clock() end)
+end)
+local function worldSettled()
+    local gs = FindFirstOf("BP_AppGameState_C")
+    local ok, a = pcall(function() return gs:IsValid() and gs:GetAddress() end)
+    a = ok and a or nil
+    if a ~= wgGs then
+        wgGs, wgGsAt = a, os.clock()
+        if wgTravelAt > 0 and os.clock() - wgTravelAt < 30 then wgTravelAt = -1000 end
+    end
+    if not a then return false end
+    if os.clock() - wgTravelAt < 30 then return false end
+    return os.clock() - wgGsAt > 5
+end
+
 LoopAsync(1000, function()
     ExecuteInGameThread(function()
+        if not worldSettled() then return end
         local ok, err = pcall(tick)
         if not ok then log("tick error: " .. tostring(err)) end
     end)

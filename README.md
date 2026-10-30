@@ -68,8 +68,9 @@ Needs [Zig](https://ziglang.org/download/) (0.17 used; its clang cross-compiles 
 Works (two PCs): rejoin after guest field death, host death, boss-room death + wipe, boss kill; co-op in beaten areas.
 
 Works (two PCs, experiments):
-- `rest_in_coop`: the host rests at a Mistle with a guest connected; the guest stays. Enemies do not reset yet, and the partner
-  NPC respawns per rest.
+- `rest_in_coop`: the host rests at a Mistle with a guest connected; the guest stays and the enemies respawn when the host gets
+  up (two `IsOnlineMultiplay` checks in the reset are answered "not multiplayer"). The guest's own rest opens his Mistle menu
+  only (no reset yet; it already sends the host a request, `Server_AddExp(-2601)`).
 - `veto_endcoop` + `spectate_cam`: a guest who dies for good in a boss fight stays in the host's world and watches the host fight.
   A wipe still ends the session normally. Two veto points are needed: `EndCooperativeMode` and the small function that actually
   switches co-op off (`0x14081BDA0`), which a Blueprint-driven death path calls directly. The black screen was the death overlay
@@ -93,9 +94,12 @@ Works (two PCs, experiments):
   It ends co-op twice: `SwitchToEndCoop` from 0x146678D02 (with an "ending co-op / distress signal" message shown by
   0x14083A630 just before) and, on entering a stage where multiplayer is off, from 0x146D627CF plus a second step 0x1409F1BA0
   ("multiplayer is not possible in this area"). With those vetoed or skipped, the host arrives (CoopNative sees the characters
-  re-spawn) and the guest is spawned next to him with `RequestPlayerSpawn`. The guest sees the world unload around him for a few
-  seconds (fade to do). Home Base is a separate map: teleporting there this way drops the host into a pit.
-- Falls (`keep_dying`): a fall now leads straight to spectating (no revive window): the host plays the dissolve and removes the body.
+  re-spawn) and the guest is spawned next to him with `RequestPlayerSpawn`. The guest gets the game's own teleport fade: the host
+  sends `PlayerController:ClientMessage("CoopTeleportFade")` (a client RPC, used as a host -> guest channel) at the start, the
+  guest's CoopNative calls `RequestTeleportFade(ctx, ctx, 48, 0)` like the vanilla teleport and unfades once he is next to the
+  host. Home Base (FieldID 0) is a separate map and keeps the vanilla behaviour (`teleport_skip_fields=0`).
+- Falls (`keep_dying`): a fall leads straight to spectating (no revive window, no partner revive in the pit); the guest comes
+  back next to the host at the host's next rest.
 
 Post-boss outro and memory with the guest connected (`keep_outro`, `guest_outro`, two-PC tests 2026-10-30):
 - The outro (large-poly cutscene) waited for "partner ready" flags the guest never sets: four `IsOnlineMultiplay` calls in the
@@ -111,9 +115,14 @@ Post-boss outro and memory with the guest connected (`keep_outro`, `guest_outro`
   side); next is one source (block his own memory, mirror the host's scenes, his pawn walking along or the spectate camera), story
   progress for the guest (CoopProgress), then vestige restoration.
 
-In progress: enemy reset on a co-op rest (works once per
-session), resting together crashes, vestige restoration (menu entries enabled; the restoration screen still refuses), the guest's
-Mistle menu while the host rests (crash), 3+ players, a teleport vote.
+Fixed 2026-10-30: the guest's game crashed at a Mistle (inside UE4SS) because a Lua loop asked every `HumanContextComponent`
+for its owner, including half-destroyed ones of replaced characters; his own component now comes from his character directly.
+Lua session polls pause during a map travel (a poll during a join crashed the game). Pure log hooks are opt-in
+(`diag_hooks=1`); startup hooks are enabled in one batch (about 0.2 s instead of 7 s).
+
+In progress: vestige restoration (the entry checks in the restoration code are answered "not multiplayer"; to test), the
+guest's rest resetting enemies, the memory for the guest (plan: he leaves for the memory, plays it solo with control in his own
+world, and rejoins), Home Base mode for the guest (`CharacterHelper.SetRestrictedActionInBaseInfo`), 3+ players, a teleport vote.
 
 Diagnostics: CoopNative logs a freeze watchdog report when the game thread stops for 8 s; `tools/threadstacks.c` samples a running
 process's thread stacks (hangs that are not freezes), `tools/memread.c` / `tools/memwrite.c` read and write a running test copy's
