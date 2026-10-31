@@ -8,3 +8,4 @@ build/
 *.ini
 __pycache__/
 local/
+CoopLogs/

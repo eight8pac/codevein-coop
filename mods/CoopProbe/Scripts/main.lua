@@ -72,7 +72,7 @@ pcall(function()
         local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
         local dead = not valid(mine) or try(function() return helper:IsDeath(mine) end)
         if dead then
-            local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "w"); if c then c:write("replay"); c:close() end
+            local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a"); if c then c:write("replay\n"); c:close() end
         end
         log("boss rewards: spectate window forced closed" .. (dead and ", own character dead -> replay requested" or ""))
     end)
@@ -307,8 +307,8 @@ local function unlockInput()
         local fade = FindFirstOf("BP_FadeUIComponent_C")
         local addr = valid(fade) and try(function() return fade:GetAddress() end)
         if addr and not iniHas("keep_dying=1") then   -- with keep_dying no death fade ever starts: nothing to end
-            local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "w")
-            if c then c:write(string.format("unfade %X", addr)); c:close(); e = string.format("unfade sent for 0x%X", addr) end
+            local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
+            if c then c:write(string.format("unfade %X\n", addr)); c:close(); e = string.format("unfade sent for 0x%X", addr) end
         else
             e = "no fade component"
         end
@@ -507,17 +507,13 @@ local function sendMenuClass()
     end
     local addr = valid(cls) and try(function() return cls:GetAddress() end)
     if not addr then return end
-    -- CoopNative.cmd holds one command: wait while another one (restclass etc.) is still pending
-    local pending = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "r")
-    if pending then pending:close(); return end
-    local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "w")
-    if c then c:write(string.format("menuclass %X", addr)); c:close(); menuClassSent = true end
+    local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
+    if c then c:write(string.format("menuclass %X\n", addr)); c:close(); menuClassSent = true end
     log(string.format("vestige menu: WDT_CheckpointMenu_C class at 0x%X sent to CoopNative", addr))
 end
 
 -- Vestige restoration with a session (vestige_keep=1, R4 stage 2): CoopNative answers "no session" to the restoration screen's
 -- IsCreateSession / GetOnlineOtherPlayerNum; Lua hands over that screen's class once ("restclass <hex>"), like the menu class.
--- CoopNative.cmd holds one command, so wait while another one is still pending.
 local restClassSent = false
 local function sendRestoreClass()
     if restClassSent or not iniHas("vestige_keep=1") then return end
@@ -525,10 +521,8 @@ local function sendRestoreClass()
     local cls = valid(m) and try(function() return m:GetClass() end) or nil
     local addr = cls and try(function() return cls:GetAddress() end)
     if not addr then return end
-    local pending = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "r")
-    if pending then pending:close(); return end
-    local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "w")
-    if c then c:write(string.format("restclass %X", addr)); c:close(); restClassSent = true end
+    local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
+    if c then c:write(string.format("restclass %X\n", addr)); c:close(); restClassSent = true end
     log(string.format("vestige restoration: BP_BCRestorationUIComponent_C class at 0x%X sent to CoopNative", addr))
 end
 
@@ -564,11 +558,16 @@ local pendingTp = nil   -- {at, oldHost, newSeenAt}
 -- Post-boss outro (session 9): hand CoopNative the DeferredTeleportDriver objects and the guests' pawns/controllers every 2 s
 -- (CoopNative.tpinfo), so its tpdump/tpfree commands work while the host hangs and Lua does not run.
 local lastTpInfo, tpInfoAt = nil, -1000
+local tpTouchAt = -1000
 local function sendTpInfo()
     if os.clock() - tpInfoAt < 2 then return end
     tpInfoAt = os.clock()
     local gs = FindFirstOf("BP_AppGameState_C")
-    if not valid(gs) or try(function() return gs.Role end) ~= 3 then return end
+    -- 2026-10-31: a guest must not have a tpinfo (an old one made his CoopNative act as host)
+    if valid(gs) and try(function() return gs.Role end) ~= 3 then os.remove(WIN64 .. "\\plugins\\CoopNative.tpinfo"); lastTpInfo = nil; return end
+    if not valid(gs) then return end
+    -- CoopNative ignores a tpinfo older than 2 minutes: rewrite it every 30 s even without a change
+    if os.clock() - tpTouchAt > 30 then tpTouchAt = os.clock(); lastTpInfo = nil end
     local lines = {}
     for _, d in ipairs(FindAllOf("DeferredTeleportDriver") or {}) do
         local a = valid(d) and try(function() return d:GetAddress() end)
@@ -897,11 +896,9 @@ pcall(function()
     end)
 end)
 local function tpfadeSend(ctx, on)
-    local pending = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "r")
-    if pending then pending:close(); return false end
-    local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "w")
+    local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
     if not c then return false end
-    c:write(string.format("tpfade %X %d", ctx, on and 1 or 0)); c:close()
+    c:write(string.format("tpfade %X %d\n", ctx, on and 1 or 0)); c:close()
     return true
 end
 local function guestTeleportFade()
@@ -956,6 +953,122 @@ local function guestTeleportFade()
     tpfHostAlive = valid(host) and not try(function() return helper:IsDeath(host) end) and not try(function() return helper:IsDying(host) end)
 end
 
+-- Scene relay (2026-10-30, after the Lies of P study): CoopNative appends every RequestEvent / RequestSkipEvent to
+-- CoopNative.relay. Host: each line goes to the guests as ClientMessage("CoopEvent:<class>|<actor>|<event>") / ("CoopSkip").
+-- Guest: his own lines are remembered (an event his game already ran is not run again); with scene_relay=1 a received event is
+-- run on the actor of the same class and name (placed level actors have the same names on both PCs) and a skip is pressed on his
+-- skip prompt. Without scene_relay=1 he only logs what arrives.
+local relayErr = false
+local RELAY_PATH = WIN64 .. "\\plugins\\CoopNative.relay"
+os.remove(RELAY_PATH)
+local relayAt, localEvents, relayIn = -1000, {}, {}
+local function fnameText(idx, num)
+    local ok, s = pcall(function() return FName(idx):ToString() end)
+    if not ok or not s then return nil end
+    if num and num > 0 then s = s .. "_" .. (num - 1) end
+    return s
+end
+pcall(function()
+    RegisterHook("/Script/Engine.PlayerController:ClientMessage", function(ctx, s)
+        local text = try(function() return s:get():ToString() end)
+        if text and (text == "CoopSkip" or text == "CoopMemoryStart" or text == "CoopMemoryEnd" or text:find("^CoopEvent:")) then relayIn[#relayIn + 1] = text end
+    end)
+end)
+local function sceneRelay()
+    if os.clock() - relayAt < 0.2 then return end
+    relayAt = os.clock()
+    local gs = FindFirstOf("BP_AppGameState_C")
+    local isHost = valid(gs) and try(function() return gs.Role end) == 3
+    local work = RELAY_PATH .. ".work"
+    if os.rename(RELAY_PATH, work) then
+        local f = io.open(work, "r")
+        local lines = {}
+        if f then for l in f:lines() do lines[#lines + 1] = l end; f:close() end
+        os.remove(work)
+        for _, l in ipairs(lines) do
+            local msg
+            if l == "skip" then msg = "CoopSkip"
+            elseif l == "memstart" then msg = "CoopMemoryStart"
+            elseif l == "memend" then msg = "CoopMemoryEnd"
+            else
+                local ni, nn, ci, ev = l:match("^event (%-?%d+) (%-?%d+) (%-?%d+) (.+)$")
+                if ev then
+                    local actor = fnameText(tonumber(ni), tonumber(nn)) or "?"
+                    local cls = fnameText(tonumber(ci), 0) or "?"
+                    msg = "CoopEvent:" .. cls .. "|" .. actor .. "|" .. ev
+                    localEvents[ev] = os.clock()
+                end
+            end
+            if msg and isHost then
+                for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+                    if valid(c) and not try(function() return c:IsLocalController() end) then
+                        pcall(function() c:ClientMessage(msg, FName("None"), 0) end)
+                    end
+                end
+                log("scene relay: sent " .. msg)
+            elseif msg then
+                log("scene relay: own " .. msg)
+            end
+        end
+    end
+    if isHost or #relayIn == 0 then relayIn = {}; return end
+    local on = iniHas("scene_relay=1")
+    for _, text in ipairs(relayIn) do
+        if text == "CoopMemoryStart" or text == "CoopMemoryEnd" then
+            -- 2026-10-31: his own memory never started (his game was still in its outro when the host's memory pulled him in), so
+            -- the memory window comes from the host now: guestMemoryControl unlocks his input on every new character
+            local mf = io.open(WIN64 .. "\\plugins\\CoopNative.guestmem", "w")
+            if mf then mf:write(text == "CoopMemoryStart" and "1" or "0"); mf:close() end
+            log("scene relay: host says " .. text)
+        elseif text == "CoopSkip" then
+            local comp = FindFirstOf("SkipEventUIComponent")
+            local ok = on and valid(comp) and pcall(function() comp:RequestSkipEvent() end)
+            log("scene relay: host skipped -> " .. (on and ("skip " .. tostring(ok)) or "logged only (scene_relay off)"))
+        else
+            local cls, actorName, ev = text:match("^CoopEvent:([^|]*)|([^|]*)|(.+)$")
+            local seen = ev and localEvents[ev] and os.clock() - localEvents[ev] < 20
+            if not on or seen then
+                log("scene relay: host event " .. tostring(ev) .. " on " .. tostring(actorName) .. (seen and " (already ran here)" or " (logged only)"))
+            else
+                local target
+                for _, a in ipairs(FindAllOf(cls) or {}) do if valid(a) and name(a) == actorName then target = a end end
+                local lib = StaticFindObject("/Script/Extensions.Default__ScenarioFunctionLibrary")
+                local ok, err = false, "no actor " .. tostring(actorName)
+                if valid(target) and valid(lib) then ok, err = pcall(function() lib:RequestEvent(target, ev) end) end
+                localEvents[ev] = os.clock()
+                log("scene relay: host event " .. ev .. " on " .. tostring(actorName) .. " -> " .. (ok and "run" or ("NOT run: " .. tostring(err):sub(1, 100))))
+            end
+        end
+    end
+    relayIn = {}
+end
+
+-- Memory control (2026-10-31): the guest floated without control in the host's memory. While CoopNative marks the memory window
+-- (CoopNative.guestmem = 1, written at his PlayMemoryResidue), every new character of ours (the memory teleport respawns him) gets
+-- the input unlock used after a respawn (temporary input masks, ignore-input flags, game-only input mode), and its state is logged
+-- every 3 s for a minute: begun play, tick enabled, movement mode, move input ignored.
+local memCtlPawn, memCtlAt, memCtlLog = nil, nil, -1000
+local function guestMemoryControl()
+    local f = io.open(WIN64 .. "\\plugins\\CoopNative.guestmem", "r"); if not f then return end
+    local on = (f:read("*a") or ""):match("1") ~= nil; f:close()
+    if not on then memCtlPawn = nil; return end
+    local pc = localPC()
+    local mine = valid(pc) and try(function() return pc.Pawn end) or nil
+    if not valid(mine) then return end
+    if name(mine) ~= memCtlPawn then
+        memCtlPawn, memCtlAt = name(mine), os.clock()
+        unlockUntil, unlockedPawn = os.clock() + 20, nil
+        log("memory control: our character is " .. memCtlPawn .. " -> input unlock for 20 s")
+    end
+    if memCtlAt and os.clock() - memCtlAt < 60 and os.clock() - memCtlLog > 3 then
+        memCtlLog = os.clock()
+        local cm = try(function() return mine.CharacterMovement end)
+        log(string.format("memory control: %s begunPlay=%s tick=%s moveMode=%s moveIgnored=%s", memCtlPawn,
+            tostring(try(function() return mine:HasActorBegunPlay() end)), tostring(try(function() return mine:IsActorTickEnabled() end)),
+            tostring(valid(cm) and try(function() return cm.MovementMode end)), tostring(try(function() return pc:IsMoveInputIgnored() end))))
+    end
+end
+
 -- Memory spectating (session 10, step c): while the host's memory runs (CoopNative.guestmem = 1, written by CoopNative when our own
 -- memory copy is blocked) our camera follows the host's character and our own pawn is hidden (it floats there without control).
 -- When it ends (0) the camera goes back to our pawn and it is shown again.
@@ -963,6 +1076,7 @@ local GUESTMEM_PATH = WIN64 .. "\\plugins\\CoopNative.guestmem"
 do local f = io.open(GUESTMEM_PATH, "w"); if f then f:write("0"); f:close() end end
 local memSpectating, memHiddenPawn, memSpecAt = false, nil, -1000
 local function guestMemorySpectate()
+    if not iniHas("guest_memory_block=1") then return end   -- (2026-10-31: the window now means "unlock", see guestMemoryControl)
     if os.clock() - memSpecAt < 1 then return end
     memSpecAt = os.clock()
     local f = io.open(GUESTMEM_PATH, "r"); if not f then return end
@@ -1117,8 +1231,8 @@ local function resyncAfterMenu()
     log("guest rest: menu closed -> resync: character flag " .. before .. " -> false (" .. tostring(ok) .. "), " .. n .. " component flag(s) cleared")
     -- clearing the flags alone sends nothing (update 38): have CoopNative call the game's join-time sender on our pawn
     local addr = try(function() return mine:GetAddress() end)
-    local f = addr and io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "w")
-    if f then f:write(string.format("syncall %X", addr)); f:close() end
+    local f = addr and io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
+    if f then f:write(string.format("syncall %X\n", addr)); f:close() end
     log("guest rest: syncall " .. (f and "requested" or "FAILED"))
 end
 local LVL_STEPS = { 0, 1, 3, 6 }
@@ -1137,8 +1251,8 @@ local function guestLevelWatch()
     if not due then lvlWatch = nil; return end
     if os.clock() - lvlWatch.at < due then return end
     lvlWatch.step = lvlWatch.step + 1
-    local f = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "w")
-    if f then f:write(string.format("lvlinfo %X", lvlWatch.a)); f:close() end
+    local f = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
+    if f then f:write(string.format("lvlinfo %X\n", lvlWatch.a)); f:close() end
 end
 -- Test helper (host, test copy only; session 10 prep): "bosshp1" in CoopProbe.cmd sets the bosses of the running fight to 1
 -- health, so the next hit kills them through the normal death path. Boss lookup after Rikka230's CoopDevTools: the boss areas
@@ -1195,7 +1309,10 @@ local function probeCommands()
     pcall(guestOutro)
     pcall(writeMyPawn)
     pcall(guestMemorySpectate)
+    pcall(guestMemoryControl)
     pcall(guestTeleportFade)
+    local okr, er = pcall(sceneRelay)
+    if not okr and not relayErr then relayErr = true; log("scene relay ERROR " .. tostring(er):sub(1, 160)) end
     guestLevelWatch()
     guestRestRequest()
     resyncAfterMenu()
@@ -1214,8 +1331,8 @@ local function probeCommands()
         -- solo test of the level-up call path: the host levels itself up by one through CoopNative, without the menu
         local cp = FindFirstOf("BP_CheckpointUIComponent_C")
         local a = valid(cp) and try(function() return cp:GetAddress() end)
-        local f = a and io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "w")
-        if f then f:write(string.format("levelup %X 1 0", a)); f:close() end
+        local f = a and io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
+        if f then f:write(string.format("levelup %X 1 0\n", a)); f:close() end
         log("levelme: " .. (f and "sent" or "no checkpoint component"))
     elseif c == "memrespawn" or c == "memrespawn2" then
         -- Memory with a guest (session 10): the museum spawns the host's memory character but never starts it (its tick is not
@@ -1285,8 +1402,8 @@ local function probeCommands()
                 if a then addrs[#addrs + 1] = string.format("%X", a); log("lvlinfo: " .. name(o) .. " component 0x" .. addrs[#addrs]) end
             end
         end
-        local f = #addrs > 0 and io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "w")
-        if f then f:write("lvlinfo " .. table.concat(addrs, " ")); f:close() end
+        local f = #addrs > 0 and io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
+        if f then f:write("lvlinfo " .. table.concat(addrs, " ") .. "\n"); f:close() end
     elseif c == "guesthaze" then
         -- haze test (session 8): give the guest's character copy in our world 100000 haze, to see whether the host-side level-up
         -- for him was refused for lack of haze (his haze is spent only on his PC)
