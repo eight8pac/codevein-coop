@@ -4,6 +4,7 @@
 // A command file lets Lua ask for memory reads (vtable lookups) that UE4SS Lua cannot do itself.
 // The exe has no ASLR (DYNAMIC_BASE off), so UFunction exec thunk addresses from the UE4SS object dump are fixed.
 #include <windows.h>
+#include <shlobj.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <share.h>
@@ -553,14 +554,10 @@ static void dump_game_thread(ULONGLONG silent_ms) {
     } else snprintf(line, sizeof line, "no context (%lu)", err);
     logf_("watchdog: game thread silent %llu ms: %s", (unsigned long long)silent_ms, line);
 }
-static void detour_get_state(void *context, void *stack, void *result) {
-    g_heartbeat = GetTickCount64(); g_game_tid = GetCurrentThreadId();
-    if (g_replay_pending && context && context == g_vetoed_sm && InterlockedExchange(&g_replay_pending, 0)) {
-        LONG kind = InterlockedExchange(&g_vetoed_kind, 0);
-        g_vetoed_sm = NULL;
-        logf_("replay: calling the vetoed %s for real", kind == 2 ? "EndCooperativeMode" : "SwitchToEndCoop");
-        if (kind == 2) g_orig_end_coop(context); else g_orig_switch_end_coop(context);
-    }
+// Work that must run on the game thread. Pumped every frame by the GameEngine::Tick hook below and, as before, by the
+// GetRescueSignalState hook (fallback: that one only runs while Blueprints poll it, about once a second). Each item is taken with
+// an InterlockedExchange, so whichever pump comes first runs it once.
+static void game_thread_work(void) {
     if (g_unfade_pending && InterlockedExchange(&g_unfade_pending, 0)) run_unfade();
     if (g_memunfade_pending && InterlockedExchange(&g_memunfade_pending, 0)) {
         uintptr_t actor = g_memory_actor;
@@ -583,6 +580,78 @@ static void detour_get_state(void *context, void *stack, void *result) {
     if (g_levelup_pending && InterlockedExchange(&g_levelup_pending, 0)) run_levelup();
     if (g_syncall_pending && InterlockedExchange(&g_syncall_pending, 0)) run_syncall();
     if (g_lvlinfo_pending && InterlockedExchange(&g_lvlinfo_pending, 0)) run_lvlinfo();
+}
+// Scene relay (2026-10-30, after the Lies of P study, which plays cutscenes on every PC and relays only start/skip by name).
+// ScenarioFunctionLibrary:RequestEvent (thunk 0x140B4B6F0) -> impl 0x14090CA30(Actor, FString* Event); SkipEventUIComponent:
+// RequestSkipEvent (thunk 0x140B5A240) -> impl 0x1409CC030(component). Both PCs log every call and append it to CoopNative.relay:
+// "event <actor name index> <number> <class name index> <event>" / "skip". CoopProbe on the host turns them into ClientMessages
+// for the guest; on the guest the lines are its own events (duplicate filter).
+#define ADDR_REQUEST_EVENT_IMPL 0x14090CA30ULL
+#define ADDR_SKIP_EVENT_IMPL 0x1409CC030ULL
+typedef uint64_t (*reqevent_fn)(void *actor, void *event);
+typedef uint64_t (*skipevent_fn)(void *comp);
+static reqevent_fn g_orig_request_event;
+static skipevent_fn g_orig_skip_event;
+static volatile LONG g_relay_logs;
+static void relay_append(const char *line) {
+    char path[MAX_PATH];
+    snprintf(path, sizeof path, "%sCoopNative.relay", g_dir);
+    FILE *f = _fsopen(path, "a", _SH_DENYNO);
+    if (f) { fputs(line, f); fputc('\n', f); fclose(f); }
+}
+static uint64_t detour_request_event(void *actor, void *event) {
+    char name[160] = "";
+    uintptr_t e = (uintptr_t)event;
+    if (e && readable(e, 16)) {
+        const uint16_t *w = *(const uint16_t **)e;
+        int n = *(int *)(e + 8);
+        if (w && n > 0 && n < 150 && readable((uintptr_t)w, (size_t)n * 2)) {
+            int k = 0;
+            for (int i = 0; i < n - 1 && k < 150; i++) name[k++] = (w[i] >= 32 && w[i] < 127 && w[i] != ' ') ? (char)w[i] : '_';
+            name[k] = 0;
+        }
+    }
+    uintptr_t a = (uintptr_t)actor;
+    int ni = 0, nn = 0, ci = 0;
+    if (a && readable(a + 0x10, 0x10)) {
+        ni = *(int *)(a + 0x18); nn = *(int *)(a + 0x1C);
+        uintptr_t cls = *(uintptr_t *)(a + 0x10);
+        if (cls && readable(cls + 0x18, 4)) ci = *(int *)(cls + 0x18);
+    }
+    if ((name[0] && strcmp(name, "None") != 0 && InterlockedIncrement(&g_relay_logs) <= 400))
+        logf_("scene: RequestEvent(actor 0x%llX name %d_%d class %d, \"%s\")", (unsigned long long)a, ni, nn, ci, name);
+    // (2026-10-31 guest log: RequestEvent runs every second for doors/Mistles/chests with an empty or "None" event: not relayed)
+    if (name[0] && strcmp(name, "None") != 0) { char line[256]; snprintf(line, sizeof line, "event %d %d %d %s", ni, nn, ci, name); relay_append(line); }
+    return g_orig_request_event(actor, event);
+}
+static uint64_t detour_skip_event(void *comp) {
+    uint64_t r = g_orig_skip_event(comp);
+    logf_("scene: RequestSkipEvent(0x%llX) -> %llu", (unsigned long long)(uintptr_t)comp, (unsigned long long)(r & 0xFF));
+    relay_append("skip");
+    return r;
+}
+
+// Game-thread pump (2026-10-30, after the Lies of P study, which drains its queue from a hooked engine tick): UGameEngine::Tick
+// 0x14EBE3C20 (UE4SS finds the same address; it hooks it too, later, on top of ours). (this, float DeltaSeconds, bool bIdleMode).
+#define ADDR_GAME_ENGINE_TICK 0x14EBE3C20ULL
+typedef void (*enginetick_fn)(void *self, float delta, uint8_t idle);
+static enginetick_fn g_orig_engine_tick;
+static volatile LONG64 g_engine_ticks;
+static void detour_engine_tick(void *self, float delta, uint8_t idle) {
+    g_heartbeat = GetTickCount64(); g_game_tid = GetCurrentThreadId();
+    if (InterlockedIncrement64(&g_engine_ticks) == 1) logf_("game-thread pump: first GameEngine::Tick (thread %lu)", GetCurrentThreadId());
+    game_thread_work();
+    g_orig_engine_tick(self, delta, idle);
+}
+static void detour_get_state(void *context, void *stack, void *result) {
+    g_heartbeat = GetTickCount64(); g_game_tid = GetCurrentThreadId();
+    if (g_replay_pending && context && context == g_vetoed_sm && InterlockedExchange(&g_replay_pending, 0)) {
+        LONG kind = InterlockedExchange(&g_vetoed_kind, 0);
+        g_vetoed_sm = NULL;
+        logf_("replay: calling the vetoed %s for real", kind == 2 ? "EndCooperativeMode" : "SwitchToEndCoop");
+        if (kind == 2) g_orig_end_coop(context); else g_orig_switch_end_coop(context);
+    }
+    game_thread_work();
     int menu = g_vestige_enabled && from_menu(stack);
     g_orig_get_state(context, stack, result);
     if (menu && result) { *(uint8_t *)result = 0; InterlockedIncrement(&g_vestige_overrides); }
@@ -968,6 +1037,16 @@ static char g_dir[MAX_PATH];
 static int read_small_file(const char *name, char *buf, size_t size) {
     char path[MAX_PATH];
     snprintf(path, sizeof path, "%s%s", g_dir, name);
+    // 2026-10-31: the guest's PC had an old CoopNative.tpinfo from a session he hosted, so his CoopNative acted as host. tpinfo is
+    // written by the host's CoopProbe (on change, and touched every 30 s, see sendTpInfo): older than 2 minutes = not ours
+    if (strcmp(name, "CoopNative.tpinfo") == 0) {
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) return 0;
+        FILETIME now; GetSystemTimeAsFileTime(&now);
+        ULONGLONG t = ((ULONGLONG)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
+        ULONGLONG n = ((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime;
+        if (n > t && n - t > 120ULL * 10000000ULL) return 0;
+    }
     FILE *f = _fsopen(path, "r", _SH_DENYNO);
     if (!f) return 0;
     size_t n = fread(buf, 1, size - 1, f);
@@ -1003,7 +1082,9 @@ static int g_host_idx[TP_MAX], g_nhost;
 static int tp_read_info(uintptr_t *drivers, int *nd, int *guest_idx, int *ng) {
     char buf[600];
     *nd = *ng = 0; g_nhost = 0;
-    if (!read_small_file("CoopNative.tpinfo", buf, sizeof buf)) return 0;
+    // 2026-10-31: before joining, the guest hosts his own world and his CoopProbe writes a tpinfo; it is deleted after the join,
+    // but g_host_pc stayed set, so his CoopNative kept acting as host (no guest v5). No (fresh) tpinfo = not the host now.
+    if (!read_small_file("CoopNative.tpinfo", buf, sizeof buf)) { g_host_pc = 0; g_host_pawn = 0; return 0; }
     for (char *p = strtok(buf, "\r\n"); p; p = strtok(NULL, "\r\n")) {
         unsigned long long a;
         if (sscanf(p, "driver %llx", &a) == 1 && *nd < TP_MAX) drivers[(*nd)++] = (uintptr_t)a;
@@ -1083,12 +1164,25 @@ static void tp_tokens(int free_guest) {
     }
 }
 
+// Command queue (2026-10-30, after the Lies of P study): CoopNative.cmd used to hold ONE command, and two writers overwrote each
+// other (menuclass / restclass). Now Lua appends one command per line; the file is renamed before reading (a writer appending
+// at that moment starts a new file) and every line is run in order.
+static void run_command(char *buf);
 static void run_commands(void) {
-    char buf[256];
-    if (!read_small_file("CoopNative.cmd", buf, sizeof buf)) return;
-    char path[MAX_PATH];
+    char path[MAX_PATH], work[MAX_PATH];
     snprintf(path, sizeof path, "%sCoopNative.cmd", g_dir);
-    DeleteFileA(path);
+    snprintf(work, sizeof work, "%sCoopNative.cmd.work", g_dir);
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) return;
+    if (!MoveFileExA(path, work, MOVEFILE_REPLACE_EXISTING)) return;
+    char all[4096] = "";
+    FILE *f = _fsopen(work, "rb", _SH_DENYNO);
+    if (f) { size_t n = fread(all, 1, sizeof all - 1, f); all[n] = 0; fclose(f); }
+    DeleteFileA(work);
+    char *ctx = NULL;
+    for (char *line = strtok_s(all, "\r\n", &ctx); line; line = strtok_s(NULL, "\r\n", &ctx))
+        if (*line) run_command(line);
+}
+static void run_command(char *buf) {
     unsigned long long a = 0, b = 0;
     if (sscanf(buf, "vfunc %llx %llx", &a, &b) == 2) {
         if (!readable((uintptr_t)a, 8)) { logf_("vfunc: object 0x%llX not readable", a); return; }
@@ -1628,7 +1722,11 @@ static void gift_note(int i, void *c, void *st) {
     // session 10: the memory moves the host into its own area and waits for the guest, who never arrives (his game has no memory
     // ground, he falls). Treat the memory start like a host teleport: group teleport spawns the guest next to the host's memory
     // character once it is up (same "start"/"arrived" markers as a Mistle teleport).
-    if (strstr(g_gift_name[i], "PlayMemoryResidue")) { g_memory_at = GetTickCount64(); g_memory_start_at = g_memory_at; }
+    if (strstr(g_gift_name[i], "PlayMemoryResidue")) {
+        g_memory_at = GetTickCount64(); g_memory_start_at = g_memory_at;
+        if (!g_host_pc && g_keep_outro) { write_guestmem(1); logf_("memory: guest memory window open (CoopProbe unlocks his input)"); }
+        if (g_host_pc) relay_append("memstart");
+    }
     if (g_keep_outro && g_group_teleport && g_memstart_tp && strstr(g_gift_name[i], "PlayMemoryResidue")) {
         logf_("memory start: guest follows like a group teleport");
         write_teleport_marker("start");
@@ -1697,6 +1795,7 @@ static void late_note(int i, void *c, void *st) {
         g_memory_at = 0;
         if (g_keep_outro && g_group_teleport) {
             logf_("memory end: v5 off; guest follows the host back like a group teleport");
+            relay_append("memend");
             write_teleport_marker("start");
             InterlockedExchange(&g_tp_pending, 1);
         }
@@ -1790,6 +1889,9 @@ FADE_DETOUR(3)
 FADE_DETOUR(4)
 static void *g_fade_det[FADE_N] = {(void *)fade_det_0, (void *)fade_det_1, (void *)fade_det_2, (void *)fade_det_3, (void *)fade_det_4};
 
+static char g_cl_result[300];
+static void cl_start_zip(void);
+static void cl_snapshot(void);
 static DWORD WINAPI worker(LPVOID unused) {
     (void)unused;
     Sleep(2000);   // let the engine finish its own startup first
@@ -1843,6 +1945,12 @@ static DWORD WINAPI worker(LPVOID unused) {
             "\xE9\xDB\xEE\x94\x05\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_in_charge, (void **)&g_orig_in_charge);
     install("LevelCheck", ADDR_LEVEL_CHECK,
             "\xE9\x0B\x6B\xD6\x05\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_level_check, (void **)&g_orig_level_check);
+    install("RequestEventImpl", ADDR_REQUEST_EVENT_IMPL,
+            "\xE9\x1B\xA6\x76\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_request_event, (void **)&g_orig_request_event);
+    install("RequestSkipEventImpl", ADDR_SKIP_EVENT_IMPL,
+            "\xE9\xEB\x2C\x9A\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_skip_event, (void **)&g_orig_skip_event);
+    install("GameEngineTick", ADDR_GAME_ENGINE_TICK,
+            "\x48\x89\xE0\x44\x88\x40\x18\x55\x53\x57\x41\x54\x41\x56\x48\x8D", (void *)detour_engine_tick, (void **)&g_orig_engine_tick);
     install("AppearLockAcquire", 0x1404448B0ULL,
             "\xE9\x3B\x5C\x93\x05\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_lock_acquire, (void **)&g_orig_lock_acquire);
     install("AppearLockRelease", 0x140448D40ULL,
@@ -1903,11 +2011,19 @@ static DWORD WINAPI worker(LPVOID unused) {
         g_hook_batch = 0;
         logf_("startup hooks enabled together -> %s", MH_StatusToString(es));
     }
+    if (g_cl_result[0]) logf_("log collection: %s", g_cl_result);
+    cl_start_zip();
     for (unsigned tick = 0;; tick++) {
+        if (tick % 150 == 20) cl_snapshot();   // every 30 s (200 ms ticks)
         Sleep(200);
         read_settings();
         run_commands();
         guest_memory_watch();
+        {
+            static int gm_open;
+            if (!g_host_pc && g_memory_start_at && GetTickCount64() - g_memory_start_at < 900000) gm_open = 1;
+            else if (gm_open) { gm_open = 0; write_guestmem(0); logf_("memory: guest memory window closed"); }
+        }
         // memory end on the host (polish 2b): the museum actor is freed at the end; its vtable changes -> group teleport back
         {
             static uintptr_t mus_seen, mus_vt;
@@ -1917,6 +2033,7 @@ static DWORD WINAPI worker(LPVOID unused) {
                 g_memory_at = 0; g_museum_actor = 0;
                 if (g_keep_outro && g_group_teleport) {
                     logf_("memory end (museum actor gone): v5 off; guest follows the host back like a group teleport");
+                    relay_append("memend");
                     write_teleport_marker("start");
                     InterlockedExchange(&g_tp_pending, 1);
                 }
@@ -1942,6 +2059,79 @@ static DWORD WINAPI worker(LPVOID unused) {
                 *(volatile int *)0x14413C404ULL = 0;
                 *(volatile int *)0x14413C40CULL = 0;
                 *(volatile uint64_t *)0x14413C410ULL = *(volatile uint64_t *)0x144194140ULL;
+            }
+        }
+        // v5g (2026-10-31): the guest floated without control in the host's memory. Most likely his memory character hit the same
+        // counter as ours (v5 above only resets the host's): tick not registered (+0x35 = 0), appear unfinished. During the memory
+        // window, log his character's flags (gpawn from tpinfo) every 3 s and, if it stays unstarted 2 s after it appeared, do the
+        // same reset on it (at most 3 times per memory).
+        {
+            static ULONGLONG g5_log, g5_seen_at, g5_mem;
+            static uintptr_t g5_pawn;
+            static int g5_count;
+            ULONGLONG nowg = GetTickCount64();
+            if (g5_mem != g_memory_at) { g5_mem = g_memory_at; g5_count = 0; g5_pawn = 0; }
+            if (g_keep_outro && g_memory_at && nowg - g_memory_at < 900000) {
+                char tb[600]; uintptr_t gp = 0;
+                if (read_small_file("CoopNative.tpinfo", tb, sizeof tb)) {
+                    char *q = strstr(tb, "gpawn ");
+                    if (q) gp = (uintptr_t)strtoull(q + 6, NULL, 16);
+                }
+                if (gp != g5_pawn) { g5_pawn = gp; g5_seen_at = nowg; }
+                if (gp && readable(gp + 0x28, 0x10) && readable(gp + 0xB80, 8)) {
+                    uint8_t t35 = *(volatile uint8_t *)(gp + 0x35), t37 = *(volatile uint8_t *)(gp + 0x37), b83 = *(volatile uint8_t *)(gp + 0xB83);
+                    if (nowg - g5_log > 3000) {
+                        g5_log = nowg;
+                        logf_("memory: guest character 0x%llX tick +0x35 %u +0x37 %u b83 %u (count %d, frame-block %s)", (unsigned long long)gp,
+                              t35, t37, b83, *(volatile int *)0x14413C404ULL, *(volatile uint64_t *)0x14413C410ULL == ~0ULL ? "forever" : "no");
+                    }
+                    // (2026-10-31 08:20 test: his character on the host was started (+0x35 = 1) throughout; the reset fired once on a
+                    //  momentary read during his character swap and pushed the counter to -1 -> logging only now)
+                    if (0 && t35 == 0 && nowg - g5_seen_at > 2000 && g5_count < 3 && *(volatile int *)0x14413C408ULL <= 0) {
+                        g5_count++; g5_seen_at = nowg;
+                        logf_("appear lock v5g: guest memory character 0x%llX unstarted (b83 %u, count %d) -> lock reset (%d)", (unsigned long long)gp,
+                              b83, *(volatile int *)0x14413C404ULL, g5_count);
+                        *(volatile uint8_t *)(gp + 0xB83) = 0;
+                        *(volatile int *)0x14413C404ULL = 0;
+                        *(volatile int *)0x14413C40CULL = 0;
+                        *(volatile uint64_t *)0x14413C410ULL = *(volatile uint64_t *)0x144194140ULL;
+                    }
+                }
+            }
+        }
+        // v5 on the guest (2026-10-31 08:5x guest log: his memory character had tick=false, moveMode=0 on HIS PC the whole memory,
+        // input not ignored; on the host it ran): his game holds his own memory character before AppBeginPlay, the same counter as
+        // the host's. While the memory window is open (CoopNative.guestmem = 1, written by CoopProbe on the host's CoopMemoryStart),
+        // check his own pawn (CoopNative.mypawn) every 200 ms: unstarted (+0x35 = 0) for 2 s -> the v5 reset (at most 3 per window).
+        if (!g_host_pc) {
+            static ULONGLONG gv5_log, gv5_since;
+            static uintptr_t gv5_pawn;
+            static int gv5_count, gv5_open;
+            char gm[8] = "";
+            int open = read_small_file("CoopNative.guestmem", gm, sizeof gm) && gm[0] == '1';
+            if (open && !gv5_open) { gv5_count = 0; logf_("memory (guest): window open, watching our own memory character"); }
+            gv5_open = open;
+            uintptr_t mp = open ? read_my_pawn() : 0;
+            ULONGLONG nowv = GetTickCount64();
+            if (mp != gv5_pawn) { gv5_pawn = mp; gv5_since = nowv; }
+            if (mp && readable(mp + 0x28, 0x10) && readable(mp + 0xB80, 8)) {
+                uint8_t t35 = *(volatile uint8_t *)(mp + 0x35), b83 = *(volatile uint8_t *)(mp + 0xB83);
+                if (nowv - gv5_log > 3000) {
+                    gv5_log = nowv;
+                    logf_("memory (guest): our character 0x%llX tick +0x35 %u b83 %u (count %d, +0xB85 holders %d, frame-block %s)", (unsigned long long)mp,
+                          t35, b83, *(volatile int *)0x14413C404ULL, *(volatile int *)0x14413C408ULL,
+                          *(volatile uint64_t *)0x14413C410ULL == ~0ULL ? "forever" : "no");
+                }
+                if (t35 != 0) gv5_since = nowv;
+                else if (nowv - gv5_since > 2000 && gv5_count < 3 && *(volatile int *)0x14413C408ULL <= 0) {
+                    gv5_count++; gv5_since = nowv;
+                    logf_("appear lock v5 (guest): our memory character 0x%llX unstarted (b83 %u, count %d) -> lock reset (%d)", (unsigned long long)mp,
+                          b83, *(volatile int *)0x14413C404ULL, gv5_count);
+                    *(volatile uint8_t *)(mp + 0xB83) = 0;
+                    *(volatile int *)0x14413C404ULL = 0;
+                    *(volatile int *)0x14413C40CULL = 0;
+                    *(volatile uint64_t *)0x14413C410ULL = *(volatile uint64_t *)0x144194140ULL;
+                }
             }
         }
         // v4 (session 10): from the memory start on (3 min, keep_outro), keep the appear lock from being "forever" while no +0xB85
@@ -1997,6 +2187,110 @@ static DWORD WINAPI worker(LPVOID unused) {
     }
 }
 
+// Automatic log collection (2026-10-31, owner; the Lies of P mod ships crash reporting). Everything stays on this PC:
+// plugins\CoopLogs\current\ holds copies of UE4SS.log and the game's CodeVein.log, refreshed every 30 s while the game runs (the
+// game and UE4SS overwrite their logs at the next start). At the next start, before CoopNative.log is reopened, the previous run
+// is moved to CoopLogs\previous\ together with that CoopNative.log and any new crash report folder (Saved\Crashes), and zipped to
+// CoopLogs\CoopLogs-<date>-<time>.zip (the newest 5 are kept). After a problem: start the game once, send the newest zip.
+static void cl_path(char *out, size_t n, const char *rel) { snprintf(out, n, "%sCoopLogs\\%s", g_dir, rel); }
+static void cl_copy_dir_files(const char *from, const char *to) {
+    char pat[MAX_PATH]; snprintf(pat, sizeof pat, "%s\\*", from);
+    WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        char a[MAX_PATH], b[MAX_PATH];
+        snprintf(a, sizeof a, "%s\\%s", from, fd.cFileName); snprintf(b, sizeof b, "%s\\%s", to, fd.cFileName);
+        CopyFileA(a, b, FALSE);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+static void cl_clear_dir(const char *dir) {
+    char pat[MAX_PATH]; snprintf(pat, sizeof pat, "%s\\*", dir);
+    WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        char a[MAX_PATH]; snprintf(a, sizeof a, "%s\\%s", dir, fd.cFileName); DeleteFileA(a);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+// the per-user local application data folder (known folder F1B32785-6FBA-4FCF-9D55-7B8E7F157091), where the game keeps Saved
+static int cl_game_saved(char *out, size_t n, const char *rel) {
+    static const GUID local_folder = {0xF1B32785, 0x6FBA, 0x4FCF, {0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91}};
+    PWSTR w = NULL;
+    if (SHGetKnownFolderPath(&local_folder, 0, NULL, &w) != S_OK || !w) { if (w) CoTaskMemFree(w); return 0; }
+    char la[MAX_PATH];
+    int k = WideCharToMultiByte(CP_ACP, 0, w, -1, la, sizeof la, NULL, NULL);
+    CoTaskMemFree(w);
+    if (k <= 0) return 0;
+    snprintf(out, n, "%s\\CodeVein\\Saved\\%s", la, rel);
+    return 1;
+}
+// worker, every 30 s
+static void cl_snapshot(void) {
+    char cur[MAX_PATH], a[MAX_PATH], b[MAX_PATH];
+    cl_path(cur, sizeof cur, "current");
+    CreateDirectoryA(cur, NULL);
+    snprintf(a, sizeof a, "%s..\\ue4ss\\UE4SS.log", g_dir); snprintf(b, sizeof b, "%s\\UE4SS.log", cur); CopyFileA(a, b, FALSE);
+    if (cl_game_saved(a, sizeof a, "Logs\\CodeVein.log")) { snprintf(b, sizeof b, "%s\\CodeVein.log", cur); CopyFileA(a, b, FALSE); }
+}
+// DllMain, before CoopNative.log is reopened (no logging possible yet; the result is logged by the worker)
+static char g_cl_cmd[2048];   // the zip command, started by the worker (not under the loader lock in DllMain)
+static void cl_start_zip(void) {
+    if (!g_cl_cmd[0]) return;
+    STARTUPINFOA si; PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof si); si.cb = sizeof si; si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+    if (CreateProcessA(NULL, g_cl_cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+    else logf_("log collection: zip could not be started (%lu)", GetLastError());
+    g_cl_cmd[0] = 0;
+}
+static void cl_collect_previous(void) {
+    char root[MAX_PATH], cur[MAX_PATH], prev[MAX_PATH], a[MAX_PATH], b[MAX_PATH];
+    snprintf(root, sizeof root, "%sCoopLogs", g_dir); CreateDirectoryA(root, NULL);
+    cl_path(cur, sizeof cur, "current"); cl_path(prev, sizeof prev, "previous");
+    snprintf(a, sizeof a, "%sCoopNative.log", g_dir);
+    if (GetFileAttributesA(a) == INVALID_FILE_ATTRIBUTES) { snprintf(g_cl_result, sizeof g_cl_result, "no previous run"); return; }
+    CreateDirectoryA(prev, NULL); cl_clear_dir(prev);
+    { char pc[MAX_PATH]; snprintf(pc, sizeof pc, "%s\\crash", prev); cl_clear_dir(pc); RemoveDirectoryA(pc); }
+    snprintf(b, sizeof b, "%s\\CoopNative.log", prev); CopyFileA(a, b, FALSE);
+    cl_copy_dir_files(cur, prev);
+    // newest crash report folder, if it is newer than the one collected last time
+    char crashes[MAX_PATH], pat[MAX_PATH], last[MAX_PATH] = "", newest[MAX_PATH] = "";
+    FILETIME best = {0, 0};
+    if (cl_game_saved(crashes, sizeof crashes, "Crashes")) {
+        snprintf(pat, sizeof pat, "%s\\*", crashes);
+        WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA(pat, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == '.') continue;
+                if (CompareFileTime(&fd.ftLastWriteTime, &best) > 0) { best = fd.ftLastWriteTime; snprintf(newest, sizeof newest, "%s", fd.cFileName); }
+            } while (FindNextFileA(h, &fd));
+            FindClose(h);
+        }
+        char lf[MAX_PATH]; cl_path(lf, sizeof lf, "last-crash.txt");
+        FILE *f = _fsopen(lf, "r", _SH_DENYNO);
+        if (f) { if (!fgets(last, sizeof last, f)) last[0] = 0; fclose(f); }
+        if (newest[0] && strcmp(newest, last) != 0) {
+            char from[MAX_PATH], to[MAX_PATH];
+            snprintf(from, sizeof from, "%s\\%s", crashes, newest);
+            snprintf(to, sizeof to, "%s\\crash", prev); CreateDirectoryA(to, NULL);
+            cl_copy_dir_files(from, to);
+            f = _fsopen(lf, "w", _SH_DENYNO); if (f) { fputs(newest, f); fclose(f); }
+        } else newest[0] = 0;
+    }
+    SYSTEMTIME st; GetLocalTime(&st);
+    char zip[MAX_PATH], *cmd = g_cl_cmd;
+    snprintf(zip, sizeof zip, "%s\\CoopLogs-%04u%02u%02u-%02u%02u%02u.zip", root, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    // zip (and keep the newest 5) in a hidden PowerShell, so the game start does not wait for it
+    snprintf(cmd, sizeof g_cl_cmd,
+             "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command \"Compress-Archive -Path '%s\\*' -DestinationPath '%s' -Force; "
+             "Get-ChildItem '%s\\CoopLogs-*.zip' | Sort-Object Name -Descending | Select-Object -Skip 5 | Remove-Item -Force\"",
+             prev, zip, root);
+    snprintf(g_cl_result, sizeof g_cl_result, "previous run collected -> CoopLogs\\%s%s%s", strrchr(zip, '\\') + 1,
+             newest[0] ? ", with crash report " : "", newest);
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
@@ -2006,6 +2300,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         while (n > 0 && g_dir[n - 1] != '\\') n--;
         g_dir[n] = 0;
         char path[MAX_PATH];
+        cl_collect_previous();
         snprintf(path, sizeof path, "%sCoopNative.log", g_dir);
         g_log = _fsopen(path, "w", _SH_DENYWR);
         logf_("CoopNative loaded (probes: GetRescueSignalState, SessionStateHandler; EndCooperativeMode veto and Mistle rest are off unless enabled)");

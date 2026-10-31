@@ -120,6 +120,17 @@ for its owner, including half-destroyed ones of replaced characters; his own com
 Lua session polls pause during a map travel (a poll during a join crashed the game). Pure log hooks are opt-in
 (`diag_hooks=1`); startup hooks are enabled in one batch (about 0.2 s instead of 7 s).
 
+Added 2026-10-31 (ideas from studying other seamless co-op mods): a game-thread pump on `UGameEngine::Tick` (0x14EBE3C20)
+instead of a polled function; a line-based command queue (`CoopNative.cmd`); a scene relay (`RequestEvent` / `RequestSkipEvent`
+are logged on both PCs, the host sends skips and the memory start/end to the guest with `ClientMessage`, so the guest's copy of the
+outro and memory scenes stays in step with the host's skips); automatic log collection on each PC (`plugins\CoopLogs\`, a zip of
+the previous run's logs and any new crash report, made at the next start; nothing is uploaded).
+
+Memory with a guest, current state: the guest watches the scenes in step with the host but cannot move. His memory character is
+started on the host, but on his own PC it stays before AppBeginPlay (tick off, no movement mode), the same counter problem the
+host had; a reset on his side is built and waiting for a test. His game picks the post-boss ending branch on its own (a different
+branch than the host's) and his story state (boss, fog wall, Mistle) does not follow the host yet.
+
 In progress: vestige restoration (the entry checks in the restoration code are answered "not multiplayer"; to test), the
 guest's rest resetting enemies, the memory for the guest (plan: he leaves for the memory, plays it solo with control in his own
 world, and rejoins), Home Base mode for the guest (`CharacterHelper.SetRestrictedActionInBaseInfo`), 3+ players, a teleport vote.
