@@ -156,8 +156,12 @@ local function fieldWindow(gs, helper)
     if keepDyingOn and not valid(mine) and sawOwnTrueDeath and trueDeadAddr() then return aliveOther end
     return deadMine and aliveOther
 end
+local postBossUntil = -1000   -- set when the host's memory starts/ends (scene relay); no spectate window until then
 local function spectateWindow()
     if os.clock() - rewardsAt < 60 then return false end
+    -- 2026-11-02: after the memory his BossAreaState still said "fight running" (his story flags) and leftover memory characters
+    -- counted as dead -> the spectate window opened: camera on the host, death filter and crisis music in the final cutscene
+    if os.clock() < postBossUntil then return false end
     local gs = FindFirstOf("BP_AppGameState_C")
     if not valid(gs) then return false end
     local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
@@ -564,7 +568,12 @@ local function sendTpInfo()
     tpInfoAt = os.clock()
     local gs = FindFirstOf("BP_AppGameState_C")
     -- 2026-10-31: a guest must not have a tpinfo (an old one made his CoopNative act as host)
-    if valid(gs) and try(function() return gs.Role end) ~= 3 then os.remove(WIN64 .. "\\plugins\\CoopNative.tpinfo"); lastTpInfo = nil; return end
+    if valid(gs) and try(function() return gs.Role end) ~= 3 then
+        os.remove(WIN64 .. "\\plugins\\CoopNative.tpinfo"); lastTpInfo = nil
+        local rf = io.open(WIN64 .. "\\plugins\\CoopNative.role", "w"); if rf then rf:write("guest"); rf:close() end
+        return
+    end
+    if valid(gs) then os.remove(WIN64 .. "\\plugins\\CoopNative.role") end
     if not valid(gs) then return end
     -- CoopNative ignores a tpinfo older than 2 minutes: rewrite it every 30 s even without a change
     if os.clock() - tpTouchAt > 30 then tpTouchAt = os.clock(); lastTpInfo = nil end
@@ -614,7 +623,10 @@ local function groupTeleport()
         elseif what:find("^start") then
             local pc0 = localPC()
             local m0 = valid(pc0) and try(function() return pc0.Pawn end) or nil
-            pendingTp = { at = os.clock(), oldHost = valid(m0) and try(function() return m0:GetAddress() end) or nil }
+            -- 2026-11-02: after the memory the host lands in the final cutscene; a guest spawned next to it there fell and died (no
+            -- ground at the cutscene spot). For the memory-end teleport ("start memend") the guests follow only once the host can
+            -- move again (cutscene over: move input not ignored for 2 s), up to 3 minutes.
+            pendingTp = { at = os.clock(), oldHost = valid(m0) and try(function() return m0:GetAddress() end) or nil, memend = what:find("memend") ~= nil }
             log("group teleport: host teleports, guests follow once the host has arrived")
             -- item 8 v2: host -> guest message (PlayerController:ClientMessage is a client RPC): the guest fades now, at the start
             for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
@@ -629,7 +641,8 @@ local function groupTeleport()
         end
     end
     if not pendingTp then return end
-    if os.clock() - pendingTp.at > 60 then log("group teleport: host did not arrive within 60 s, given up"); pendingTp = nil; return end
+    local limit = pendingTp.memend and 180 or 60
+    if os.clock() - pendingTp.at > limit then log("group teleport: host did not arrive within " .. limit .. " s, given up"); pendingTp = nil; return end
     local gs = FindFirstOf("BP_AppGameState_C")
     if not valid(gs) or try(function() return gs.Role end) ~= 3 then return end
     local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
@@ -642,6 +655,13 @@ local function groupTeleport()
     if not arrived then return end
     pendingTp.newSeenAt = pendingTp.newSeenAt or os.clock()
     if os.clock() - pendingTp.newSeenAt < 3 then return end   -- let the host's area finish loading
+    if pendingTp.memend then
+        local ignored = try(function() return pc:IsMoveInputIgnored() end)
+        if ignored ~= false then pendingTp.freeAt = nil; return end
+        pendingTp.freeAt = pendingTp.freeAt or os.clock()
+        if os.clock() - pendingTp.freeAt < 2 then return end
+        log("group teleport: host can move again after the final cutscene -> bringing the guests")
+    end
     pendingTp = nil
     -- by remote controller: right after the teleport the host's old pawn still exists and was taken for a guest (spawned twice)
     local n = 0
@@ -959,6 +979,98 @@ end
 -- run on the actor of the same class and name (placed level actors have the same names on both PCs) and a skip is pressed on his
 -- skip prompt. Without scene_relay=1 he only logs what arrives.
 local relayErr = false
+-- 2026-11-02 (owner): a host skip inside the memory moves the host to the next memory part; the guest stayed behind. While the
+-- memory runs, a host skip pulls every guest character next to the host (K2_TeleportTo, server side; 2.5 s and 5 s after it).
+local memHostOn, memFollowAt = false, nil
+local function baseOf(q)
+    local bm = try(function() return q.BasedMovement end)
+    local b = bm and try(function() return bm.MovementBase end)
+    if not valid(b) then return "none" end
+    local o = try(function() return b:GetOwner() end)
+    return name(b) .. "@" .. (valid(o) and name(o) or "?")
+end
+local memBaseLogUntil, memBaseLogAt = -1000, -1000
+local function memoryBaseLog()
+    if os.clock() > memBaseLogUntil or os.clock() - memBaseLogAt < 3 then return end
+    memBaseLogAt = os.clock()
+    for _, q in ipairs(FindAllOf("BP_Player_C") or {}) do
+        if valid(q) then
+            local loc = try(function() return q:K2_GetActorLocation() end)
+            local cm = try(function() return q.CharacterMovement end)
+            log(string.format("memory base: %s role=%s z=%s moveMode=%s base=%s", name(q), tostring(try(function() return q.Role end)),
+                tostring(loc and math.floor(loc.Z)), tostring(valid(cm) and try(function() return cm.MovementMode end)), baseOf(q)))
+        end
+    end
+end
+local function memoryFollow()
+    if not memFollowAt then return end
+    local dt = os.clock() - memFollowAt
+    if dt < 2.5 then return end
+    local pc = localPC()
+    local host = valid(pc) and try(function() return pc.Pawn end) or nil
+    local hp = valid(host) and try(function() return host:K2_GetActorLocation() end)
+    local hr = valid(host) and try(function() return host:K2_GetActorRotation() end)
+    if hp then
+        for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+            local g = valid(c) and not try(function() return c:IsLocalController() end) and try(function() return c.Pawn end)
+            local gp = valid(g) and try(function() return g:K2_GetActorLocation() end)
+            if gp then
+                local dx, dy, dz = gp.X - hp.X, gp.Y - hp.Y, gp.Z - hp.Z
+                if dx * dx + dy * dy + dz * dz > 3000 * 3000 then   -- (10 m pulled him back while he walked nearby)
+                    local to = { X = hp.X + 150, Y = hp.Y + 150, Z = hp.Z }
+                    local ok = pcall(function() g:K2_TeleportTo(to, hr or { Pitch = 0, Yaw = 0, Roll = 0 }) end)
+                    log(string.format("memory follow: %s was %.0f m from the host -> teleported next to the host %s", name(g),
+                        math.sqrt(dx * dx + dy * dy + dz * dz) / 100, tostring(ok)))
+                end
+            end
+        end
+    end
+    if dt >= 5 then memFollowAt = nil end
+end
+-- 2026-11-02: the guest's blood veil (JinkakuComponent.JinkakuMesh) was invisible on the host outside the memory cutscenes. Log
+-- every player character's veil state 4 s after it appears (both PCs): mesh set, visible, hidden in game, disappear expression.
+local veilSeen = {}
+local function veilWatch()
+    for _, p in ipairs(FindAllOf("BP_Player_C") or {}) do
+        local n = valid(p) and name(p)
+        if n and not veilSeen[n] then veilSeen[n] = os.clock()
+        elseif n and veilSeen[n] ~= true and os.clock() - veilSeen[n] > 4 then
+            veilSeen[n] = true
+            local j = try(function() return p.Jinkaku end)
+            local m = valid(j) and try(function() return j.JinkakuMesh end)
+            local sk = valid(m) and try(function() return m.SkeletalMesh end)
+            -- Home Base mode (FCharacterRestrictedActionInBaseInfo: FieldType 1 = base, bJinkakuVisibility = veil shown) stuck on a
+            -- field character hides the veil; the guest joined from Home Base (suspect, 2026-11-02). Outside Home Base reset it.
+            local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+            local out = {}
+            pcall(function() helper:GetRestrictedActionInBaseInfo(p, out) end)
+            local info = out.OutInfo or out
+            local ft = try(function() return info.FieldType end)
+            local jv = try(function() return info.bJinkakuVisibility end)
+            local fm = FindFirstOf("AppFieldManager")
+            local inBase = valid(fm) and try(function() return fm:IsInHideout(fm) end)
+            log(string.format("veil: %s mesh=%s visible=%s hiddenInGame=%s actorHidden=%s | base mode FieldType=%s veilShown=%s inHideout=%s",
+                n, tostring(valid(sk) and name(sk)), tostring(valid(m) and try(function() return m:IsVisible() end)),
+                tostring(valid(m) and try(function() return m.bHiddenInGame end)), tostring(try(function() return p.bHidden end)),
+                tostring(ft), tostring(jv), tostring(inBase)))
+            -- 2026-11-02: after the memory his character kept FieldType 3 (memory mode: weapon hidden; his own memory flow does not end
+            -- normally) -> no weapon visible. Outside Home Base and outside the memory window every special mode is cleared.
+            local gmf = io.open(WIN64 .. "\\plugins\\CoopNative.guestmem", "r")
+            local inMemory = gmf and ((gmf:read("*a") or ""):match("1") ~= nil) or false
+            if gmf then gmf:close() end
+            if ft and ft ~= 0 and inBase ~= true and not inMemory then
+                local gs = FindFirstOf("BP_AppGameState_C")
+                local isHost = valid(gs) and try(function() return gs.Role end) == 3
+                local mine = try(function() return localPC().Pawn end)
+                local own = valid(mine) and name(mine) == n
+                local a = own and pcall(function() helper:ClearRestrictedActionInBaseInfo(p) end)
+                local b = isHost and pcall(function() helper:ClearRestrictedActionInBaseInfoHost(p) end)
+                if valid(m) then pcall(function() m:SetVisibility(true, true) end) end
+                log("veil: " .. n .. " had special mode " .. tostring(ft) .. " in the field -> cleared (own " .. tostring(a) .. ", host " .. tostring(b) .. "), veil mesh shown")
+            end
+        end
+    end
+end
 local RELAY_PATH = WIN64 .. "\\plugins\\CoopNative.relay"
 os.remove(RELAY_PATH)
 local relayAt, localEvents, relayIn = -1000, {}, {}
@@ -987,9 +1099,9 @@ local function sceneRelay()
         os.remove(work)
         for _, l in ipairs(lines) do
             local msg
-            if l == "skip" then msg = "CoopSkip"
-            elseif l == "memstart" then msg = "CoopMemoryStart"
-            elseif l == "memend" then msg = "CoopMemoryEnd"
+            if l == "skip" then msg = "CoopSkip"; if isHost and memHostOn then memFollowAt = os.clock() end
+            elseif l == "memstart" then msg = "CoopMemoryStart"; memHostOn = true; memBaseLogUntil = os.clock() + 60
+            elseif l == "memend" then msg = "CoopMemoryEnd"; memHostOn = false; memFollowAt = nil
             else
                 local ni, nn, ci, ev = l:match("^event (%-?%d+) (%-?%d+) (%-?%d+) (.+)$")
                 if ev then
@@ -1015,6 +1127,8 @@ local function sceneRelay()
     local on = iniHas("scene_relay=1")
     for _, text in ipairs(relayIn) do
         if text == "CoopMemoryStart" or text == "CoopMemoryEnd" then
+            postBossUntil = os.clock() + 300
+            if text == "CoopMemoryStart" then memBaseLogUntil = os.clock() + 60 end
             -- 2026-10-31: his own memory never started (his game was still in its outro when the host's memory pulled him in), so
             -- the memory window comes from the host now: guestMemoryControl unlocks his input on every new character
             local mf = io.open(WIN64 .. "\\plugins\\CoopNative.guestmem", "w")
@@ -1022,6 +1136,7 @@ local function sceneRelay()
             log("scene relay: host says " .. text)
         elseif text == "CoopSkip" then
             local comp = FindFirstOf("SkipEventUIComponent")
+            if on and valid(comp) then local af = io.open(WIN64 .. "\\plugins\\CoopNative.allowskip", "w"); if af then af:write("1"); af:close() end end
             local ok = on and valid(comp) and pcall(function() comp:RequestSkipEvent() end)
             log("scene relay: host skipped -> " .. (on and ("skip " .. tostring(ok)) or "logged only (scene_relay off)"))
         else
@@ -1043,14 +1158,86 @@ local function sceneRelay()
     relayIn = {}
 end
 
+-- memory step (a): on the guest, tell CoopNative our own pawn (every 2 s, on change) so it can release our held memory flow once the
+-- host brings us back after the memory
+local lastMyPawn, myPawnAt = nil, -1000
+local function writeMyPawn()
+    if os.clock() - myPawnAt < 2 then return end
+    myPawnAt = os.clock()
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not valid(gs) or try(function() return gs.Role end) == 3 then return end
+    local pc = localPC()
+    local p = valid(pc) and try(function() return pc.Pawn end) or nil
+    local a = valid(p) and try(function() return p:GetAddress() end) or nil
+    if a and a ~= lastMyPawn then
+        lastMyPawn = a
+        local f = io.open(WIN64 .. "\\plugins\\CoopNative.mypawn", "w"); if f then f:write(string.format("%X", a)); f:close() end
+    end    -- 2026-11-02: in the memory the HOST's character also floated on this PC until the first skip (it was not started here either);
+    -- hand every player character to CoopNative (CoopNative.pawns), whose guest-side v5 checks them all during the memory
+    local list = {}
+    for _, q in ipairs(FindAllOf("BP_Player_C") or {}) do
+        local qa = valid(q) and try(function() return q:GetAddress() end)
+        if qa then list[#list + 1] = string.format("%X", qa) end
+    end
+    local pf = io.open(WIN64 .. "\\plugins\\CoopNative.pawns", "w"); if pf then pf:write(table.concat(list, " ")); pf:close() end
+end
 -- Memory control (2026-10-31): the guest floated without control in the host's memory. While CoopNative marks the memory window
 -- (CoopNative.guestmem = 1, written at his PlayMemoryResidue), every new character of ours (the memory teleport respawns him) gets
 -- the input unlock used after a respawn (temporary input masks, ignore-input flags, game-only input mode), and its state is logged
 -- every 3 s for a minute: begun play, tick enabled, movement mode, move input ignored.
 local memCtlPawn, memCtlAt, memCtlLog = nil, nil, -1000
+-- 2026-11-02 (owner's idea, refined): the host's character floated on this PC at the memory start. Its position arrives, but the
+-- character does not run here: its tick is off (guest log 20:04: "other character ... tick +0x35 0"), so no animation, gravity or
+-- ground. For 90 s after the memory window opens, every player character whose tick is off gets its tick switched back on (actor,
+-- body mesh, movement component), the step the game's own character start would have done; each one is logged once.
+local memWinAt, floatFixed, floatCheckAt, floatZ = nil, {}, -1000, nil
+local function memoryFloatFix()
+    if not memWinAt or os.clock() - memWinAt > 90 or os.clock() - floatCheckAt < 1 then return end
+    floatCheckAt = os.clock()
+    for _, q in ipairs(FindAllOf("BP_Player_C") or {}) do
+        local qn = valid(q) and name(q)
+        -- 2026-11-02 floor logs: the host's memory character stood at the right height (z 100, like ours) but in falling mode
+        -- (3) with no floor here (its base, StaticMeshActor_15, did not resolve on this PC; ours stands on that same floor):
+        -- remote characters (role 1) falling at an unchanged height are put into walking mode (1); position keeps coming from the host
+        if qn and try(function() return q.Role end) == 1 then
+            local cm = try(function() return q.CharacterMovement end)
+            local loc = try(function() return q:K2_GetActorLocation() end)
+            if valid(cm) and loc and try(function() return cm.MovementMode end) == 3 then
+                floatZ = floatZ or {}
+                local last = floatZ[qn]
+                floatZ[qn] = loc.Z
+                if last and math.abs(last - loc.Z) < 5 then
+                    local ok = pcall(function() cm:SetMovementMode(1, 0) end)
+                    if not floatFixed[qn .. "/walk"] then
+                        floatFixed[qn .. "/walk"] = true
+                        log(string.format("memory float fix: %s was falling at a steady height (z %d) -> walking %s", qn, math.floor(loc.Z), tostring(ok)))
+                    end
+                end
+            end
+        end
+        if qn and try(function() return q:IsActorTickEnabled() end) == false then
+            local a = pcall(function() q:SetActorTickEnabled(true) end)
+            local m = try(function() return q.Mesh end)
+            local b = valid(m) and pcall(function() m:SetComponentTickEnabled(true) end)
+            local cm = try(function() return q.CharacterMovement end)
+            local c = valid(cm) and pcall(function() cm:SetComponentTickEnabled(true) end)
+            if not floatFixed[qn] then
+                floatFixed[qn] = true
+                log(string.format("memory float fix: %s had its tick off -> actor %s, mesh %s, movement %s; now tick=%s", qn, tostring(a),
+                    tostring(b), tostring(c), tostring(try(function() return q:IsActorTickEnabled() end))))
+            end
+        end
+    end
+end
 local function guestMemoryControl()
     local f = io.open(WIN64 .. "\\plugins\\CoopNative.guestmem", "r"); if not f then return end
     local on = (f:read("*a") or ""):match("1") ~= nil; f:close()
+    if on and not memWinAt then
+        memWinAt, floatFixed = os.clock(), {}
+        myPawnAt = -1000   -- hand CoopNative the full character list right now, not up to 2 s later
+        pcall(writeMyPawn)
+    elseif not on then memWinAt = nil end
+    pcall(memoryFloatFix)
     if not on then memCtlPawn = nil; return end
     local pc = localPC()
     local mine = valid(pc) and try(function() return pc.Pawn end) or nil
@@ -1062,6 +1249,16 @@ local function guestMemoryControl()
     end
     if memCtlAt and os.clock() - memCtlAt < 60 and os.clock() - memCtlLog > 3 then
         memCtlLog = os.clock()
+        -- 2026-11-02: the host's character floated on this PC at the memory start: log every player character here
+        for _, q in ipairs(FindAllOf("BP_Player_C") or {}) do
+            if valid(q) and name(q) ~= memCtlPawn then
+                local qm = try(function() return q.CharacterMovement end)
+                local loc = try(function() return q:K2_GetActorLocation() end)
+                log(string.format("memory control: other %s tick=%s moveMode=%s z=%s role=%s", name(q),
+                    tostring(try(function() return q:IsActorTickEnabled() end)), tostring(valid(qm) and try(function() return qm.MovementMode end)),
+                    tostring(loc and math.floor(loc.Z)), tostring(try(function() return q.Role end))))
+            end
+        end
         local cm = try(function() return mine.CharacterMovement end)
         log(string.format("memory control: %s begunPlay=%s tick=%s moveMode=%s moveIgnored=%s", memCtlPawn,
             tostring(try(function() return mine:HasActorBegunPlay() end)), tostring(try(function() return mine:IsActorTickEnabled() end)),
@@ -1110,22 +1307,6 @@ local function guestMemorySpectate()
         end
         log("memory spectate: ended, camera back to " .. (valid(mine) and name(mine) or "?"))
         memHiddenPawn = nil
-    end
-end
--- memory step (a): on the guest, tell CoopNative our own pawn (every 2 s, on change) so it can release our held memory flow once the
--- host brings us back after the memory
-local lastMyPawn, myPawnAt = nil, -1000
-local function writeMyPawn()
-    if os.clock() - myPawnAt < 2 then return end
-    myPawnAt = os.clock()
-    local gs = FindFirstOf("BP_AppGameState_C")
-    if not valid(gs) or try(function() return gs.Role end) == 3 then return end
-    local pc = localPC()
-    local p = valid(pc) and try(function() return pc.Pawn end) or nil
-    local a = valid(p) and try(function() return p:GetAddress() end) or nil
-    if a and a ~= lastMyPawn then
-        lastMyPawn = a
-        local f = io.open(WIN64 .. "\\plugins\\CoopNative.mypawn", "w"); if f then f:write(string.format("%X", a)); f:close() end
     end
 end
 -- 2026-10-30 (guest crashes 20:51 and 21:24 at the Mistle, inside UE4SS, null+0x18): looping over every HumanContextComponent and
@@ -1311,6 +1492,9 @@ local function probeCommands()
     pcall(guestMemorySpectate)
     pcall(guestMemoryControl)
     pcall(guestTeleportFade)
+    pcall(memoryFollow)
+    pcall(memoryBaseLog)
+    pcall(veilWatch)
     local okr, er = pcall(sceneRelay)
     if not okr and not relayErr then relayErr = true; log("scene relay ERROR " .. tostring(er):sub(1, 160)) end
     guestLevelWatch()

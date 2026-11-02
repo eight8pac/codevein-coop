@@ -126,10 +126,13 @@ are logged on both PCs, the host sends skips and the memory start/end to the gue
 outro and memory scenes stays in step with the host's skips); automatic log collection on each PC (`plugins\CoopLogs\`, a zip of
 the previous run's logs and any new crash report, made at the next start; nothing is uploaded).
 
-Memory with a guest, current state: the guest watches the scenes in step with the host but cannot move. His memory character is
-started on the host, but on his own PC it stays before AppBeginPlay (tick off, no movement mode), the same counter problem the
-host had; a reset on his side is built and waiting for a test. His game picks the post-boss ending branch on its own (a different
-branch than the host's) and his story state (boss, fog wall, Mistle) does not follow the host yet.
+Memory with a guest, current state (two-PC tests 2026-11-02): the guest walks in the host's memory. His memory character stayed
+before AppBeginPlay on his own PC (same counter problem as the host's); a reset on his side starts it, and characters that do not
+run on his PC get their tick switched back on. The host's skips are relayed to him, pull him next to the host inside the memory,
+and his own skips are ignored in co-op. After the memory he is brought to the host only when the host's final cutscene is over
+(spawning him at the cutscene spot killed him). Remaining: a few janky seconds at the memory start, his game picks its own
+post-boss ending branch (story progress, see CoopProgress), and the lock-counter resets could underflow (counters are now kept
+from going below 0; a crash with "BitArrayIndex" in Actor.cpp was the symptom).
 
 In progress: vestige restoration (the entry checks in the restoration code are answered "not multiplayer"; to test), the
 guest's rest resetting enemies, the memory for the guest (plan: he leaves for the memory, plays it solo with control in his own

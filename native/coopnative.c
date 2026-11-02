@@ -383,6 +383,42 @@ static void detour_appear_finish(void *pawn) {
               pend1, pc0, pc1, (pc1 >> 3) & 1, (pc1 >> 2) & 1, b83_0, b83_1, busy0, g_busy_count);
 }
 
+// 2026-11-02 (both PCs crashed at a host rest: "BitArrayIndex" assert, Actor.cpp:88, right after "+0xB84 holders -1/-2"): zeroing
+// the counters in v5 while other characters still had their lock flags set let those characters decrement again later -> the
+// counters went negative -> the engine used them as an index. Every reset now also clears the flags of all known player
+// characters, and the worker keeps the three counters from staying below 0.
+static void clear_one_lock_flags(uintptr_t a) {
+    if (a > 0x10000 && readable(a + 0xB80, 8)) {
+        *(volatile uint8_t *)(a + 0xB83) = 0; *(volatile uint8_t *)(a + 0xB84) = 0; *(volatile uint8_t *)(a + 0xB85) = 0;
+    }
+}
+// only character addresses: "hpawn"/"gpawn" lines of tpinfo (it also lists controllers and drivers) and CoopNative.pawns
+static void clear_player_lock_flags(void) {
+    char buf[600];
+    if (read_small_file("CoopNative.tpinfo", buf, sizeof buf)) {
+        for (char *line = strtok(buf, "\r\n"); line; line = strtok(NULL, "\r\n")) {
+            unsigned long long a;
+            if (sscanf(line, "gpawn %llx", &a) == 1 || sscanf(line, "hpawn %llx", &a) == 1) clear_one_lock_flags((uintptr_t)a);
+        }
+    }
+    if (read_small_file("CoopNative.pawns", buf, sizeof buf)) {
+        char *q = buf;
+        while (*q) {
+            char *end; unsigned long long v = strtoull(q, &end, 16);
+            if (end == q) break;
+            clear_one_lock_flags((uintptr_t)v);
+            q = end; while (*q == ' ') q++;
+        }
+    }
+}
+static void clamp_lock_counters(void) {
+    static ULONGLONG last_log;
+    volatile int *c[3] = {(volatile int *)0x14413C404ULL, (volatile int *)0x14413C408ULL, (volatile int *)0x14413C40CULL};
+    int fixed = 0;
+    for (int i = 0; i < 3; i++) if (*c[i] < 0) { *c[i] = 0; fixed = 1; }
+    if (fixed && GetTickCount64() - last_log > 1000) { last_log = GetTickCount64(); logf_("appear lock: negative counter(s) set back to 0"); }
+}
+
 // Assert guard (session 10, 12:46:55 crash): after the v5 reset a leftover holder released its lock and the engine check
 // "NumInCharacterSetupBeforeAppBeginPlay > 0" (AppCharacter.cpp) aborted the game. [0x14413C404] is exactly that counter. The fatal
 // assert 0x140C3EEC0 is skipped (logged) only when called from the lock code (return address 0x145D78000..0x145D86200); the code
@@ -591,6 +627,10 @@ static void game_thread_work(void) {
 typedef uint64_t (*reqevent_fn)(void *actor, void *event);
 typedef uint64_t (*skipevent_fn)(void *comp);
 static reqevent_fn g_orig_request_event;
+static int in_session_as_guest(void) {
+    char b[16];
+    return read_small_file("CoopNative.role", b, sizeof b) && strncmp(b, "guest", 5) == 0;
+}
 static skipevent_fn g_orig_skip_event;
 static volatile LONG g_relay_logs;
 static void relay_append(const char *line) {
@@ -625,11 +665,76 @@ static uint64_t detour_request_event(void *actor, void *event) {
     return g_orig_request_event(actor, event);
 }
 static uint64_t detour_skip_event(void *comp) {
+    // 2026-11-02 (owner): a guest skipping on his own caused problems afterwards. In a session as guest (no fresh tpinfo) his own
+    // skip input is ignored; the host's skip arrives through CoopProbe, which touches CoopNative.allowskip right before pressing it
+    if (!g_host_pc && g_keep_outro && in_session_as_guest()) {
+        char path[MAX_PATH];
+        snprintf(path, sizeof path, "%sCoopNative.allowskip", g_dir);
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        int fresh = 0;
+        if (GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) {
+            FILETIME now; GetSystemTimeAsFileTime(&now);
+            ULONGLONG t = ((ULONGLONG)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
+            ULONGLONG n = ((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime;
+            fresh = n >= t && n - t < 3ULL * 10000000ULL;
+        }
+        if (!fresh) { logf_("scene: our own skip (0x%llX) ignored: only the host skips in co-op", (unsigned long long)(uintptr_t)comp); return 0; }
+        DeleteFileA(path);
+    }
     uint64_t r = g_orig_skip_event(comp);
     logf_("scene: RequestSkipEvent(0x%llX) -> %llu", (unsigned long long)(uintptr_t)comp, (unsigned long long)(r & 0xFF));
     relay_append("skip");
     return r;
 }
+
+// Ending-branch trace (2026-11-02): the guest's game picks a different post-boss ending than the host's (vestige branch). For
+// 10 minutes after a boss kill, both PCs log what these queries return (ScenarioManager:GetPlayPolySymbol = the chosen large-poly
+// cutscene; the vestige / progress / flag checks the flow may use). Exec thunks: (context, FFrame*, result); the result is read
+// after the original ran: its first 16 bytes, and the text if it is an FString. At most 80 lines per function.
+#define BRANCH_N 9
+static const char *g_branch_name[BRANCH_N] = {"ScenarioManager:GetPlayPolySymbol", "ScenarioActor:GetProgressFlag", "ScenarioActor:GetVolatileFlags", "ScenarioActor:IsVolatileFlagsSet", "CharacterHelper:IsAcquiredBloodCodePiece", "BCRestorationUIComponent:IsAcquiredBloodCodePiece", "CharacterHelper:GetScenarioAfterMemoryResidue", "AppSaveManager:GetGameProgress", "AppSaveManager:CheckGameProgress"};
+static const uint64_t g_branch_addr[BRANCH_N] = {0x140B49E40ULL, 0x140B3C9B0ULL, 0x140B3CD30ULL, 0x140B3D150ULL, 0x140A6BA10ULL, 0x140A3E2B0ULL, 0x140A68E10ULL, 0x140A04BB0ULL, 0x140A034A0ULL};
+static const char *g_branch_expect[BRANCH_N] = {
+    "\xE9\xAB\x92\x28\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC",
+    "\xE9\xAB\x1A\x21\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC",
+    "\xE9\xDB\x28\x21\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC",
+    "\xE9\x2B\x43\x21\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC",
+    "\xE9\x7B\xC4\x30\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC",
+    "\xE9\x0B\xEC\x10\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC",
+    "\xE9\x5B\x18\x30\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC",
+    "\xE9\x3B\x4C\xCB\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC",
+    "\xE9\xFB\x20\xCB\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC"};
+static exec_fn g_branch_orig[BRANCH_N];
+static volatile LONG g_branch_count[BRANCH_N];
+static volatile ULONGLONG g_branch_kill_at;   // mirror of the boss kill time, set where the boss kill is noted
+static void branch_note(int i, void *c, void *r) {
+    if (!g_branch_kill_at || GetTickCount64() - g_branch_kill_at > 600000) return;
+    if (InterlockedIncrement(&g_branch_count[i]) > 80) return;
+    uintptr_t a = (uintptr_t)r;
+    if (!a || !readable(a, 16)) { logf_("BRANCH %s ctx=0x%llX -> (no result)", g_branch_name[i], (unsigned long long)(uintptr_t)c); return; }
+    const uint8_t *b = (const uint8_t *)a;
+    char txt[96] = "";
+    const uint16_t *w = *(const uint16_t **)a;
+    int len = *(int *)(a + 8);
+    if (w && len > 1 && len < 80 && readable((uintptr_t)w, (size_t)len * 2)) {
+        int k = 0; txt[k++] = ' '; txt[k++] = '"';
+        for (int j = 0; j < len - 1 && k < 90; j++) txt[k++] = (w[j] >= 32 && w[j] < 127) ? (char)w[j] : '?';
+        txt[k++] = '"'; txt[k] = 0;
+    }
+    logf_("BRANCH %s ctx=0x%llX -> %02X %02X %02X %02X %02X %02X %02X %02X | %02X %02X %02X %02X%s", g_branch_name[i],
+          (unsigned long long)(uintptr_t)c, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], txt);
+}
+#define BRANCH_DETOUR(i) static void branch_det_##i(void *c, void *st, void *r) { g_branch_orig[i](c, st, r); branch_note(i, c, r); }
+BRANCH_DETOUR(0)
+BRANCH_DETOUR(1)
+BRANCH_DETOUR(2)
+BRANCH_DETOUR(3)
+BRANCH_DETOUR(4)
+BRANCH_DETOUR(5)
+BRANCH_DETOUR(6)
+BRANCH_DETOUR(7)
+BRANCH_DETOUR(8)
+static void *g_branch_det[BRANCH_N] = {branch_det_0, branch_det_1, branch_det_2, branch_det_3, branch_det_4, branch_det_5, branch_det_6, branch_det_7, branch_det_8};
 
 // Game-thread pump (2026-10-30, after the Lies of P study, which drains its queue from a hooked engine tick): UGameEngine::Tick
 // 0x14EBE3C20 (UE4SS finds the same address; it hooks it too, later, on top of ours). (this, float DeltaSeconds, bool bIdleMode).
@@ -1547,7 +1652,7 @@ static void detour_finish_boss(void *ctx, void *stack, void *result) {
             if (g_keep_outro && flag) { *(unsigned char *)locals = 0; g_outro_at = GetTickCount64(); g_outro_at_early = g_outro_at; }
         }
     }
-    g_bosskill_at = GetTickCount64();
+    g_bosskill_at = GetTickCount64(); g_branch_kill_at = g_bosskill_at;
     logf_("MulticastFinishBossBattle(bWithDisconnect=%d) on 0x%llX%s", flag, (unsigned long long)(uintptr_t)ctx,
           g_keep_outro && flag > 0 ? "  *** FLIPPED to 0 (keep_outro) ***" : "");
     g_orig_finish_boss(ctx, stack, result);
@@ -1717,6 +1822,7 @@ static const uint64_t g_gift_addr[GIFT_N] = {0x140A5E650ULL, 0x140A5E800ULL, 0x1
 static const char *g_gift_expect[GIFT_N] = {"\xE9\x4B\xFD\x2D\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xDB\x04\x2E\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x3B\x58\x2D\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xCB\x35\xBB\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x5B\x38\xBB\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x3B\x14\xBB\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x3B\x15\xBB\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x3B\x3C\x23\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x5B\x41\x23\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x0B\x43\x23\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xCB\x44\x23\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x0B\x44\x23\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xEB\x3D\x23\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x5B\xEC\x28\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x9B\xE8\x28\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x4B\xEE\x28\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x5B\x43\x29\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x5B\x2D\x64\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xDB\x63\x64\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x6B\x66\x64\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x1B\x27\x33\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x2B\xE6\xD0\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x5B\xE9\xD0\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xBB\xE7\xD0\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x2B\xFE\x2D\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xDB\x74\x14\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xAB\xA3\x3A\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC"};
 static exec_fn g_gift_orig[GIFT_N];
 static volatile LONG g_gift_count[GIFT_N];
+static volatile uintptr_t g_museum_actor;   // (declared here so the memory start can clear it; set by the late scenario hooks)
 static void gift_note(int i, void *c, void *st) {
     if (strstr(g_gift_name[i], "WaitForMemoryResidueFinished")) g_memory_actor = (uintptr_t)c;
     // session 10: the memory moves the host into its own area and waits for the guest, who never arrives (his game has no memory
@@ -1724,6 +1830,9 @@ static void gift_note(int i, void *c, void *st) {
     // character once it is up (same "start"/"arrived" markers as a Mistle teleport).
     if (strstr(g_gift_name[i], "PlayMemoryResidue")) {
         g_memory_at = GetTickCount64(); g_memory_start_at = g_memory_at;
+        // 2026-11-02: a second memory in the same game session (save reloaded) still had the first memory's museum actor here;
+        // it was gone, so "memory end" fired 70 ms after the start (no guest memory window, a group teleport back, v5 off)
+        g_museum_actor = 0;
         if (!g_host_pc && g_keep_outro) { write_guestmem(1); logf_("memory: guest memory window open (CoopProbe unlocks his input)"); }
         if (g_host_pc) relay_append("memstart");
     }
@@ -1778,7 +1887,6 @@ static exec_fn g_late_orig[LATE_N];
 static volatile LONG g_late_count[LATE_N], g_late_installed;
 // Museum state (session 10): OnMemoryResidueFinished is called through the museum manager's OnPostBeginPlayMuseum with the
 // MuseumUtilityActor as its parameter (RPC-style call: FFrame+0x20 == 0, Locals at +0x28). Keep it for the worker's field dump.
-static volatile uintptr_t g_museum_actor;
 static volatile ULONGLONG g_museum_at;
 static void late_note(int i, void *c, void *st) {
     uintptr_t p0 = 0;
@@ -1796,7 +1904,7 @@ static void late_note(int i, void *c, void *st) {
         if (g_keep_outro && g_group_teleport) {
             logf_("memory end: v5 off; guest follows the host back like a group teleport");
             relay_append("memend");
-            write_teleport_marker("start");
+            write_teleport_marker("start memend");
             InterlockedExchange(&g_tp_pending, 1);
         }
     }
@@ -1949,6 +2057,7 @@ static DWORD WINAPI worker(LPVOID unused) {
             "\xE9\x1B\xA6\x76\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_request_event, (void **)&g_orig_request_event);
     install("RequestSkipEventImpl", ADDR_SKIP_EVENT_IMPL,
             "\xE9\xEB\x2C\x9A\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_skip_event, (void **)&g_orig_skip_event);
+    for (int i = 0; i < BRANCH_N; i++) install(g_branch_name[i], g_branch_addr[i], g_branch_expect[i], g_branch_det[i], (void **)&g_branch_orig[i]);
     install("GameEngineTick", ADDR_GAME_ENGINE_TICK,
             "\x48\x89\xE0\x44\x88\x40\x18\x55\x53\x57\x41\x54\x41\x56\x48\x8D", (void *)detour_engine_tick, (void **)&g_orig_engine_tick);
     install("AppearLockAcquire", 0x1404448B0ULL,
@@ -2015,6 +2124,7 @@ static DWORD WINAPI worker(LPVOID unused) {
     cl_start_zip();
     for (unsigned tick = 0;; tick++) {
         if (tick % 150 == 20) cl_snapshot();   // every 30 s (200 ms ticks)
+        clamp_lock_counters();
         Sleep(200);
         read_settings();
         run_commands();
@@ -2034,7 +2144,7 @@ static DWORD WINAPI worker(LPVOID unused) {
                 if (g_keep_outro && g_group_teleport) {
                     logf_("memory end (museum actor gone): v5 off; guest follows the host back like a group teleport");
                     relay_append("memend");
-                    write_teleport_marker("start");
+                    write_teleport_marker("start memend");
                     InterlockedExchange(&g_tp_pending, 1);
                 }
             }
@@ -2056,7 +2166,7 @@ static DWORD WINAPI worker(LPVOID unused) {
                 logf_("appear lock v5: host memory character 0x%llX unstarted (b83 %u, count %d, +0xB84 holders %d) -> lock reset",
                       (unsigned long long)hp, *(volatile uint8_t *)(hp + 0xB83), *(volatile int *)0x14413C404ULL, *(volatile int *)0x14413C40CULL);
                 *(volatile uint8_t *)(hp + 0xB83) = 0;
-                *(volatile int *)0x14413C404ULL = 0;
+                *(volatile int *)0x14413C404ULL = 0; clear_player_lock_flags();
                 *(volatile int *)0x14413C40CULL = 0;
                 *(volatile uint64_t *)0x14413C410ULL = *(volatile uint64_t *)0x144194140ULL;
             }
@@ -2092,7 +2202,7 @@ static DWORD WINAPI worker(LPVOID unused) {
                         logf_("appear lock v5g: guest memory character 0x%llX unstarted (b83 %u, count %d) -> lock reset (%d)", (unsigned long long)gp,
                               b83, *(volatile int *)0x14413C404ULL, g5_count);
                         *(volatile uint8_t *)(gp + 0xB83) = 0;
-                        *(volatile int *)0x14413C404ULL = 0;
+                        *(volatile int *)0x14413C404ULL = 0; clear_player_lock_flags();
                         *(volatile int *)0x14413C40CULL = 0;
                         *(volatile uint64_t *)0x14413C410ULL = *(volatile uint64_t *)0x144194140ULL;
                     }
@@ -2114,6 +2224,44 @@ static DWORD WINAPI worker(LPVOID unused) {
             uintptr_t mp = open ? read_my_pawn() : 0;
             ULONGLONG nowv = GetTickCount64();
             if (mp != gv5_pawn) { gv5_pawn = mp; gv5_since = nowv; }
+            // the other player characters on this PC (the host's memory character floated here until the first skip, 2026-11-02):
+            // same check, from CoopNative.pawns (all BP_Player_C, written by CoopProbe every 2 s); one reset per character
+            if (open) {
+                static uintptr_t other_reset[16];
+                static ULONGLONG other_since[16];
+                static uintptr_t other_addr[16];
+                char pb[400];
+                if (read_small_file("CoopNative.pawns", pb, sizeof pb)) {
+                    char *q = pb;
+                    while (*q) {
+                        char *end; unsigned long long v = strtoull(q, &end, 16);
+                        if (end == q) break;
+                        q = end; while (*q == ' ') q++;
+                        uintptr_t op = (uintptr_t)v;
+                        if (!op || op == mp || !readable(op + 0x28, 0x10) || !readable(op + 0xB80, 8)) continue;
+                        int slot = -1, free_slot = -1;
+                        for (int k = 0; k < 16; k++) { if (other_addr[k] == op) slot = k; if (!other_addr[k] && free_slot < 0) free_slot = k; }
+                        if (slot < 0) { if (free_slot < 0) continue; slot = free_slot; other_addr[slot] = op; other_since[slot] = nowv; other_reset[slot] = 0; }
+                        // 2026-11-02: the host's character floated on this PC at the memory start; log every other character too
+                        if (nowv - gv5_log < 250)
+                            logf_("memory (guest): other character 0x%llX tick +0x35 %u +0x37 %u b83 %u appear-pending %u pc-bits 0x%02X",
+                                  (unsigned long long)op, *(volatile uint8_t *)(op + 0x35), *(volatile uint8_t *)(op + 0x37),
+                                  *(volatile uint8_t *)(op + 0xB83), readable(op + 0xC12, 1) ? *(volatile uint8_t *)(op + 0xC12) : 255,
+                                  readable(op + 0x3C8, 1) ? *(volatile uint8_t *)(op + 0x3C8) : 255);
+                        if (*(volatile uint8_t *)(op + 0x35) != 0) { other_since[slot] = nowv; continue; }
+                        if (!other_reset[slot] && nowv - other_since[slot] > 2000 && *(volatile int *)0x14413C408ULL <= 0) {
+                            other_reset[slot] = 1;
+                            logf_("appear lock v5 (guest): other player character 0x%llX unstarted (b83 %u, count %d) -> lock reset",
+                                  (unsigned long long)op, *(volatile uint8_t *)(op + 0xB83), *(volatile int *)0x14413C404ULL);
+                            *(volatile uint8_t *)(op + 0xB83) = 0;
+                            *(volatile int *)0x14413C404ULL = 0; clear_player_lock_flags();
+                            *(volatile int *)0x14413C40CULL = 0;
+                            *(volatile uint64_t *)0x14413C410ULL = *(volatile uint64_t *)0x144194140ULL;
+                        }
+                    }
+                }
+                if (!open) for (int k = 0; k < 16; k++) other_addr[k] = 0;
+            }
             if (mp && readable(mp + 0x28, 0x10) && readable(mp + 0xB80, 8)) {
                 uint8_t t35 = *(volatile uint8_t *)(mp + 0x35), b83 = *(volatile uint8_t *)(mp + 0xB83);
                 if (nowv - gv5_log > 3000) {
@@ -2128,7 +2276,7 @@ static DWORD WINAPI worker(LPVOID unused) {
                     logf_("appear lock v5 (guest): our memory character 0x%llX unstarted (b83 %u, count %d) -> lock reset (%d)", (unsigned long long)mp,
                           b83, *(volatile int *)0x14413C404ULL, gv5_count);
                     *(volatile uint8_t *)(mp + 0xB83) = 0;
-                    *(volatile int *)0x14413C404ULL = 0;
+                    *(volatile int *)0x14413C404ULL = 0; clear_player_lock_flags();
                     *(volatile int *)0x14413C40CULL = 0;
                     *(volatile uint64_t *)0x14413C410ULL = *(volatile uint64_t *)0x144194140ULL;
                 }
