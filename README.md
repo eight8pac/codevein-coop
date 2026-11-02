@@ -17,6 +17,7 @@ CoopNative's addresses are fixed for that build; it checks 16 bytes at every tar
 | `mods/CoopSeamless` | UE4SS Lua mod: re-host / re-join reconciler, co-op in beaten areas. Switches in `config.txt` | host and guests |
 | `mods/CoopProbe` | UE4SS Lua mod: state log every 0.2 s; tells CoopNative when a spectate window is open; spectate camera | everyone running CoopNative |
 | `native/coopnative.c` | C DLL (MinHook detours), loaded by Ultimate ASI Loader. Experiments, all **off** unless enabled | host and guests (for tests) |
+| `mods/CoopProgress` | UE4SS Lua mod: logs boss rewards, progress flags and the story position; gives the guest the host's boss items and story progress, the host can publish its position (all **off** unless enabled in `config.txt`, save backed up first) | guests; host for publishing (logging: anyone) |
 | `tools/` | Read-only analysis: pak v4 reader, Kismet call/arg finders, exe scanners, headless Ghidra scripts | developers |
 
 ## Install (game closed)

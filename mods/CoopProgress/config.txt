@@ -1,0 +1,6 @@
+enabled=1
+journal=1
+guest_rewards=0
+guest_progress=0
+host_publish=0
+solo_as_guest=0
