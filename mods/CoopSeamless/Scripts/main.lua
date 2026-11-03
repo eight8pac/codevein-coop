@@ -11,7 +11,8 @@
 --   sessiondiag=1   log only: signatures of the search/join functions, and after any search the found signals with their names
 --   lockhost=1      guest: rejoin only the host he joined by hand (search, pick that host's signal, join); no join if he is absent
 --   remember=1      keep the role and the host's name in state.txt, so auto mode is back after a crash or a restart
---   versioncheck=1  host sends a fingerprint of CoopSeamless/CoopProbe/CoopProgress to a guest who joins; the guest logs mismatches
+--   versioncheck=1  host sends his kit number (plugins\CoopKitVersion.txt) and a fingerprint of CoopSeamless/CoopProbe/
+--                   CoopProgress to a guest who joins; the guest logs what differs
 local TAG = "[CoopSeamless] "
 local SETTLE_S, HOST_RETRY_S, OPEN_RETRY_S, GUEST_RETRY_S = 8, 30, 10, 25
 local FIELD, BOSSAREA, CINEMATICS, ENEMYRESET = 1, 2, 4, 8   -- ESessionOpenness
@@ -42,11 +43,26 @@ local lastLine, lastPawnName = "", ""
 local wasHosting, wasJoined = false, false   -- previous tick, for start-of-session detection
 local lockedHost = nil             -- lockhost: the one host this guest rejoins (his PlayerName, i.e. the Steam name)
 
--- remember: role and host name survive a crash or restart (state.txt next to config.txt; names can hold spaces, so not in config)
+local function localName()         -- our own PlayerName (Steam name), nil while there is no local PlayerState
+    for _, pc in ipairs(FindAllOf("PlayerController") or {}) do
+        if try(function() return pc:IsLocalPlayerController() end) then
+            return try(function() return pc.PlayerState.PlayerName:ToString() end)
+        end
+    end
+end
+
+-- remember: role and host name survive a crash or restart (state.txt next to config.txt; names can hold spaces, so not in config).
+-- The file also holds our own name: a guest kit zipped from the host's game folder could carry the host's state.txt, and a
+-- state.txt written by another player is ignored.
 local STATE_PATH = MOD_DIR .. "\\state.txt"
 local function saveState(role, host)
     local f = io.open(STATE_PATH, "w")
-    if f then f:write("role=" .. role .. "\n"); if host then f:write("host=" .. host .. "\n") end; f:close() end
+    if not f then return end
+    f:write("role=" .. role .. "\n")
+    local me = localName()
+    if me then f:write("me=" .. me .. "\n") end
+    if host then f:write("host=" .. host .. "\n") end
+    f:close()
 end
 local function loadState()
     local f = io.open(STATE_PATH, "r")
@@ -139,9 +155,12 @@ end
 
 -- Search/join by host (proposal 2026-11-03). From the paks and the exe (not run yet): App_GameInstance has Event_SearchLobby
 -- (MaxResult) and Event_JoinSession(SearchResult) next to Event_FindAndJoinSession; UAppOnlineWrapperIF has
--- GetFoundOnlineSessionsCount, GetOnlineSessionResult, GetFoundOnlineSessionInfo, ShowInviteUI; the engine's
+-- GetFoundOnlineSessionsCount, GetOnlineSessionResult, GetFoundOnlineSessionInfo; the engine's
 -- FindSessionsCallbackProxy:GetServerName(BlueprintSessionResult) gives the owner's name (Steam OSS). Parameter names and
 -- order are read from the UFunctions at run time, nothing is assumed: an unknown parameter stops the call.
+-- Guests join through the distress signal only: ShowInviteUI (Steam invite) is listed by sessiondiag, never called.
+-- Next to CoopProbe (polls IsOnlineMultiplay / GetRescueSignalState every second) and CoopNative (answers some session checks
+-- on the guest): the search below only runs while the guest is out of any session, the same moment as the vanilla retry.
 local GI_PATH = "/Game/Modes/App_GameInstance.App_GameInstance_C:"
 local IF_OWNERS = {"/Script/Extensions.AppSessionManager:", "/Script/Extensions.AppOnlineWrapper:", "/Script/Extensions.AppOnlineWrapperIF:"}
 local function paramNames(path)
@@ -235,11 +254,21 @@ local function pickHost(s)
     log("lockhost: " .. lockedHost .. " is not among " .. #list .. " signal(s) [" .. table.concat(names, ", ") .. "] -> waiting")
 end
 
--- versioncheck: FNV-1a of each mod's main.lua; the host sends "CoopVersion:<mod>=<hash>,..." with ClientMessage (a client RPC,
--- already used by CoopProbe as a host -> guest channel); the guest compares with his own files
+-- versioncheck: the kit number (plugins\CoopKitVersion.txt, read the way CoopProbe shows it on the title screen) and FNV-1a of
+-- each mod's main.lua; the host sends "CoopVersion:kit=<n>,<mod>=<hash>,..." with ClientMessage (a client RPC, already used by
+-- CoopProbe as a host -> guest channel); the guest compares with his own files. Like CoopProbe, the hook only queues the text;
+-- the files are read in tick.
 local MODS_DIR = MOD_DIR:match("^(.*)[/\\][^/\\]+$") or "."
+local WIN64 = debug.getinfo(1, "S").source:match("^@(.*)[/\\]ue4ss[/\\]Mods[/\\]") or "."
+local function kitVersion()
+    local vf = io.open(WIN64 .. "\\plugins\\CoopKitVersion.txt", "r")
+    if not vf then return "none" end
+    local ver = (vf:read("*l") or ""):gsub("CodeVein%-guest%-update%-", ""):gsub("%.zip", ""):gsub("[%s,=]", "")
+    vf:close()
+    return ver ~= "" and ver or "?"
+end
 local function fingerprint()
-    local parts = {}
+    local parts = {"kit=" .. kitVersion()}
     for _, m in ipairs({"CoopSeamless", "CoopProbe", "CoopProgress"}) do
         local f = io.open(MODS_DIR .. "\\" .. m .. "\\Scripts\\main.lua", "rb")
         local h = "absent"
@@ -264,21 +293,23 @@ local function sendVersion()
     end
     log("versioncheck: sent " .. myPrint)
 end
+local versionIn = nil              -- the host's fingerprint, queued by the hook
 pcall(function()
     RegisterHook("/Script/Engine.PlayerController:ClientMessage", function(ctx, msg)
-        if cfg.versioncheck ~= "1" then return end
         local text = try(function() return msg:get():ToString() end)
         local theirs = text and text:match("^CoopVersion:(.*)$")
-        if not theirs then return end
-        myPrint = myPrint or fingerprint()
-        if theirs == myPrint then log("versioncheck: same mods as the host (" .. theirs .. ")"); return end
-        local mine = {}
-        for m, h in myPrint:gmatch("(%w+)=(%w+)") do mine[m] = h end
-        for m, h in theirs:gmatch("(%w+)=(%w+)") do
-            if mine[m] ~= h then log("versioncheck: MISMATCH " .. m .. " host=" .. h .. " here=" .. tostring(mine[m])) end
-        end
+        if theirs then versionIn = theirs end
     end)
 end)
+local function checkVersion(theirs)
+    myPrint = myPrint or fingerprint()
+    if theirs == myPrint then log("versioncheck: same kit and mods as the host (" .. theirs .. ")"); return end
+    local mine = {}
+    for m, h in myPrint:gmatch("([^,=]+)=([^,]*)") do mine[m] = h end
+    for m, h in theirs:gmatch("([^,=]+)=([^,]*)") do
+        if mine[m] ~= h then log("versioncheck: MISMATCH " .. m .. " host=" .. h .. " here=" .. tostring(mine[m])) end
+    end
+end
 
 local stateLoaded, sigLogged, wasSearching, versionAt = false, false, false, nil
 local function tick()
@@ -288,9 +319,13 @@ local function tick()
     if not s then return end
     local now = os.time()
 
-    if not stateLoaded then
+    local me = (not stateLoaded and cfg.remember == "1") and localName() or nil
+    if not stateLoaded and (cfg.remember ~= "1" or me) then
         stateLoaded = true
         local st = cfg.remember == "1" and loadState() or nil
+        if st and st.role ~= "none" and st.me ~= me then
+            log("remember: state.txt is from " .. tostring(st.me) .. ", not " .. me .. " -> ignored"); st = nil
+        end
         if st and st.role == "host" and cfg.host ~= "off" then
             hostSticky = true; log("remember: host mode on from state.txt")
         elseif st and st.role == "guest" and cfg.guest ~= "off" then
@@ -317,6 +352,10 @@ local function tick()
     else
         lastOthers = 0
     end
+    if versionIn then
+        local theirs = versionIn; versionIn = nil
+        if cfg.versioncheck == "1" then checkVersion(theirs) end
+    end
 
     -- learn intent from what happens, only when a session or connection starts: right after a leave
     -- through the menu the game still reports the old connection for a moment (2-PC test 2026-10-26)
@@ -338,10 +377,7 @@ local function tick()
         hostName = table.concat(names, " + ")   -- everyone in the session; logged only
         log("guest mode on (joined a host; players: " .. hostName .. ")")
         -- lockhost: with one guest (vanilla cap) the one other name is the host
-        local me
-        for _, pc in ipairs(FindAllOf("PlayerController") or {}) do
-            if try(function() return pc:IsLocalPlayerController() end) then me = try(function() return pc.PlayerState.PlayerName:ToString() end) end
-        end
+        local me = localName()
         local others = {}
         for _, n in ipairs(names) do if n ~= me then others[#others + 1] = n end end
         if #others == 1 then lockedHost = others[1] else log("lockhost: " .. #others .. " other players, host not known") end
