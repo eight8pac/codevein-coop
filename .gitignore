@@ -9,3 +9,4 @@ build/
 __pycache__/
 local/
 CoopLogs/
+mods/CoopSeamless/state.txt

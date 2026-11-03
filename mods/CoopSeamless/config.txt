@@ -1,3 +1,7 @@
 enabled=1
 host=auto
 guest=auto
+sessiondiag=0
+lockhost=0
+remember=0
+versioncheck=0
