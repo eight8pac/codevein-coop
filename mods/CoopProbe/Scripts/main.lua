@@ -676,6 +676,10 @@ local function groupTeleport()
     end
     log("group teleport: " .. n .. " guest(s) brought to the host")
 end
+-- memory state on the host (set by the scene relay): memHostOn while the memory runs; memFollowAt = a host skip to follow;
+-- memRespawnAt = a guest character removed during the memory, to be spawned again next to the host
+local memHostOn, memFollowAt, memRespawnAt = false, nil, nil
+local memWalkSince = nil
 local function keepDying(rested)
     local list = {}
     local gs = FindFirstOf("BP_AppGameState_C")
@@ -797,6 +801,9 @@ local function keepDying(rested)
                         local ok = pcall(function() p:K2_DestroyActor() end)
                         log("keep dying: " .. (fall and "fall death" or "true death") .. " of " .. name(p) .. " -> unpossess " .. tostring(un) .. ", body removed " .. (ok and "ok" or "FAILED") .. "; back on the host's next rest")
                         pendingRespawn = true
+                        -- 2026-11-03: during the memory a follow teleport landed him over no ground (the host was still moving to the
+                        -- next part), he died and stayed "gone" until a rest: in the memory he is spawned next to the host again
+                        if memHostOn then memRespawnAt = os.clock() + 3; log("keep dying: in the memory -> respawn next to the host in 3 s") end
                         tdSeen[a] = nil
                         local f = io.open(TRUEDEAD_PATH, "w"); if f then f:write("0"); f:close() end
                     end
@@ -981,7 +988,6 @@ end
 local relayErr = false
 -- 2026-11-02 (owner): a host skip inside the memory moves the host to the next memory part; the guest stayed behind. While the
 -- memory runs, a host skip pulls every guest character next to the host (K2_TeleportTo, server side; 2.5 s and 5 s after it).
-local memHostOn, memFollowAt = false, nil
 local function baseOf(q)
     local bm = try(function() return q.BasedMovement end)
     local b = bm and try(function() return bm.MovementBase end)
@@ -1003,29 +1009,40 @@ local function memoryBaseLog()
     end
 end
 local function memoryFollow()
-    if not memFollowAt then return end
-    local dt = os.clock() - memFollowAt
-    if dt < 2.5 then return end
     local pc = localPC()
     local host = valid(pc) and try(function() return pc.Pawn end) or nil
-    local hp = valid(host) and try(function() return host:K2_GetActorLocation() end)
-    local hr = valid(host) and try(function() return host:K2_GetActorRotation() end)
-    if hp then
-        for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
-            local g = valid(c) and not try(function() return c:IsLocalController() end) and try(function() return c.Pawn end)
-            local gp = valid(g) and try(function() return g:K2_GetActorLocation() end)
-            if gp then
-                local dx, dy, dz = gp.X - hp.X, gp.Y - hp.Y, gp.Z - hp.Z
-                if dx * dx + dy * dy + dz * dz > 3000 * 3000 then   -- (10 m pulled him back while he walked nearby)
-                    local to = { X = hp.X + 150, Y = hp.Y + 150, Z = hp.Z }
-                    local ok = pcall(function() g:K2_TeleportTo(to, hr or { Pitch = 0, Yaw = 0, Roll = 0 }) end)
-                    log(string.format("memory follow: %s was %.0f m from the host -> teleported next to the host %s", name(g),
-                        math.sqrt(dx * dx + dy * dy + dz * dz) / 100, tostring(ok)))
-                end
+    local hcm = valid(host) and try(function() return host.CharacterMovement end)
+    local walking = valid(hcm) and try(function() return hcm.MovementMode end) == 1
+    -- 2026-11-03: pulling him over 2.5 s after a skip put him next to the host while the host was still moving to the next memory
+    -- part (no ground there): he fell and died. Now the host must stand on ground for 2 s first (up to 20 s after the skip).
+    if walking then memWalkSince = memWalkSince or os.clock() else memWalkSince = nil end
+    local steady = memWalkSince and os.clock() - memWalkSince >= 2
+    if memRespawnAt and os.clock() > memRespawnAt and steady and memHostOn then
+        memRespawnAt = nil
+        local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+        if respawnGuest(helper, nil, host, false) then pendingRespawn = false end
+    end
+    if not memFollowAt then return end
+    local dt = os.clock() - memFollowAt
+    if dt > 20 then memFollowAt = nil; return end
+    if not steady then return end
+    local hp = try(function() return host:K2_GetActorLocation() end)
+    local hr = try(function() return host:K2_GetActorRotation() end)
+    if not hp then return end
+    for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+        local g = valid(c) and not try(function() return c:IsLocalController() end) and try(function() return c.Pawn end)
+        local gp = valid(g) and try(function() return g:K2_GetActorLocation() end)
+        if gp then
+            local dx, dy, dz = gp.X - hp.X, gp.Y - hp.Y, gp.Z - hp.Z
+            if dx * dx + dy * dy + dz * dz > 3000 * 3000 then   -- (10 m pulled him back while he walked nearby)
+                local to = { X = hp.X + 150, Y = hp.Y + 150, Z = hp.Z + 50 }
+                local ok = pcall(function() g:K2_TeleportTo(to, hr or { Pitch = 0, Yaw = 0, Roll = 0 }) end)
+                log(string.format("memory follow: %s was %.0f m from the host (host on ground) -> teleported next to the host %s", name(g),
+                    math.sqrt(dx * dx + dy * dy + dz * dz) / 100, tostring(ok)))
             end
         end
     end
-    if dt >= 5 then memFollowAt = nil end
+    memFollowAt = nil
 end
 -- 2026-11-02: the guest's blood veil (JinkakuComponent.JinkakuMesh) was invisible on the host outside the memory cutscenes. Log
 -- every player character's veil state 4 s after it appears (both PCs): mesh set, visible, hidden in game, disappear expression.
