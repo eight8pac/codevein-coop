@@ -1055,8 +1055,11 @@ local function memoryFollow()
     end
     memFollowAt = nil
 end
--- 2026-11-02: the guest's blood veil (JinkakuComponent.JinkakuMesh) was invisible on the host outside the memory cutscenes. Log
--- every player character's veil state 4 s after it appears (both PCs): mesh set, visible, hidden in game, disappear expression.
+-- Special-mode reset (2026-11-02/03). After the memory his character kept FieldType 3 (memory mode: weapon hidden; his own
+-- memory flow does not end normally) -> no weapon. Each player character is checked once, 4 s after it appears: outside Home
+-- Base and outside the memory window every special mode (FCharacterRestrictedActionInBaseInfo) is cleared.
+-- (The earlier veil-mesh logging and forced veil visibility are gone: the hidden veil was the brother's game setting, and forcing
+--  it visible overrode that setting.)
 veilSeen = {}
 function veilWatch()
     for _, p in ipairs(FindAllOf("BP_Player_C") or {}) do
@@ -1064,31 +1067,17 @@ function veilWatch()
         if n and not veilSeen[n] then veilSeen[n] = os.clock()
         elseif n and veilSeen[n] ~= true and os.clock() - veilSeen[n] > 4 then
             veilSeen[n] = true
-            local j = try(function() return p.Jinkaku end)
-            local m = valid(j) and try(function() return j.JinkakuMesh end)
-            local sk = valid(m) and try(function() return m.SkeletalMesh end)
-            -- Home Base mode (FCharacterRestrictedActionInBaseInfo: FieldType 1 = base, bJinkakuVisibility = veil shown) stuck on a
-            -- field character hides the veil; the guest joined from Home Base (suspect, 2026-11-02). Outside Home Base reset it.
             local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
             local out = {}
             pcall(function() helper:GetRestrictedActionInBaseInfo(p, out) end)
             local info = out.OutInfo or out
             local ft = try(function() return info.FieldType end)
-            local jv = try(function() return info.bJinkakuVisibility end)
             local fm = FindFirstOf("AppFieldManager")
             local inBase = valid(fm) and try(function() return fm:IsInHideout(fm) end)
-            log(string.format("veil: %s mesh=%s visible=%s hiddenInGame=%s actorHidden=%s | base mode FieldType=%s veilShown=%s inHideout=%s",
-                n, tostring(valid(sk) and name(sk)), tostring(valid(m) and try(function() return m:IsVisible() end)),
-                tostring(valid(m) and try(function() return m.bHiddenInGame end)), tostring(try(function() return p.bHidden end)),
-                tostring(ft), tostring(jv), tostring(inBase)))
-            -- 2026-11-02: after the memory his character kept FieldType 3 (memory mode: weapon hidden; his own memory flow does not end
-            -- normally) -> no weapon visible. Outside Home Base and outside the memory window every special mode is cleared.
             local gmf = io.open(WIN64 .. "\\plugins\\CoopNative.guestmem", "r")
             local inMemory = gmf and ((gmf:read("*a") or ""):match("1") ~= nil) or false
             if gmf then gmf:close() end
-            -- 2026-11-03 (owner): the HOST's memory character lost its memory mode (gun drawn, could run): the window file above
-            -- exists only on the guest, so on the host every memory character looked "outside the memory". memHostOn = the host's
-            -- memory runs (scene relay memstart..memend).
+            -- the window file exists only on the guest; on the host memHostOn = the host's memory runs (relay memstart..memend)
             if memHostOn then inMemory = true end
             if ft and ft ~= 0 and inBase ~= true and not inMemory then
                 local gs = FindFirstOf("BP_AppGameState_C")
@@ -1097,8 +1086,7 @@ function veilWatch()
                 local own = valid(mine) and name(mine) == n
                 local a = own and pcall(function() helper:ClearRestrictedActionInBaseInfo(p) end)
                 local b = isHost and pcall(function() helper:ClearRestrictedActionInBaseInfoHost(p) end)
-                if valid(m) then pcall(function() m:SetVisibility(true, true) end) end
-                log("veil: " .. n .. " had special mode " .. tostring(ft) .. " in the field -> cleared (own " .. tostring(a) .. ", host " .. tostring(b) .. "), veil mesh shown")
+                log("special mode: " .. n .. " had mode " .. tostring(ft) .. " in the field -> cleared (own " .. tostring(a) .. ", host " .. tostring(b) .. ")")
             end
         end
     end
@@ -1800,31 +1788,38 @@ function bloodCodeSyncGuest()
     end
     bcIn = {}
 end
--- Co-op version on the title screen (owner 2026-11-03: to see that both PCs run the same kit). The game's own version text
--- block on the title gets " / co-op <kit>" appended (plugins\\CoopKitVersion.txt). Checked every 2 s while no world is
--- loaded; the first time, the title's text blocks are logged once (to find the right one if the match fails).
-titleVerAt, titleVerLogged = -1000, false
+-- Co-op version on the title screen (owner 2026-11-03: to see that both PCs run the same kit). The game's version text on the
+-- title gets "  /  co-op <kit>" appended (plugins\\CoopKitVersion.txt).
+-- v2 (2026-11-03, after title-screen crashes inside UE4SS): no search while menus are being built. Every 2 s only a cheap check
+-- whether the title menu component exists; once it has existed for 5 s, ONE pass over the text blocks; at most 3 passes per
+-- title visit, and nothing while a world (our player character) exists. The first pass logs the title's texts once.
+titleVerAt, titleVerLogged, titleSeenAt, titlePasses, titleDone = -1000, false, nil, 0, false
 function titleVersion()
-    if os.clock() - titleVerAt < 2 then return end
+    if titleDone or os.clock() - titleVerAt < 2 then return end
     titleVerAt = os.clock()
-    local gs = FindFirstOf("BP_AppGameState_C")
-    local pc = localPC()
-    if valid(pc) and valid(try(function() return pc.Pawn end)) and name(pc.Pawn):find("BP_Player_C", 1, true) then return end
+    local tm = FindFirstOf("TitleMenuUIComponent")
+    if not valid(tm) then titleSeenAt, titlePasses = nil, 0; return end
+    titleSeenAt = titleSeenAt or os.clock()
+    if os.clock() - titleSeenAt < 5 or titlePasses >= 3 then return end
+    titlePasses = titlePasses + 1
     local vf = io.open(WIN64 .. "\\plugins\\CoopKitVersion.txt", "r")
     local ver = vf and (vf:read("*l") or ""):gsub("CodeVein%-guest%-update%-", ""):gsub("%.zip", ""):gsub("%s", "") or "?"
     if vf then vf:close() end
     local seen = {}
     for _, tb in ipairs(FindAllOf("TextBlock") or {}) do
         local txt = valid(tb) and try(function() return tb:GetText():ToString() end)
-        if txt then
-            if not titleVerLogged and #seen < 25 and txt ~= "" then seen[#seen + 1] = name(tb) .. "=" .. txt:sub(1, 30) end
-            if not txt:find("co-op", 1, true) and (txt:find("^[Vv][Ee][Rr]") or txt:find("1%.53")) then
+        if txt and txt ~= "" then
+            if not titleVerLogged and #seen < 40 then seen[#seen + 1] = name(tb) .. "=" .. txt:sub(1, 30) end
+            if txt:find("co-op", 1, true) then titleDone = true
+            -- only the short "Version: ..." line (17:48 test: the version number also matched long update-note texts)
+            elseif #txt < 60 and txt:find("^[Vv][Ee][Rr]") then
                 local ok = pcall(function() tb:SetText(FText(txt .. "  /  co-op " .. ver)) end)
                 log("title version: '" .. txt .. "' -> co-op " .. ver .. " " .. tostring(ok))
+                if ok then titleDone = true end
             end
         end
     end
-    if not titleVerLogged and #seen > 0 then titleVerLogged = true; log("title version: text blocks: " .. table.concat(seen, " | "):sub(1, 900)) end
+    if not titleVerLogged then titleVerLogged = true; log("title version: pass " .. titlePasses .. ", texts: " .. table.concat(seen, " | "):sub(1, 1500)) end
 end
 function teleportToMark(why)
     local v = iniValue("test_mark")
@@ -1870,9 +1865,7 @@ local function probeCommands()
     if world then pcall(visMirrorGuest) end
     if world then pcall(bossWallsOff) end
     pcall(autoTeleportToMark)
-    -- (2026-11-03: the guest crashed twice inside UE4SS on the title screen with this on: walking every TextBlock while the
-    --  menu builds them is the FindAllOf crash pattern again -> off until it is rebuilt without FindAllOf)
-    -- pcall(titleVersion)
+    if not world then pcall(titleVersion) else titleDone = false end
     if world then pcall(bloodCodeSyncHost) end
     if world then pcall(bloodCodeSyncGuest) end
     pcall(guestMemoryControl)
