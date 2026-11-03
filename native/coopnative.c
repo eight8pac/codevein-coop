@@ -429,6 +429,11 @@ static volatile LONG g_assert_skips;
 static uint64_t detour_assert_fatal(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) {
     uintptr_t ret = (uintptr_t)__builtin_return_address(0);
     if (ret >= 0x145D78000ULL && ret < 0x145D86200ULL) {
+        // 2026-11-03 (both PCs crashed with "BitArrayIndex" right after a negative counter): the failing check is followed by a
+        // plain DEC of the counter it tested. Set exactly that counter to 1 first, so the decrement ends at 0, never below:
+        // return 0x145D8361B = "[0x14413C40C] > 0" (+0xB84 holders), return 0x145D78817 = "[0x14413C404] > 0" (start counter)
+        if (ret == 0x145D8361BULL && *(volatile int *)0x14413C40CULL <= 0) *(volatile int *)0x14413C40CULL = 1;
+        if (ret == 0x145D78817ULL && *(volatile int *)0x14413C404ULL <= 0) *(volatile int *)0x14413C404ULL = 1;
         LONG n = InterlockedIncrement(&g_assert_skips);
         if (n <= 50) logf_("appear lock: engine check in the lock code skipped (from 0x%llX, count %d, +0xB84 holders %d, %ld so far)",
                            (unsigned long long)ret, *(volatile int *)0x14413C404ULL, *(volatile int *)0x14413C40CULL, n);
@@ -735,6 +740,46 @@ BRANCH_DETOUR(6)
 BRANCH_DETOUR(7)
 BRANCH_DETOUR(8)
 static void *g_branch_det[BRANCH_N] = {branch_det_0, branch_det_1, branch_det_2, branch_det_3, branch_det_4, branch_det_5, branch_det_6, branch_det_7, branch_det_8};
+
+// CheckGameProgress trace (2026-11-03): on the guest it answered "yes" where his synced flags say no (all vestiges, extra Nicola
+// statue in the memory, the Nicola knight figure in the field). Impl 0x140792570(FString* symbol, UObject* ctx) -> bool; inside,
+// 0x141DF3070(ctx) fetches the data object that is checked (cast against 0x1409FA3B0's class). Both PCs log symbol, answer, the
+// context's class and the data object (address + class/name FName indexes; "fname <idx>" in CoopProbe.cmd resolves them):
+// the first 150 calls of a run, and all calls for 10 min after a boss kill (at most 1500 more).
+#define ADDR_CHECK_PROGRESS_IMPL 0x140792570ULL
+#define ADDR_CTX_DATA 0x141DF3070ULL
+typedef uint8_t (*checkprog_fn)(void *symbol, void *ctx);
+typedef void *(*ctxdata_fn)(void *ctx);
+static checkprog_fn g_orig_check_progress;
+static volatile LONG g_cgp_logs, g_cgp_boss_logs;
+static uint8_t detour_check_progress(void *symbol, void *ctx) {
+    // the symbol is read BEFORE the call (2026-11-03: read afterwards it came out garbled; the impl consumes the FString)
+    int boss = g_branch_kill_at && GetTickCount64() - g_branch_kill_at < 600000;
+    int want = InterlockedIncrement(&g_cgp_logs) <= 150 || (boss && InterlockedIncrement(&g_cgp_boss_logs) <= 1500);
+    if (!want) return g_orig_check_progress(symbol, ctx);
+    char name[120] = "";
+    uintptr_t e = (uintptr_t)symbol;
+    if (e && readable(e, 16)) {
+        const uint16_t *w = *(const uint16_t **)e;
+        int n = *(int *)(e + 8);
+        if (w && n > 0 && n < 110 && readable((uintptr_t)w, (size_t)n * 2)) {
+            int k = 0;
+            for (int i = 0; i < n - 1 && k < 110; i++) name[k++] = (w[i] >= 32 && w[i] < 127) ? (char)w[i] : '?';
+            name[k] = 0;
+        }
+    }
+    uint8_t r = g_orig_check_progress(symbol, ctx);
+    uintptr_t c = (uintptr_t)ctx, d = 0;
+    int cc = -1, dc = -1, dn = -1;
+    if (c && readable(c + 0x10, 0x10)) { uintptr_t cl = *(uintptr_t *)(c + 0x10); if (cl && readable(cl + 0x18, 4)) cc = *(int *)(cl + 0x18); }
+    if (c) d = (uintptr_t)((ctxdata_fn)ADDR_CTX_DATA)(ctx);
+    if (d && readable(d + 0x10, 0x10)) {
+        dn = *(int *)(d + 0x18);
+        uintptr_t cl = *(uintptr_t *)(d + 0x10); if (cl && readable(cl + 0x18, 4)) dc = *(int *)(cl + 0x18);
+    }
+    logf_("CGP %s -> %u | ctx 0x%llX class %d | data 0x%llX class %d name %d", name, r, (unsigned long long)c, cc, (unsigned long long)d, dc, dn);
+    return r;
+}
 
 // Game-thread pump (2026-10-30, after the Lies of P study, which drains its queue from a hooked engine tick): UGameEngine::Tick
 // 0x14EBE3C20 (UE4SS finds the same address; it hooks it too, later, on top of ours). (this, float DeltaSeconds, bool bIdleMode).
@@ -2000,6 +2045,77 @@ static void *g_fade_det[FADE_N] = {(void *)fade_det_0, (void *)fade_det_1, (void
 static char g_cl_result[300];
 static void cl_start_zip(void);
 static void cl_snapshot(void);
+// Exit log package (2026-11-03, owner: no second start to get the zip). At every start CoopNative writes CoopLogs\\collect.ps1
+// and starts it hidden with this process id; it waits until the game has ended (quit or crash), then zips CoopNative.log,
+// UE4SS.log, the game's CodeVein.log, CoopProgress's journal and a crash report of this run into
+// CoopLogs\\CoopLogs-<date>-<time>.zip (newest 5 kept) and, with log_share=<folder> in CoopNative.ini (a LAN share on the host's
+// PC), copies the zip there. Nothing goes to the internet.
+static const char *g_exit_ps =
+    "param([int]$GamePid, [string]$Plugins, [string]$Share)\n"
+    "Start-Transcript -Path (Join-Path (Join-Path $Plugins 'CoopLogs') 'collect.log') -Force | Out-Null\n"
+    "$start = Get-Date\n"
+    "try { Wait-Process -Id $GamePid -ErrorAction Stop } catch {}\n"
+    "Start-Sleep -Seconds 8\n"
+    "$root = Join-Path $Plugins 'CoopLogs'\n"
+    "$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'\n"
+    "$tmp = Join-Path $root ('exit-' + $stamp)\n"
+    "New-Item -ItemType Directory -Force -Path $tmp | Out-Null\n"
+    "Copy-Item (Join-Path $Plugins 'CoopNative.log') $tmp -ErrorAction SilentlyContinue\n"
+    "Copy-Item (Join-Path (Split-Path $Plugins -Parent) 'ue4ss\\UE4SS.log') $tmp -ErrorAction SilentlyContinue\n"
+    "$saved = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'CodeVein\\Saved'\n"
+    "Copy-Item (Join-Path $saved 'Logs\\CodeVein.log') $tmp -ErrorAction SilentlyContinue\n"
+    "$crash = Get-ChildItem (Join-Path $saved 'Crashes') -Directory -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt $start } | Sort-Object LastWriteTime -Descending | Select-Object -First 1\n"
+    "if ($crash) { Copy-Item $crash.FullName (Join-Path $tmp 'crash') -Recurse -ErrorAction SilentlyContinue }\n"
+    "$journal = Join-Path (Split-Path $Plugins -Parent) 'ue4ss\\Mods\\CoopProgress\\journal.txt'\n"
+    "Copy-Item $journal $tmp -ErrorAction SilentlyContinue\n"
+    "$zip = Join-Path $root ('CoopLogs-' + $stamp + '.zip')\n"
+    "Compress-Archive -Path (Join-Path $tmp '*') -DestinationPath $zip -Force\n"
+    "Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue\n"
+    "Get-ChildItem (Join-Path $root 'CoopLogs-*.zip') | Sort-Object Name -Descending | Select-Object -Skip 5 | Remove-Item -Force -ErrorAction SilentlyContinue\n"
+    "if ($Share -and (Test-Path $zip)) { Copy-Item $zip $Share -ErrorAction SilentlyContinue }\n"
+    "# auto update (2026-11-03): a newer guest kit on the host's share (kits\\latest.txt) is unpacked into this game folder now that the game is closed\n"
+    "if ($Share) {\n"
+    "  try {\n"
+    "    $kits = Join-Path $Share 'kits'\n"
+    "    $latest = (Get-Content (Join-Path $kits 'latest.txt') -ErrorAction Stop | Select-Object -First 1).Trim()\n"
+    "    $cur = ''\n"
+    "    $vf = Join-Path $Plugins 'CoopKitVersion.txt'\n"
+    "    if (Test-Path $vf) { $cur = (Get-Content $vf | Select-Object -First 1).Trim() }\n"
+    "    if ($latest -and $latest -ne $cur -and (Test-Path (Join-Path $kits $latest))) {\n"
+    "      Expand-Archive -Path (Join-Path $kits $latest) -DestinationPath (Split-Path $Plugins -Parent) -Force\n"
+    "      Write-Output ('auto update: ' + $cur + ' -> ' + $latest)\n"
+    "    } else { Write-Output ('auto update: up to date (' + $cur + ')') }\n"
+    "  } catch { Write-Output ('auto update failed: ' + $_) }\n"
+    "}\n";
+static void start_exit_package(void) {
+    char root[MAX_PATH], ps1[MAX_PATH], share[600] = "", ini[2048], sysdir[MAX_PATH] = "C:\\Windows\\System32", cmd[2048], plugins[MAX_PATH];
+    snprintf(root, sizeof root, "%sCoopLogs", g_dir); CreateDirectoryA(root, NULL);
+    snprintf(ps1, sizeof ps1, "%s\\collect.ps1", root);
+    FILE *f = _fsopen(ps1, "w", _SH_DENYNO);
+    if (!f) { logf_("log package: could not write collect.ps1"); return; }
+    fputs(g_exit_ps, f); fclose(f);
+    if (read_small_file("CoopNative.ini", ini, sizeof ini)) {
+        const char *q = strstr(ini, "log_share=");
+        if (q) {
+            q += 10;
+            size_t k = 0;
+            while (q[k] && q[k] != '\r' && q[k] != '\n' && k < sizeof share - 1) { share[k] = q[k]; k++; }
+            share[k] = 0;
+        }
+    }
+    snprintf(plugins, sizeof plugins, "%s", g_dir);
+    size_t pl = strlen(plugins);
+    if (pl && plugins[pl - 1] == '\\') plugins[pl - 1] = 0;
+    GetSystemDirectoryA(sysdir, sizeof sysdir);
+    snprintf(cmd, sizeof cmd, "\"%s\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \"%s\" -GamePid %lu -Plugins \"%s\" -Share \"%s\"",
+             sysdir, ps1, GetCurrentProcessId(), plugins, share);
+    STARTUPINFOA si; PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof si); si.cb = sizeof si; si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+    if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        logf_("log package: waiting for the game to end (zip to CoopLogs%s%s)", share[0] ? ", copy to " : "", share[0] ? share : "");
+    } else logf_("log package: could not start the watcher (%lu)", GetLastError());
+}
 static DWORD WINAPI worker(LPVOID unused) {
     (void)unused;
     Sleep(2000);   // let the engine finish its own startup first
@@ -2058,6 +2174,8 @@ static DWORD WINAPI worker(LPVOID unused) {
     install("RequestSkipEventImpl", ADDR_SKIP_EVENT_IMPL,
             "\xE9\xEB\x2C\x9A\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_skip_event, (void **)&g_orig_skip_event);
     for (int i = 0; i < BRANCH_N; i++) install(g_branch_name[i], g_branch_addr[i], g_branch_expect[i], g_branch_det[i], (void **)&g_branch_orig[i]);
+    install("CheckGameProgressImpl", ADDR_CHECK_PROGRESS_IMPL,
+            "\xE9\x0B\x1F\x55\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_check_progress, (void **)&g_orig_check_progress);
     install("GameEngineTick", ADDR_GAME_ENGINE_TICK,
             "\x48\x89\xE0\x44\x88\x40\x18\x55\x53\x57\x41\x54\x41\x56\x48\x8D", (void *)detour_engine_tick, (void **)&g_orig_engine_tick);
     install("AppearLockAcquire", 0x1404448B0ULL,
@@ -2121,9 +2239,8 @@ static DWORD WINAPI worker(LPVOID unused) {
         logf_("startup hooks enabled together -> %s", MH_StatusToString(es));
     }
     if (g_cl_result[0]) logf_("log collection: %s", g_cl_result);
-    cl_start_zip();
+    start_exit_package();
     for (unsigned tick = 0;; tick++) {
-        if (tick % 150 == 20) cl_snapshot();   // every 30 s (200 ms ticks)
         clamp_lock_counters();
         Sleep(200);
         read_settings();
@@ -2431,10 +2548,13 @@ static void cl_collect_previous(void) {
     char zip[MAX_PATH], *cmd = g_cl_cmd;
     snprintf(zip, sizeof zip, "%s\\CoopLogs-%04u%02u%02u-%02u%02u%02u.zip", root, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
     // zip (and keep the newest 5) in a hidden PowerShell, so the game start does not wait for it
+    // full path (2026-11-03: on the guest's PC "powershell.exe" alone gave error 2, file not found, from inside the game)
+    char sysdir[MAX_PATH] = "C:\\Windows\\System32";
+    GetSystemDirectoryA(sysdir, sizeof sysdir);
     snprintf(cmd, sizeof g_cl_cmd,
-             "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command \"Compress-Archive -Path '%s\\*' -DestinationPath '%s' -Force; "
+             "\"%s\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -WindowStyle Hidden -Command \"Compress-Archive -Path '%s\\*' -DestinationPath '%s' -Force; "
              "Get-ChildItem '%s\\CoopLogs-*.zip' | Sort-Object Name -Descending | Select-Object -Skip 5 | Remove-Item -Force\"",
-             prev, zip, root);
+             sysdir, prev, zip, root);
     snprintf(g_cl_result, sizeof g_cl_result, "previous run collected -> CoopLogs\\%s%s%s", strrchr(zip, '\\') + 1,
              newest[0] ? ", with crash report " : "", newest);
 }
@@ -2448,7 +2568,6 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         while (n > 0 && g_dir[n - 1] != '\\') n--;
         g_dir[n] = 0;
         char path[MAX_PATH];
-        cl_collect_previous();
         snprintf(path, sizeof path, "%sCoopNative.log", g_dir);
         g_log = _fsopen(path, "w", _SH_DENYWR);
         logf_("CoopNative loaded (probes: GetRescueSignalState, SessionStateHandler; EndCooperativeMode veto and Mistle rest are off unless enabled)");

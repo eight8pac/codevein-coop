@@ -49,6 +49,11 @@ local function iniHas(key)
     local s = f:read("*a") or ""; f:close()
     return s:find(key, 1, true) ~= nil
 end
+function iniValue(key)
+    local f = io.open(INI, "r"); if not f then return nil end
+    local s = f:read("*a") or ""; f:close()
+    return s:match(key .. "=([^\r\n]+)")
+end
 -- On the host every player has a PlayerController; ours is the local one.
 local function localPC()
     for _, pc in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
@@ -156,7 +161,7 @@ local function fieldWindow(gs, helper)
     if keepDyingOn and not valid(mine) and sawOwnTrueDeath and trueDeadAddr() then return aliveOther end
     return deadMine and aliveOther
 end
-local postBossUntil = -1000   -- set when the host's memory starts/ends (scene relay); no spectate window until then
+postBossUntil = -1000   -- set when the host's memory starts/ends (scene relay); no spectate window until then
 local function spectateWindow()
     if os.clock() - rewardsAt < 60 then return false end
     -- 2026-11-02: after the memory his BossAreaState still said "fight running" (his story flags) and leftover memory characters
@@ -576,7 +581,12 @@ local function sendTpInfo()
     if valid(gs) then os.remove(WIN64 .. "\\plugins\\CoopNative.role") end
     if not valid(gs) then return end
     -- CoopNative ignores a tpinfo older than 2 minutes: rewrite it every 30 s even without a change
-    if os.clock() - tpTouchAt > 30 then tpTouchAt = os.clock(); lastTpInfo = nil end
+    -- (2026-11-03: two freezes while loading came right after this rewrite; only needed with a guest connected)
+    local remote = false
+    for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+        if valid(c) and not try(function() return c:IsLocalController() end) then remote = true end
+    end
+    if remote and os.clock() - tpTouchAt > 30 then tpTouchAt = os.clock(); lastTpInfo = nil end
     local lines = {}
     for _, d in ipairs(FindAllOf("DeferredTeleportDriver") or {}) do
         local a = valid(d) and try(function() return d:GetAddress() end)
@@ -988,15 +998,15 @@ end
 local relayErr = false
 -- 2026-11-02 (owner): a host skip inside the memory moves the host to the next memory part; the guest stayed behind. While the
 -- memory runs, a host skip pulls every guest character next to the host (K2_TeleportTo, server side; 2.5 s and 5 s after it).
-local function baseOf(q)
+function baseOf(q)
     local bm = try(function() return q.BasedMovement end)
     local b = bm and try(function() return bm.MovementBase end)
     if not valid(b) then return "none" end
     local o = try(function() return b:GetOwner() end)
     return name(b) .. "@" .. (valid(o) and name(o) or "?")
 end
-local memBaseLogUntil, memBaseLogAt = -1000, -1000
-local function memoryBaseLog()
+memBaseLogUntil, memBaseLogAt = -1000, -1000
+function memoryBaseLog()
     if os.clock() > memBaseLogUntil or os.clock() - memBaseLogAt < 3 then return end
     memBaseLogAt = os.clock()
     for _, q in ipairs(FindAllOf("BP_Player_C") or {}) do
@@ -1016,7 +1026,8 @@ local function memoryFollow()
     -- 2026-11-03: pulling him over 2.5 s after a skip put him next to the host while the host was still moving to the next memory
     -- part (no ground there): he fell and died. Now the host must stand on ground for 2 s first (up to 20 s after the skip).
     if walking then memWalkSince = memWalkSince or os.clock() else memWalkSince = nil end
-    local steady = memWalkSince and os.clock() - memWalkSince >= 2
+    -- (owner 2026-11-03: faster; 2 s -> 0.75 s. A landing over no ground is caught by the memory respawn above)
+    local steady = memWalkSince and os.clock() - memWalkSince >= 0.75
     if memRespawnAt and os.clock() > memRespawnAt and steady and memHostOn then
         memRespawnAt = nil
         local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
@@ -1046,8 +1057,8 @@ local function memoryFollow()
 end
 -- 2026-11-02: the guest's blood veil (JinkakuComponent.JinkakuMesh) was invisible on the host outside the memory cutscenes. Log
 -- every player character's veil state 4 s after it appears (both PCs): mesh set, visible, hidden in game, disappear expression.
-local veilSeen = {}
-local function veilWatch()
+veilSeen = {}
+function veilWatch()
     for _, p in ipairs(FindAllOf("BP_Player_C") or {}) do
         local n = valid(p) and name(p)
         if n and not veilSeen[n] then veilSeen[n] = os.clock()
@@ -1075,6 +1086,10 @@ local function veilWatch()
             local gmf = io.open(WIN64 .. "\\plugins\\CoopNative.guestmem", "r")
             local inMemory = gmf and ((gmf:read("*a") or ""):match("1") ~= nil) or false
             if gmf then gmf:close() end
+            -- 2026-11-03 (owner): the HOST's memory character lost its memory mode (gun drawn, could run): the window file above
+            -- exists only on the guest, so on the host every memory character looked "outside the memory". memHostOn = the host's
+            -- memory runs (scene relay memstart..memend).
+            if memHostOn then inMemory = true end
             if ft and ft ~= 0 and inBase ~= true and not inMemory then
                 local gs = FindFirstOf("BP_AppGameState_C")
                 local isHost = valid(gs) and try(function() return gs.Role end) == 3
@@ -1198,6 +1213,154 @@ local function writeMyPawn()
     end
     local pf = io.open(WIN64 .. "\\plugins\\CoopNative.pawns", "w"); if pf then pf:write(table.concat(list, " ")); pf:close() end
 end
+-- NPC census (2026-11-03): the guest saw story NPCs that should not be there (both saves identical). Both PCs log the NPC-like
+-- characters that exist (not players; names with NPC/Npc/Talk/Scenario), with their network role (3 = created on this PC,
+-- 1 = replicated from the host) and position: 20 s after joining / after our character changed (teleport, respawn), and
+-- every 2 minutes in a session. No component walks (FindAllOf + GetOwner crashed UE4SS before).
+npcAt, npcPawn, npcPawnAt = -1000, nil, nil
+-- Visibility mirror (2026-11-03, census: the NPCs are the host's replicated actors with the same names on both PCs, but after the
+-- boss the host hid BP_ScenarioChara_St09_Cyllene_14 / _Nicolas_92 and the guest still showed them; the fog wall came back on
+-- the guest after a rest). The host sends the hidden state of story NPCs and mist/boss walls (by name) whenever it changes or a
+-- guest joins: ClientMessage "CoopVis:<name>=<0|1>;..."; the guest applies SetActorHiddenInGame and the collision to the actor
+-- with that name.
+WALL_CLASSES = {"BP_MistWall_C", "BP_MistWall_St07_C"}
+-- v2 (2026-11-03 test): bHidden was the wrong state. Mist walls are local level actors (role 0) whose state is bProcessEnable,
+-- set with SetStateMistWall(bEnable, bForce); story NPCs (AScenarioCharacter) use bProgressVisibility / bShouldBeVisible, set
+-- with SetProgressVisibility. The host sends those per name ("W" wall enabled, "V" NPC visible); the guest calls the same
+-- setters. Io (ActionNPC, the companion) is left alone.
+function visActors()
+    local out = {}
+    for _, q in ipairs(FindAllOf("Character") or {}) do
+        local n = valid(q) and name(q)
+        -- (2026-11-03: Sophie is BP_SubQuestChara_08_002_SumikaDevil: side-quest characters are included too)
+        if n and (n:find("ScenarioChara", 1, true) or n:find("SubQuestChara", 1, true)) then out[#out + 1] = {q, "V"} end
+    end
+    for _, c in ipairs(WALL_CLASSES) do
+        for _, q in ipairs(FindAllOf(c) or {}) do if valid(q) then out[#out + 1] = {q, "W"} end end
+    end
+    return out
+end
+function visState(q, kind)
+    if kind == "W" then return try(function() return q.bProcessEnable end) and "1" or "0" end
+    local pv = try(function() return q.bProgressVisibility end)
+    local sv = try(function() return q.bShouldBeVisible end)
+    local hidden = try(function() return q.bHidden end)
+    if pv == nil then return hidden and "0" or "1" end   -- classes without progress visibility
+    -- (2026-11-03: Cyllene was off by progress on the guest but could be shown again through bHidden; count both)
+    return (pv and sv ~= false and not hidden) and "1" or "0"
+end
+visSent, visAt, visGuests = {}, -1000, 0
+function visMirrorHost()
+    if os.clock() - visAt < 1 then return end   -- (owner: the NPCs/walls changed late; 3 s -> 1 s)
+    visAt = os.clock()
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not valid(gs) or try(function() return gs.Role end) ~= 3 then return end
+    local guests = {}
+    for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+        if valid(c) and not try(function() return c:IsLocalController() end) then guests[#guests + 1] = c end
+    end
+    if #guests == 0 then visGuests = 0; return end
+    if #guests > visGuests then visSent = {} end   -- a new guest: send everything again
+    visGuests = #guests
+    local changed = {}
+    for _, e in ipairs(visActors()) do
+        local q, kind = e[1], e[2]
+        local n = name(q)
+        local s = kind .. visState(q, kind)
+        if visSent[n] ~= s then visSent[n] = s; changed[#changed + 1] = n .. "=" .. s end
+    end
+    for i = 1, #changed, 15 do
+        local msg = "CoopVis:" .. table.concat(changed, ";", i, math.min(i + 14, #changed))
+        for _, c in ipairs(guests) do pcall(function() c:ClientMessage(msg, FName("None"), 0) end) end
+        log("visibility mirror: sent " .. msg:sub(1, 200))
+    end
+end
+visIn, visWanted, visDone = {}, {}, {}
+pcall(function()
+    RegisterHook("/Script/Engine.PlayerController:ClientMessage", function(ctx, s)
+        local text = try(function() return s:get():ToString() end)
+        if text and text:find("^CoopVis:") then visIn[#visIn + 1] = text:sub(9) end
+    end)
+end)
+-- the guest keeps the host's last state per name and re-applies it every 3 s (his own logic switched the wall back on before)
+visApplyAt = -1000
+function visMirrorGuest()
+    for _, m in ipairs(visIn) do
+        for n, s in m:gmatch("([^;=]+)=([WV][01])") do visWanted[n] = s end
+    end
+    local fresh = #visIn > 0
+    visIn = {}
+    if not fresh and os.clock() - visApplyAt < 1 then return end
+    visApplyAt = os.clock()
+    if next(visWanted) == nil then return end
+    local applied = {}
+    for _, e in ipairs(visActors()) do
+        local q, kind = e[1], e[2]
+        local n = name(q)
+        local want = visWanted[n]
+        if want and want:sub(1, 1) == kind then
+            local on = want:sub(2, 2) == "1"
+            local key = n .. "/" .. want
+            if visState(q, kind) ~= (on and "1" or "0") or (kind == "W" and not visDone[key]) then
+                visDone[key] = true
+                if kind == "W" then
+                    -- (102 test: bProcessEnable went false on the guest but the fog stayed: the effect fades in the wall's tick,
+                    -- which may not run there) -> tick on, plus the wall's own activate/deactivate and effect functions
+                    pcall(function() q:SetActorTickEnabled(true) end)
+                    pcall(function() q:SetStateMistWall(on, true) end)
+                    if on then pcall(function() q:OnActivate(true) end); pcall(function() q:ConstructEffect() end)
+                    else pcall(function() q:OnDeactivate(true) end); pcall(function() q:DestructEffect() end) end
+                else
+                    pcall(function() q:SetProgressVisibility(on) end)
+                    pcall(function() q.bShouldBeVisible = on end)
+                    pcall(function() q:SetActorHiddenInGame(not on) end)
+                end
+                applied[#applied + 1] = n .. (on and " on" or " off")
+            end
+        end
+    end
+    if #applied > 0 then log("visibility mirror: " .. table.concat(applied, ", ")) end
+end
+function npcCensus(reason)
+    local list, other, others = {}, 0, nil
+    for _, q in ipairs(FindAllOf("Character") or {}) do
+        local n = valid(q) and name(q)
+        if n and not n:find("BP_Player_C", 1, true) then
+            if n:find("NPC") or n:find("Npc") or n:find("Talk") or n:find("Scenario") then
+                local loc = try(function() return q:K2_GetActorLocation() end)
+                list[#list + 1] = string.format("%s role=%s hidden=%s progressVisible=%s/%s at %s", n, tostring(try(function() return q.Role end)),
+                    tostring(try(function() return q.bHidden end)), tostring(try(function() return q.bProgressVisibility end)),
+                    tostring(try(function() return q.bShouldBeVisible end)),
+                    loc and string.format("%d,%d,%d", math.floor(loc.X), math.floor(loc.Y), math.floor(loc.Z)) or "?")
+            else other = other + 1; others = others or {}; others[#others + 1] = n .. "/" .. tostring(try(function() return q.Role end)) end
+        end
+    end
+    for _, c in ipairs(WALL_CLASSES) do
+        for _, q in ipairs(FindAllOf(c) or {}) do
+            if valid(q) then
+                list[#list + 1] = string.format("%s role=%s enabled=%s", name(q), tostring(try(function() return q.Role end)),
+                    tostring(try(function() return q.bProcessEnable end)))
+            end
+        end
+    end
+    table.sort(list)
+    log("npc census (" .. reason .. "): " .. #list .. " NPC-like/walls, " .. other .. " other characters")
+    if others then table.sort(others); log("npc census: others: " .. table.concat(others, ", "):sub(1, 1500)) end
+    for i = 1, math.min(#list, 40) do log("npc census:   " .. list[i]) end
+end
+function npcCensusTick()
+    local gs = FindFirstOf("BP_AppGameState_C")
+    local sm = FindFirstOf("AppSessionManager")
+    local multi = valid(sm) and valid(gs) and try(function() return sm:IsOnlineMultiplay(gs) end)
+    if not multi then npcPawn = nil; return end
+    local pc = localPC()
+    local mine = valid(pc) and try(function() return pc.Pawn end) or nil
+    local mn = valid(mine) and name(mine) or nil
+    if mn and mn ~= npcPawn then npcPawn, npcPawnAt = mn, os.clock() end
+    if npcPawnAt and os.clock() - npcPawnAt > 20 then npcPawnAt = nil; npcAt = os.clock(); npcCensus("20 s after " .. tostring(mn) .. " appeared") end
+    if os.clock() - npcAt > 120 then npcAt = os.clock(); npcCensus("periodic") end
+end
+
 -- Memory control (2026-10-31): the guest floated without control in the host's memory. While CoopNative marks the memory window
 -- (CoopNative.guestmem = 1, written at his PlayMemoryResidue), every new character of ours (the memory teleport respawns him) gets
 -- the input unlock used after a respawn (temporary input masks, ignore-input flags, game-only input mode), and its state is logged
@@ -1207,8 +1370,8 @@ local memCtlPawn, memCtlAt, memCtlLog = nil, nil, -1000
 -- character does not run here: its tick is off (guest log 20:04: "other character ... tick +0x35 0"), so no animation, gravity or
 -- ground. For 90 s after the memory window opens, every player character whose tick is off gets its tick switched back on (actor,
 -- body mesh, movement component), the step the game's own character start would have done; each one is logged once.
-local memWinAt, floatFixed, floatCheckAt, floatZ = nil, {}, -1000, nil
-local function memoryFloatFix()
+memWinAt, floatFixed, floatCheckAt, floatZ = nil, {}, -1000, nil
+function memoryFloatFix()
     if not memWinAt or os.clock() - memWinAt > 90 or os.clock() - floatCheckAt < 1 then return end
     floatCheckAt = os.clock()
     for _, q in ipairs(FindAllOf("BP_Player_C") or {}) do
@@ -1487,6 +1650,44 @@ end
 -- area here: on a client a multicast called locally runs locally, so his game starts the same cutscene as the host.
 local OUTRO_PATH = WIN64 .. "\\plugins\\CoopNative.outro"
 do local f = io.open(OUTRO_PATH, "r"); if f then f:close(); os.remove(OUTRO_PATH) end end
+-- Boss door after the kill (2026-11-03, owner: on the guest the fog wall at the boss room entrance stayed after the boss died;
+-- in single player it is gone). When the guest's outro starts (the boss is dead), remember that boss area; from then on, for the
+-- rest of the game run, every boss wall (ABossWallBase: BlockWall +0x380 blocking volume, MistWall +0x388) within 120 m of that
+-- area is switched off every 3 s: mist off (SetStateMistWall false, OnDeactivate, DestructEffect, hidden) and the blocking
+-- volume without collision. His own logic switched walls back on before, hence the repetition.
+deadBossAreas, bossWallAt = {}, -1000
+function bossWallsOff()
+    if #deadBossAreas == 0 or os.clock() - bossWallAt < 1 then return end
+    bossWallAt = os.clock()
+    for _, w in ipairs(FindAllOf("BossWallBase") or {}) do
+        local wl = valid(w) and try(function() return w:K2_GetActorLocation() end)
+        local near = false
+        if wl then
+            for _, a in ipairs(deadBossAreas) do
+                local dx, dy, dz = wl.X - a.X, wl.Y - a.Y, wl.Z - a.Z
+                if dx * dx + dy * dy + dz * dz < 12000 * 12000 then near = true end
+            end
+        end
+        if near then
+            local mist = try(function() return w.MistWall end)
+            local block = try(function() return w.BlockWall end)
+            local changed = false
+            if valid(mist) and (try(function() return mist.bProcessEnable end) ~= false or not try(function() return mist.bHidden end)) then
+                pcall(function() mist:SetActorTickEnabled(true) end)
+                pcall(function() mist:SetStateMistWall(false, true) end)
+                pcall(function() mist:OnDeactivate(true) end)
+                pcall(function() mist:DestructEffect() end)
+                pcall(function() mist:SetActorHiddenInGame(true) end)
+                changed = true
+            end
+            if valid(block) and try(function() return block:GetActorEnableCollision() end) ~= false then
+                pcall(function() block:SetActorEnableCollision(false) end)
+                changed = true
+            end
+            if changed then log("boss door: " .. name(w) .. " off (mist " .. (valid(mist) and name(mist) or "-") .. ", block " .. (valid(block) and name(block) or "-") .. ")") end
+        end
+    end
+end
 local function guestOutro()
     local f = io.open(OUTRO_PATH, "r"); if not f then return end
     local t = f:read("*a") or ""; f:close(); os.remove(OUTRO_PATH)
@@ -1497,21 +1698,188 @@ local function guestOutro()
     for _, a in ipairs(FindAllOf("BossAreaBase") or {}) do
         if valid(a) and try(function() return a:GetAddress() end) == want then
             local ok, e = pcall(function() a:MulticastExecuteFlowDiagramWithCallback(3) end)
+            local al = try(function() return a:K2_GetActorLocation() end)
+            if al then deadBossAreas[#deadBossAreas + 1] = { X = al.X, Y = al.Y, Z = al.Z }; log("boss door: " .. name(a) .. " is done, its walls go off") end
             log("guest outro: " .. name(a) .. ":MulticastExecuteFlowDiagramWithCallback(FinishEvent) -> " .. (ok and "called" or ("ERROR " .. tostring(e):sub(1, 140))))
             return
         end
     end
     log("guest outro: boss area 0x" .. t .. " not found")
 end
+-- Test start position (owner, 2026-11-03): walking to the boss took long. test_mark=X,Y,Z in CoopNative.ini; with
+-- test_mark_autotp=1 our character is moved there once per game run, 8 s after it first appears; "tp" in CoopProbe.cmd any time.
+-- Blood code sync (2026-11-03, owner: after the boss the guest saw the "blood code acquired" message, but the code was not in
+-- his list; the Get_<X>BC flag alone does not unlock it). The host watches its own acquired blood codes
+-- (CharacterHelper:GetAcquiredBloodCodeList) and sends every new one by asset path (ClientMessage "CoopBC:<path>"); the guest
+-- loads that asset and calls CharacterHelper:AcquireBloodCode(his character, article, forced, no indication).
+bcKnown, bcAt, bcIn = nil, -1000, {}
+-- entries may come wrapped (RemoteUnrealParam): unwrap with :get()
+local function bcObj(v)
+    if valid(v) then return v end
+    local g = try(function() return v:get() end)
+    if valid(g) then return g end
+    return nil
+end
+local function bcPath(a)
+    local full = try(function() return a:GetFullName() end)
+    return full and full:match("^%S+%s+(.+)$") or full
+end
+function bloodCodeSyncHost()
+    if os.clock() - bcAt < 2 then return end
+    bcAt = os.clock()
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not valid(gs) or try(function() return gs.Role end) ~= 3 then return end
+    local pc = localPC()
+    local mine = valid(pc) and try(function() return pc.Pawn end) or nil
+    if not valid(mine) then return end
+    local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+    local ok, list = pcall(function() return helper:GetAcquiredBloodCodeList(mine) end)
+    local now = {}
+    -- (2026-11-03: nothing was logged; the result may be a Lua table or a TArray object, and the call may need an out table)
+    if ok and type(list) == "table" then
+        for _, v in pairs(list) do local a = bcObj(v); local pth = a and bcPath(a); if pth then now[pth] = true end end
+    elseif ok and list then
+        pcall(function() list:ForEach(function(_, e) local a = e:get(); local pth = valid(a) and bcPath(a); if pth then now[pth] = true end end) end)
+    end
+    if next(now) == nil then
+        local out = {}
+        pcall(function() helper:GetAcquiredBloodCodeList(mine, out) end)
+        local arr = out.ReturnValue or out[1]
+        if type(arr) == "table" then for _, a in pairs(arr) do local pth = valid(a) and bcPath(a); if pth then now[pth] = true end end
+        elseif arr then pcall(function() arr:ForEach(function(_, e) local a = e:get(); local pth = valid(a) and bcPath(a); if pth then now[pth] = true end end) end) end
+    end
+    if next(now) == nil then
+        if not bcWarned then
+            bcWarned = true
+            local n, first = 0, nil
+            if type(list) == "table" then for k, v in pairs(list) do n = n + 1; if not first then first = tostring(k) .. ":" .. type(v) .. ":" .. tostring(v) end end end
+            log("blood code sync: list unreadable (call ok=" .. tostring(ok) .. ", type " .. type(list) .. ", " .. n .. " entries, first " .. tostring(first) .. ")")
+        end
+        return
+    end
+    if not bcKnown then
+        local n = 0
+        for _ in pairs(now) do n = n + 1 end
+        bcKnown = now
+        log("blood code sync: " .. n .. " codes known at the start")
+        return
+    end
+    for pth in pairs(now) do
+        if not bcKnown[pth] then
+            bcKnown[pth] = true
+            for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+                if valid(c) and not try(function() return c:IsLocalController() end) then
+                    pcall(function() c:ClientMessage("CoopBC:" .. pth, FName("None"), 0) end)
+                end
+            end
+            log("blood code sync: new blood code " .. pth .. " -> sent to the guests")
+        end
+    end
+end
+pcall(function()
+    RegisterHook("/Script/Engine.PlayerController:ClientMessage", function(ctx, s)
+        local text = try(function() return s:get():ToString() end)
+        if text and text:find("^CoopBC:") then bcIn[#bcIn + 1] = text:sub(8) end
+    end)
+end)
+function bloodCodeSyncGuest()
+    if #bcIn == 0 then return end
+    local pc = localPC()
+    local mine = valid(pc) and try(function() return pc.Pawn end) or nil
+    if not valid(mine) then return end
+    -- (2026-11-03: unlocked during the host's final cutscene, the game showed no message) -> wait only while we cannot move;
+    -- otherwise unlock at once, so the message comes at the host's moment like in vanilla (the 2 s wait felt late, owner)
+    if try(function() return pc:IsMoveInputIgnored() end) ~= false then return end
+    local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+    for _, pth in ipairs(bcIn) do
+        local a = StaticFindObject(pth)
+        if not valid(a) then pcall(function() a = LoadAsset(pth) end) end
+        local had = valid(a) and try(function() return helper:IsAcquiredBloodCode(mine, a) end)
+        local ok = valid(a) and not had and pcall(function() helper:AcquireBloodCode(mine, a, true, false) end)   -- with the game's message (owner 2026-11-03)
+        log("blood code sync: " .. pth .. (not valid(a) and " NOT FOUND" or (had and " already acquired" or (" acquired " .. tostring(ok)))))
+    end
+    bcIn = {}
+end
+-- Co-op version on the title screen (owner 2026-11-03: to see that both PCs run the same kit). The game's own version text
+-- block on the title gets " / co-op <kit>" appended (plugins\\CoopKitVersion.txt). Checked every 2 s while no world is
+-- loaded; the first time, the title's text blocks are logged once (to find the right one if the match fails).
+titleVerAt, titleVerLogged = -1000, false
+function titleVersion()
+    if os.clock() - titleVerAt < 2 then return end
+    titleVerAt = os.clock()
+    local gs = FindFirstOf("BP_AppGameState_C")
+    local pc = localPC()
+    if valid(pc) and valid(try(function() return pc.Pawn end)) and name(pc.Pawn):find("BP_Player_C", 1, true) then return end
+    local vf = io.open(WIN64 .. "\\plugins\\CoopKitVersion.txt", "r")
+    local ver = vf and (vf:read("*l") or ""):gsub("CodeVein%-guest%-update%-", ""):gsub("%.zip", ""):gsub("%s", "") or "?"
+    if vf then vf:close() end
+    local seen = {}
+    for _, tb in ipairs(FindAllOf("TextBlock") or {}) do
+        local txt = valid(tb) and try(function() return tb:GetText():ToString() end)
+        if txt then
+            if not titleVerLogged and #seen < 25 and txt ~= "" then seen[#seen + 1] = name(tb) .. "=" .. txt:sub(1, 30) end
+            if not txt:find("co-op", 1, true) and (txt:find("^[Vv][Ee][Rr]") or txt:find("1%.53")) then
+                local ok = pcall(function() tb:SetText(FText(txt .. "  /  co-op " .. ver)) end)
+                log("title version: '" .. txt .. "' -> co-op " .. ver .. " " .. tostring(ok))
+            end
+        end
+    end
+    if not titleVerLogged and #seen > 0 then titleVerLogged = true; log("title version: text blocks: " .. table.concat(seen, " | "):sub(1, 900)) end
+end
+function teleportToMark(why)
+    local v = iniValue("test_mark")
+    if not v then log("tp: no test_mark in CoopNative.ini"); return end
+    -- (2026-11-03: "v and v:match(...)" kept only the first capture -> y/z nil -> the log line failed inside pcall, silently)
+    local x, y, z = v:match("(%-?[%d.]+),(%-?[%d.]+),(%-?[%d.]+)")
+    if not z then log("tp: test_mark unreadable: " .. tostring(v)); return end
+    local pc = localPC()
+    local mine = valid(pc) and try(function() return pc.Pawn end) or nil
+    if not valid(mine) then log("tp: no character"); return end
+    local rot = try(function() return mine:K2_GetActorRotation() end) or { Pitch = 0, Yaw = 0, Roll = 0 }
+    local ok = pcall(function() mine:K2_TeleportTo({ X = tonumber(x), Y = tonumber(y), Z = tonumber(z) + 50 }, rot) end)
+    log("tp (" .. why .. "): " .. name(mine) .. " -> " .. x .. "," .. y .. "," .. z .. " " .. tostring(ok))
+end
+autoTpDone, autoTpSeen = false, nil
+function autoTeleportToMark()
+    if autoTpDone or not iniHas("test_mark_autotp=1") then return end
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not valid(gs) or try(function() return gs.Role end) ~= 3 then return end
+    local pc = localPC()
+    local mine = valid(pc) and try(function() return pc.Pawn end) or nil
+    if not (valid(mine) and name(mine):find("BP_Player_C", 1, true)) then return end
+    autoTpSeen = autoTpSeen or os.clock()
+    if os.clock() - autoTpSeen < 8 then return end
+    autoTpDone = true
+    local okt, et = pcall(teleportToMark, "save loaded")
+    if not okt then log("tp ERROR " .. tostring(et):sub(1, 160)) end
+end
+-- 2026-11-03: UE4SS crashed inside its object hash tables (+0xC77xxx) on the title screen and while loading, more often since
+-- the per-second object searches grew. The world-only checks in probeCommands run only while our own player character exists.
+local function inWorldNow()
+    local pc = localPC()
+    local p = valid(pc) and try(function() return pc.Pawn end) or nil
+    return valid(p) and name(p):find("BP_Player_C", 1, true) ~= nil
+end
 local function probeCommands()
+    local world = inWorldNow()
     pcall(guestOutro)
     pcall(writeMyPawn)
-    pcall(guestMemorySpectate)
+    if world then pcall(guestMemorySpectate) end
+    if world then pcall(npcCensusTick) end
+    if world then pcall(visMirrorHost) end
+    if world then pcall(visMirrorGuest) end
+    if world then pcall(bossWallsOff) end
+    pcall(autoTeleportToMark)
+    -- (2026-11-03: the guest crashed twice inside UE4SS on the title screen with this on: walking every TextBlock while the
+    --  menu builds them is the FindAllOf crash pattern again -> off until it is rebuilt without FindAllOf)
+    -- pcall(titleVersion)
+    if world then pcall(bloodCodeSyncHost) end
+    if world then pcall(bloodCodeSyncGuest) end
     pcall(guestMemoryControl)
     pcall(guestTeleportFade)
-    pcall(memoryFollow)
-    pcall(memoryBaseLog)
-    pcall(veilWatch)
+    if world then pcall(memoryFollow) end
+    if world then pcall(memoryBaseLog) end
+    if world then pcall(veilWatch) end
     local okr, er = pcall(sceneRelay)
     if not okr and not relayErr then relayErr = true; log("scene relay ERROR " .. tostring(er):sub(1, 160)) end
     guestLevelWatch()
@@ -1555,6 +1923,15 @@ local function probeCommands()
         local ok, e = pcall(function() helper:RequestPlayerSpawn(old, pc, at, r, r, true, skip) end)
         log(c .. ": RequestPlayerSpawn(host controller, skipAppear " .. tostring(skip) .. ") at " .. string.format("%.0f %.0f %.0f", at.X, at.Y, at.Z) .. " -> " ..
             (ok and "called" or ("ERROR " .. tostring(e):sub(1, 140))) .. "; old pawn " .. name(old))
+    elseif c:find("^fname") then
+        -- resolve FName indexes for the native CGP trace: "fname 123 456 ..."
+        local out = {}
+        for n in c:gmatch("(%d+)") do out[#out + 1] = n .. "=" .. tostring(try(function() return FName(tonumber(n)):ToString() end)) end
+        log("fname: " .. table.concat(out, " "))
+    elseif c == "tp" then
+        -- 2026-11-03 (owner): the test start position near the boss, test_mark=X,Y,Z in CoopNative.ini (host test copy)
+        local okt, et = pcall(teleportToMark, "command")
+        if not okt then log("tp ERROR " .. tostring(et):sub(1, 160)) end
     elseif c == "bosshp1" then
         local gs = FindFirstOf("BP_AppGameState_C")
         if not valid(gs) or try(function() return gs.Role end) ~= 3 then log("bosshp1: host only"); return end

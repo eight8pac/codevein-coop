@@ -135,6 +135,19 @@ and his own skips are ignored in co-op. After the memory he is brought to the ho
 post-boss ending branch (story progress, see CoopProgress), and the lock-counter resets could underflow (counters are now kept
 from going below 0; a crash with "BitArrayIndex" in Actor.cpp was the symptom).
 
+Story and world sync with a guest (two-PC tests 2026-11-03): CoopProgress (by Rikka230) moves the guest's story position to the
+host's; on top of that the host sends every story flag that turns true and, when a guest joins, its whole flag state (BoolMap
+and ValMap; item and weapon pickups stay per player), all through the game's own co-op symbol sync. The guest sets the boss's
+success flag at the kill, so his post-memory ending matches the host's. The host mirrors the story visibility of scenario and
+side-quest NPCs and the state of mist walls by name (`ClientMessage`), the guest's boss door is removed after the kill, and new
+blood codes the host gets are unlocked for the guest (`AcquireBloodCode`, with the game's message). A lock-counter underflow
+that crashed the engine ("BitArrayIndex", Actor.cpp) is prevented where the failing check sits. Still open: the guest's
+`CheckGameProgress` answers differently from his synced flags (being traced), cutscene polish, chests/items, NPC interaction.
+
+LAN helpers (`tools/lan`): an optional Windows share on the host (`setup-coopdrop.ps1`, one local user, private networks only) that
+receives the guest's log zips (made automatically when his game ends, also after a crash) and offers new guest kits;
+`Start Code Vein Co-op.cmd` installs a newer kit from that share before starting the game through Steam.
+
 In progress: vestige restoration (the entry checks in the restoration code are answered "not multiplayer"; to test), the
 guest's rest resetting enemies, the memory for the guest (plan: he leaves for the memory, plays it solo with control in his own
 world, and rejoins), Home Base mode for the guest (`CharacterHelper.SetRestrictedActionInBaseInfo`), 3+ players, a teleport vote.
