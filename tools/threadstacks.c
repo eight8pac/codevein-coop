@@ -6,10 +6,13 @@
 #include <stdio.h>
 #include <stdint.h>
 
+// optional: threadstacks <pid> <out|-> <lo hex> <hi hex> also prints values inside [lo, hi) as M+offset (e.g. a mod DLL)
+static uint64_t g_lo, g_hi;
 int main(int argc, char **argv) {
+    if (argc >= 5) { g_lo = strtoull(argv[3], NULL, 16); g_hi = strtoull(argv[4], NULL, 16); }
     if (argc < 2) { fprintf(stderr, "usage: threadstacks <pid> [out.txt]\n"); return 2; }
     DWORD pid = (DWORD)strtoul(argv[1], NULL, 10);
-    FILE *out = argc > 2 ? fopen(argv[2], "w") : stdout;
+    FILE *out = (argc > 2 && strcmp(argv[2], "-") != 0) ? fopen(argv[2], "w") : stdout;
     if (!out) return 3;
     HANDLE proc = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
     if (!proc) { fprintf(stderr, "OpenProcess failed %lu\n", GetLastError()); return 4; }
@@ -32,9 +35,10 @@ int main(int argc, char **argv) {
         if (!ctx) continue;
         int n = 0;
         char line[2048]; int len = snprintf(line, sizeof line, "tid %lu RIP %llX:", te.th32ThreadID, (unsigned long long)c.Rip);
-        for (size_t i = 0; i < got / 8 && n < 40; i++) {
+        for (size_t i = 0; i < got / 8 && n < 200; i++) {
             uint64_t v = buf[i];
             if (v >= 0x140001000ULL && v < 0x152000000ULL) { len += snprintf(line + len, sizeof line - len, " %llX", (unsigned long long)v); n++; }
+            else if (g_lo && v >= g_lo && v < g_hi) { len += snprintf(line + len, sizeof line - len, " M+%llX", (unsigned long long)(v - g_lo)); n++; }
         }
         int rip_in_exe = c.Rip >= 0x140001000ULL && c.Rip < 0x152000000ULL;
         if (n >= 4 || rip_in_exe) { fprintf(out, "%s\n", line); shown++; }

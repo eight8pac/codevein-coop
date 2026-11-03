@@ -212,6 +212,66 @@ local function moveProgress(symbol)
     journal("GUEST", string.format("progress %d -> %s (%d) %s", pos, symbol, target, ok and "ok" or ("FAILED " .. tostring(err):sub(1, 100))))
 end
 
+-- Story flags outside the main line (2026-11-03, two-PC test): after the host's boss kill and final cutscene, flags such as
+-- Boss_St09_Suc (boss done: fog wall, NPCs), <map>.BP_CheckPoint_Boss (Mistle), Get_BreathBC (blood code) and
+-- St09_Scenario1_FirstTime flipped on the host only; the position channel moves the main line alone. The host also publishes
+-- every BoolMap flag that turns true (except IAF_* item pickups, which stay per player) with the marker "CoopProgress.flag";
+-- the guest sets it with SetGameProgress(flag, ctx, true), only false -> true, after the same save backup.
+local lastFlags, flagErr = nil, false
+local fullApplied, reloadAt = 0, nil
+local FLAG_MARKER = "CoopProgress.flag"
+local function setFlag(flag)
+    local cur = lastFlags and lastFlags["BoolMap:" .. flag]
+    if cur == "true" then journal("GUEST", "flag " .. flag .. " already true"); return end
+    if not ensureBackup() then return end
+    local ctx = localPawn() or FindFirstOf("BP_AppGameState_C")
+    local ok, err = pcall(function() saveManager():SetGameProgress(flag, ctx, true) end)
+    journal("GUEST", "flag " .. flag .. " -> true " .. (ok and "ok" or ("FAILED " .. tostring(err):sub(1, 100))))
+    if ok then reloadAt = os.time() + 3 end
+end
+
+-- Full flag sync (2026-11-03, two-PC test: the flips during the session arrived, but older differences between the two saves
+-- and the ValMap numbers were never synced; NPCs and the fog wall stayed). When a guest joins, the host sends its whole flag
+-- state in batches of FULL_BATCH entries with the marker "CoopProgress.full": "B:<flag>" for every true BoolMap flag (no IAF_*
+-- item pickups) and "V:<name>=<n>" for every non-zero ValMap value. The guest applies only what is ahead of his own state
+-- (false -> true, a smaller number -> the host's), after the same save backup, then asks AScenarioProgressLoader to reload
+-- the story-dependent world (ReloadProgress), so objects that read the flags when they were loaded can catch up.
+local FULL_MARKER, FULL_BATCH = "CoopProgress.full", 40
+local function applyFull(entries)
+    local n = 0
+    local ctx = localPawn() or FindFirstOf("BP_AppGameState_C")
+    for _, e in ipairs(entries) do
+        local b = e:match("^B:(.+)$")
+        local vname, vval = e:match("^V:(.+)=(%-?%d+)$")
+        if b and not b:find("^IAF_") and not b:find("^WAF_") and (not lastFlags or lastFlags["BoolMap:" .. b] ~= "true") then
+            if not ensureBackup() then return end
+            if pcall(function() saveManager():SetGameProgress(b, ctx, true) end) then n = n + 1 end
+        elseif vname then
+            local cur = tonumber(lastFlags and lastFlags["ValMap:" .. vname] or "0") or 0
+            local want = tonumber(vval) or 0
+            if want > cur then
+                if not ensureBackup() then return end
+                if pcall(function() saveManager():SetGameProgressInt(vname, ctx, want) end) then n = n + 1 end
+            end
+        end
+    end
+    fullApplied = fullApplied + n
+    if n > 0 then
+        journal("GUEST", "full sync batch: " .. n .. " of " .. #entries .. " entries applied (" .. fullApplied .. " so far)")
+        reloadAt = os.time() + 3   -- after the last batch: reload the story-dependent world once
+    end
+end
+local function reloadWorldProgress()
+    if not reloadAt or os.time() < reloadAt then return end
+    reloadAt = nil
+    local loaders = FindAllOf("ScenarioProgressLoader") or {}
+    local done = 0
+    for _, l in ipairs(loaders) do
+        if valid(l) and pcall(function() l:ReloadProgress() end) then done = done + 1 end
+    end
+    journal("GUEST", "world progress reload: " .. done .. " of " .. #loaders .. " ScenarioProgressLoader(s); " .. fullApplied .. " entries applied in total")
+end
+
 -- Host -> guest story position, for progress outside boss kills. The host calls the game's own co-op symbol sync,
 -- ScenarioPlayerComponent:MulticastSetSyncedSymbols(symbols, results), on its character, with the marker below first and
 -- its position second. Solo test 2026-10-28: the call works from Lua, the hook reads both arrays, and it does not change
@@ -220,17 +280,68 @@ local MARKER = "CoopProgress.pos"
 local PUBLISH_S = 10
 local function hostPublishes() return cfg.host_publish == "1" and (role() == "host" or (role() == "solo" and cfg.solo_as_guest == "1")) end
 local lastPublished, lastPublishAt = nil, 0
+local flagQueue = {}
+local function publishFlags(comp)
+    while #flagQueue > 0 do
+        local f = flagQueue[1]
+        local ok, err = pcall(function() comp:MulticastSetSyncedSymbols({FLAG_MARKER, f}, {true, true}) end)
+        if not ok then journal("HOST", "flag publish FAILED " .. tostring(err):sub(1, 100)); return end
+        journal("HOST", "published flag " .. f)
+        table.remove(flagQueue, 1)
+    end
+end
+local fullQueue, guestCount = {}, 0
+local function queueFullState()
+    if not lastFlags then return false end
+    local entries = {}
+    for k, v in pairs(lastFlags) do
+        local b = k:match("^BoolMap:(.+)$")
+        local vn = k:match("^ValMap:(.+)$")
+        if b and v == "true" and not b:find("^IAF_") and not b:find("^WAF_") then entries[#entries + 1] = "B:" .. b
+        elseif vn and v ~= "0" and tonumber(v) then entries[#entries + 1] = "V:" .. vn .. "=" .. v end
+    end
+    table.sort(entries)
+    for i = 1, #entries, FULL_BATCH do
+        local batch = {FULL_MARKER}
+        for j = i, math.min(i + FULL_BATCH - 1, #entries) do batch[#batch + 1] = entries[j] end
+        fullQueue[#fullQueue + 1] = batch
+    end
+    journal("HOST", "full flag state queued for the guest: " .. #entries .. " entries in " .. #fullQueue .. " batch(es)")
+    return true
+end
+local function remoteControllers()
+    local n = 0
+    for _, pc in ipairs(FindAllOf("PlayerController") or {}) do
+        if valid(pc) and try(function() return pc:IsLocalPlayerController() end) == false then n = n + 1 end
+    end
+    return n
+end
+local function publishFull(comp)
+    -- a new guest -> send everything (once per join), one batch per publish tick
+    local n = remoteControllers()
+    if n > guestCount then
+        if queueFullState() then guestCount = n end
+    elseif n < guestCount then guestCount = n end
+    local batch = table.remove(fullQueue, 1)
+    if not batch then return end
+    local results = {}
+    for i = 1, #batch do results[i] = true end
+    local ok, err = pcall(function() comp:MulticastSetSyncedSymbols(batch, results) end)
+    if not ok then journal("HOST", "full sync batch FAILED " .. tostring(err):sub(1, 100)); table.insert(fullQueue, 1, batch) end
+end
 local function publishPosition()
     if not hostPublishes() then return end
     local pos = currentPosition()
     if not pos or pos == 0 then return end
-    if pos == lastPublished and os.time() - lastPublishAt < 60 then return end   -- resend every minute for late joiners
+    if pos == lastPublished and os.time() - lastPublishAt < 60 and #flagQueue == 0 and #fullQueue == 0 and remoteControllers() <= guestCount then return end   -- resend every minute for late joiners
     local p = localPawn()
     -- FindAllOf + GetOwner on every ScenarioPlayerComponent crashed UE4SS (null read at UE4SS.dll+0x2AED17) when a skip had just
     -- replaced characters: half-destroyed components are still listed (2026-11-03, host; same crash as codevein-coop's guest
     -- Mistle crashes). Take the component straight from our own character (BP_Player.ScenarioPlayer).
     local comp = valid(p) and try(function() return p.ScenarioPlayer end) or nil
     if not valid(comp) then return end
+    publishFlags(comp)
+    publishFull(comp)
     local ok, err = pcall(function() comp:MulticastSetSyncedSymbols({MARKER, line[pos].sym}, {true, true}) end)
     if ok then
         if pos ~= lastPublished then journal("HOST", "published position " .. pos .. " " .. line[pos].sym) end
@@ -252,6 +363,23 @@ hook("/Script/Extensions.BossAreaBase:MulticastGainRewards", function(ctx, ...)
         rewards(try(function() return area.BossAreaRewardsToGuest end), "ItemArticle", "ItemCount"),
         rewards(try(function() return area.CooperativePlayRewardToHost end), "RewardArticle", "Count"),
         rewards(try(function() return area.CooperativePlayRewardToGuest end), "RewardArticle", "Count")))
+    -- 2026-11-03 (Rikka, #1): the post-memory ending is chosen by the memory map's IsReturn: every ReturnFlags entry (the
+    -- Successor's broken vestiges, IAF_BloodCrystal_BrokenNormal_*) true -> Boss_StXX_Ret, else Boss_StXX_Suc. Log those flags
+    -- on both PCs at each boss phase, plus the _Ret/_Suc flags, to compare host and guest.
+    if lastFlags then
+        local broken, branch = {}, {}
+        for k, v in pairs(lastFlags) do
+            local n = k:match("^BoolMap:IAF_BloodCrystal_BrokenNormal_(%d+)$")
+            if n then broken[#broken + 1] = {tonumber(n), v} end
+            local b = k:match("^BoolMap:(Boss_St%d+_[RS][eu][tc])$")
+            if b and b:find(tostring(defeat), 1, true) == 1 then branch[#branch + 1] = b .. "=" .. v end
+        end
+        table.sort(broken, function(x, y) return x[1] < y[1] end)
+        local parts = {}
+        for _, e in ipairs(broken) do parts[#parts + 1] = e[1] .. "=" .. e[2] end
+        table.sort(branch)
+        journal("VESTIGES", defeat .. " broken vestiges: " .. table.concat(parts, " ") .. " | " .. table.concat(branch, " "))
+    end
     if not isGuestSide() or (cfg.guest_rewards ~= "1" and cfg.guest_progress ~= "1") then return end
     if last == false then journal("GUEST", defeat .. ": not the last phase, waiting"); return end
     if cfg.guest_rewards == "1" then
@@ -261,6 +389,13 @@ hook("/Script/Extensions.BossAreaBase:MulticastGainRewards", function(ctx, ...)
     if cfg.guest_progress == "1" then
         local ok, err = pcall(moveProgress, defeat)
         if not ok then journal("GUEST", "progress error: " .. tostring(err):sub(1, 120)) end
+        -- 2026-11-03: the host's <defeat>_Suc flips right before its final cutscene and reached the guest ~5 s later; when his
+        -- final cutscene started first, his game chose the other ending. Set it here, at the kill, if his flag store has it.
+        local suc = tostring(defeat) .. "_Suc"
+        if lastFlags and lastFlags["BoolMap:" .. suc] ~= nil then
+            local ok2, err2 = pcall(setFlag, suc)
+            if not ok2 then journal("GUEST", "early " .. suc .. " error: " .. tostring(err2):sub(1, 120)) end
+        end
     end
 end)
 
@@ -287,6 +422,24 @@ for _, fn in ipairs({"ScenarioPlayerComponent:MulticastSetSyncedSymbols", "Scena
             end
         end
         journal("SYNC", fn:match(":(.+)$") .. "(" .. table.concat(parts, "; ") .. ") on " .. name(try(function() return ctx:get() end)))
+        -- the host's full flag state, published by publishFull() on the host's PC (on his join)
+        if fn:find("MulticastSetSyncedSymbols", 1, true) and parts[1] and parts[1]:find("^%[" .. FULL_MARKER:gsub("%.", "%%.") .. ",")
+           and isGuestSide() and cfg.guest_progress == "1" then
+            local entries = {}
+            for e in parts[1]:sub(2, -2):gmatch("[^,]+") do entries[#entries + 1] = e end
+            table.remove(entries, 1)   -- the marker
+            local ok, err = pcall(applyFull, entries)
+            if not ok then journal("GUEST", "full sync error: " .. tostring(err):sub(1, 120)) end
+        end
+        -- a host flag, published by publishFlags() on the host's PC
+        if fn:find("MulticastSetSyncedSymbols", 1, true) and parts[1] and parts[1]:find("^%[" .. FLAG_MARKER:gsub("%.", "%%.") .. ",")
+           and isGuestSide() and cfg.guest_progress == "1" then
+            local fl = parts[1]:match("^%[[^,]+,([^%]]+)%]")
+            if fl then
+                local ok, err = pcall(setFlag, fl)
+                if not ok then journal("GUEST", "host flag error: " .. tostring(err):sub(1, 120)) end
+            end
+        end
         -- the host's position, published by publishPosition() on the host's PC
         if fn:find("MulticastSetSyncedSymbols", 1, true) and parts[1] and parts[1]:find("^%[" .. MARKER:gsub("%.", "%%.") .. ",")
            and isGuestSide() and cfg.guest_progress == "1" then
@@ -314,7 +467,6 @@ local function readFlags()
     end
     return flags
 end
-local lastFlags, flagErr = nil, false
 local function diffFlags()
     local now = readFlags()
     if not now then
@@ -345,6 +497,12 @@ local function diffFlags()
             journal("LOAD", #changes .. " flag changes at once: new baseline")
         else
             for _, c in ipairs(changes) do journal("FLAG", c) end
+            if hostPublishes() then
+                for k, v in pairs(now) do
+                    local fl = k:match("^BoolMap:(.+)$")
+                    if fl and v == "true" and lastFlags[k] == "false" and not fl:find("^IAF_") and not fl:find("^WAF_") then flagQueue[#flagQueue + 1] = fl end
+                end
+            end
         end
     else
         log("flag store read: " .. count .. " entries")
@@ -373,7 +531,10 @@ LoopAsync(DIFF_S * 1000, function()
         if not ok then log("flag diff error: " .. tostring(err):sub(1, 120)) end
         ok, err = pcall(position)
         if not ok then log("position error: " .. tostring(err):sub(1, 120)) end
-        if os.time() % PUBLISH_S < DIFF_S then
+        ok, err = pcall(reloadWorldProgress)
+        if not ok then log("reload error: " .. tostring(err):sub(1, 120)) end
+        -- while full-sync batches or flags are queued, publish every DIFF_S instead of every PUBLISH_S
+        if os.time() % PUBLISH_S < DIFF_S or #fullQueue > 0 or #flagQueue > 0 then
             ok, err = pcall(publishPosition)
             if not ok then log("publish error: " .. tostring(err):sub(1, 120)) end
         end
