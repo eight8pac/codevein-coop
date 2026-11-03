@@ -61,8 +61,10 @@ Everything goes into `<game dir>\CodeVein\Binaries\Win64`.
 4. Everyone in the group uses the **same matchmaking password**; the automatic search joins the first matching signal.
    Proposal, untested, all off in `mods/CoopSeamless/config.txt`: `sessiondiag=1` (log the search/join signatures and the
    names of the signals found), `lockhost=1` (a guest rejoins only the host he joined by hand), `remember=1` (role and
-   host kept in `state.txt` across a crash or restart), `versioncheck=1` (the host sends a fingerprint of the three Lua mods,
-   the guest logs any mismatch). `lockhost` needs a `sessiondiag` run first to confirm the signatures.
+   host kept in `state.txt` across a crash or restart; a `state.txt` written by another player, e.g. inside a kit zipped from
+   the host's folder, is ignored), `versioncheck=1` (the host sends his kit number from `plugins\CoopKitVersion.txt` and a
+   fingerprint of the three Lua mods, the guest logs what differs). `lockhost` needs a `sessiondiag` run first to confirm the
+   signatures. Guests still join through the distress signal; no Steam invite is used.
 
 Uninstall: remove the two mod folders, `winmm.dll` and `plugins\`.
 
