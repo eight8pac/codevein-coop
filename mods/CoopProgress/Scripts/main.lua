@@ -226,11 +226,11 @@ local function publishPosition()
     if not pos or pos == 0 then return end
     if pos == lastPublished and os.time() - lastPublishAt < 60 then return end   -- resend every minute for late joiners
     local p = localPawn()
-    local comp
-    for _, c in ipairs(FindAllOf("ScenarioPlayerComponent") or {}) do
-        if valid(c) and p and name(try(function() return c:GetOwner() end)) == name(p) then comp = c end
-    end
-    if not comp then return end
+    -- FindAllOf + GetOwner on every ScenarioPlayerComponent crashed UE4SS (null read at UE4SS.dll+0x2AED17) when a skip had just
+    -- replaced characters: half-destroyed components are still listed (2026-11-03, host; same crash as codevein-coop's guest
+    -- Mistle crashes). Take the component straight from our own character (BP_Player.ScenarioPlayer).
+    local comp = valid(p) and try(function() return p.ScenarioPlayer end) or nil
+    if not valid(comp) then return end
     local ok, err = pcall(function() comp:MulticastSetSyncedSymbols({MARKER, line[pos].sym}, {true, true}) end)
     if ok then
         if pos ~= lastPublished then journal("HOST", "published position " .. pos .. " " .. line[pos].sym) end
