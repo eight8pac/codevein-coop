@@ -1800,8 +1800,11 @@ function titleVersion()
     local tm = FindFirstOf("TitleMenuUIComponent")
     if not valid(tm) then titleSeenAt, titlePasses = nil, 0; return end
     titleSeenAt = titleSeenAt or os.clock()
-    if os.clock() - titleSeenAt < 5 or titlePasses >= 3 then return end
+    -- it did not show up in the first passes on 11-03, so it may be filled later: a pass every 10 s, 6 at most
+    if os.clock() - titleSeenAt < 5 or titlePasses >= 6 or os.clock() < (titleNextAt or 0) then return end
+    titleNextAt = os.clock() + 10
     titlePasses = titlePasses + 1
+    if titlePasses == 6 then log("title version: last pass, the version line was not found in any text block so far") end
     local vf = io.open(WIN64 .. "\\plugins\\CoopKitVersion.txt", "r")
     local ver = vf and (vf:read("*l") or ""):gsub("CodeVein%-guest%-update%-", ""):gsub("%.zip", ""):gsub("%s", "") or "?"
     if vf then vf:close() end
@@ -1809,17 +1812,20 @@ function titleVersion()
     for _, tb in ipairs(FindAllOf("TextBlock") or {}) do
         local txt = valid(tb) and try(function() return tb:GetText():ToString() end)
         if txt and txt ~= "" then
-            if not titleVerLogged and #seen < 40 then seen[#seen + 1] = name(tb) .. "=" .. txt:sub(1, 30) end
+            -- only what is really on screen (2026-11-04: the line changed so far was never seen on the title)
+            local vis = try(function() return tb:IsVisible() end)
+            if not titleVerLogged and vis == true and #seen < 60 then seen[#seen + 1] = name(tb) .. "=" .. txt:sub(1, 40) end
             if txt:find("co-op", 1, true) then titleDone = true
-            -- only the short "Version: ..." line (17:48 test: the version number also matched long update-note texts)
-            elseif #txt < 60 and txt:find("^[Vv][Ee][Rr]") then
+            -- the real line is "Game client ver. 1.53.93354" (owner 2026-11-04); "Version: First Blood" was another text
+            -- 19:15 test: no text block holds that line, so the version goes behind the copyright line the owner can see
+            elseif #txt < 60 and (txt:lower():find("ver%.%s*%d") or txt:find("BANDAI NAMCO", 1, true)) then
                 local ok = pcall(function() tb:SetText(FText(txt .. "  /  co-op " .. ver)) end)
-                log("title version: '" .. txt .. "' -> co-op " .. ver .. " " .. tostring(ok))
+                log("title version: '" .. txt .. "' -> co-op " .. ver .. " " .. tostring(ok) .. " visible=" .. tostring(vis) .. " " .. tostring(try(function() return tb:GetFullName() end)):sub(1, 160))
                 if ok then titleDone = true end
             end
         end
     end
-    if not titleVerLogged then titleVerLogged = true; log("title version: pass " .. titlePasses .. ", texts: " .. table.concat(seen, " | "):sub(1, 1500)) end
+    if not titleVerLogged then titleVerLogged = true; log("title version: pass " .. titlePasses .. ", texts: " .. table.concat(seen, " | "):sub(1, 3000)) end
 end
 function teleportToMark(why)
     local v = iniValue("test_mark")
@@ -1934,6 +1940,48 @@ local function probeCommands()
             local ok, e = pcall(function() helper:SetHealth(x, 1) end)
             log("bosshp1: " .. name(x) .. " -> 1 health " .. (ok and "ok" or ("ERROR " .. tostring(e):sub(1, 120))))
         end
+    elseif c == "chests" or c == "chestgive" or c == "chestgivew" then
+        -- R8 (2026-11-04): what chests really hold, and does UItemComponent:RPCClient_GainItem take it. chests = log only;
+        -- chestgive / chestgivew = give up to 3 item / non-item articles to our own character (test save only).
+        local mine = try(function() return localPC().Pawn end)
+        local comp = valid(mine) and try(function() return mine.Item end) or nil
+        local n, items, others = 0, {}, {}
+        for _, ch in ipairs(FindAllOf("BP_ItemBox_C") or {}) do
+            if valid(ch) then
+                n = n + 1
+                local parts = {}
+                local ok, e = pcall(function()
+                    ch.SpawnItemInfos:ForEach(function(_, x)
+                        local r = x:get()
+                        local art = try(function() return r.ItemArticle end)
+                        local cls = valid(art) and try(function() return name(art:GetClass()) end) or "?"
+                        local cnt = try(function() return r.ItemCount end) or 1
+                        parts[#parts + 1] = string.format("%s[%s] x%s drop=%s weight=%s grind=%s sym=%s", valid(art) and name(art) or "?", tostring(cls), tostring(cnt),
+                            tostring(try(function() return r.DropType end)), tostring(try(function() return r.Weight end)), tostring(try(function() return r.Grind end)),
+                            tostring(try(function() return r.DropProgressSymbol:ToString() end)))
+                        if valid(art) then
+                            local list = tostring(cls):find("Item", 1, true) and items or others
+                            list[#list + 1] = {art, cnt > 0 and cnt or 1}
+                        end
+                    end)
+                end)
+                log("chests: " .. name(ch) .. " state=" .. tostring(try(function() return ch.ChestState end)) .. " flag=" ..
+                    tostring(try(function() return ch.HoldStateFlagName:ToString() end)) .. " | " .. (ok and table.concat(parts, " ; ") or ("unreadable " .. tostring(e):sub(1, 100))))
+            end
+        end
+        log("chests: " .. n .. " chest(s), " .. #items .. " item article(s), " .. #others .. " other article(s), item component " .. tostring(valid(comp)))
+        if c ~= "chests" and valid(comp) then
+            local list = c == "chestgive" and items or others
+            for i = 1, math.min(3, #list) do
+                local ok, e = pcall(function() comp:RPCClient_GainItem(list[i][1], list[i][2]) end)
+                log("chests: give " .. name(list[i][1]) .. " x" .. tostring(list[i][2]) .. " -> " .. (ok and "called" or ("ERROR " .. tostring(e):sub(1, 120))))
+            end
+        end
+    elseif c == "deathvt" then
+        -- fall presentation: the address of our DeathComponent, to read its vtable (Multicast_MigrationToDeath_Implementation = slot +0x430)
+        local p = try(function() return localPC().Pawn end)
+        local d = valid(p) and try(function() return p.Death end) or nil
+        log(string.format("deathvt: pawn %X death %X", valid(p) and p:GetAddress() or 0, valid(d) and d:GetAddress() or 0))
     elseif c == "baseinfo" then
         -- Home Base mode research (item 1): the game's "restricted action in base" info (weapon visibility, attack, dash, menu, ...)
         -- per player, plus the field manager's IsInHideout and each player's anim instance bIsBaseMode
@@ -2024,7 +2072,18 @@ local function worldSettled()
     return os.clock() - wgGsAt > 5
 end
 
+-- 2026-11-04: with these mods polling during the load the first engine tick came after 80 s, without them after 22 s. Nothing here
+-- is needed before the first tick, so the loops wait for CoopNative's signal (or 120 s, should CoopNative be missing).
+local coopReadyFile = (debug.getinfo(1, "S").source:match("^@(.*)[/\\]ue4ss[/\\]Mods[/\\]") or ".") .. "\\plugins\\CoopNative.ticked"
+local coopReadyStart, coopReady = os.time(), false
+local function coopEngineReady()
+    if coopReady then return true end
+    local f = io.open(coopReadyFile, "r")
+    if f then f:close(); coopReady = true elseif os.time() - coopReadyStart > 120 then coopReady = true end
+    return coopReady
+end
 LoopAsync(200, function()
+    if not coopEngineReady() then return false end
     ExecuteInGameThread(function()
         local line = worldSettled() and (try(stateLine) or "state error") or last
         if line ~= last then log("STATE " .. line); last = line end
