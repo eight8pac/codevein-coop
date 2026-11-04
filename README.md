@@ -1,8 +1,11 @@
 # Code Vein seamless co-op (work in progress)
 
-Mods that keep a Code Vein (2019) co-op group together: automatic re-hosting and re-joining after the deaths and boss kills
-that end a vanilla session, co-op in areas whose boss is dead, and native experiments for resting at a Mistle in co-op and
-keeping a dead guest in the session to spectate. **Not a release**: tested by hand on two PCs only, one guest (vanilla cap).
+Mods that turn Code Vein (2019) co-op into one continuous session. The guest stays with the host through the deaths and boss
+kills that end a vanilla session: a dead guest spectates and comes back at the host's rest, the group teleports together, both
+play the boss, its outro and the memory, and the guest's story progress, world state and blood codes follow the host's. Co-op also
+works in areas whose boss is dead. Automatic re-hosting and re-joining remain as a fallback when a session does break.
+**Not a release**: tested by hand on two PCs only, one guest (vanilla cap). Cutscenes are still rough, and chests, ground items and
+NPC interaction for the guest are in progress (see Status).
 
 Findings, teardown table and QA live in the Co-op Anything write-up:
 <https://github.com/cranebeaker/coop-anything/tree/main/games/code-vein>
@@ -14,9 +17,9 @@ CoopNative's addresses are fixed for that build; it checks 16 bytes at every tar
 
 | Path | What | Needed on |
 |---|---|---|
-| `mods/CoopSeamless` | UE4SS Lua mod: re-host / re-join reconciler, co-op in beaten areas. Switches in `config.txt` | host and guests |
-| `mods/CoopProbe` | UE4SS Lua mod: state log every 0.2 s; tells CoopNative when a spectate window is open; spectate camera | everyone running CoopNative |
-| `native/coopnative.c` | C DLL (MinHook detours), loaded by Ultimate ASI Loader. Experiments, all **off** unless enabled | host and guests (for tests) |
+| `mods/CoopSeamless` | UE4SS Lua mod: session handling, re-host / re-join as a fallback, co-op in beaten areas. Switches in `config.txt` | host and guests |
+| `mods/CoopProbe` | UE4SS Lua mod: the co-op logic on top of CoopNative: group teleport, spectating, memory and cutscene relay, world and blood code sync, state log | everyone running CoopNative |
+| `native/coopnative.c` | C DLL (MinHook detours), loaded by Ultimate ASI Loader: keeps the session alive, game-thread work, traces. Most parts are switches in `CoopNative.ini` | host and guests (for tests) |
 | `mods/CoopProgress` | UE4SS Lua mod: logs boss rewards, progress flags and the story position; gives the guest the host's boss items and story progress, the host can publish its position (all **off** unless enabled in `config.txt`, save backed up first) | guests; host for publishing (logging: anyone) |
 | `tools/` | Read-only analysis: pak v4 reader, Kismet call/arg finders, exe scanners, headless Ghidra scripts | developers |
 
