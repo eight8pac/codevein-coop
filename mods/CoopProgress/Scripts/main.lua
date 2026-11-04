@@ -351,6 +351,25 @@ local function publishPosition()
     end
 end
 
+-- Host decides the ending (2026-11-04). The Successor bosses end in Boss_StXX_Ret when every ReturnFlags vestige is broken, else in
+-- Boss_StXX_Suc (memory map IsReturn; table by Rikka, #1). The host's game sets that flag in the step after the memory, which the
+-- guest's game never runs, and BP hooks do not register on this UE4SS build. So the host works the result out at the kill and
+-- sends the flag on the normal flag channel; the guest has it well before his final cutscene.
+local RETURN_FLAGS = {Boss_St07 = {10, 13, 14, 15, 16}, Boss_St09 = {19, 20, 22, 23},
+                      Boss_St11 = {25, 28, 29, 31, 32}, Boss_St12 = {34, 37, 38, 40, 41}}
+local function hostEnding(defeat)
+    local need = RETURN_FLAGS[defeat]
+    if not need then return end
+    if not lastFlags then journal("HOST", "ending " .. defeat .. ": flag store not read yet, nothing sent"); return end
+    local ret, missing = true, {}
+    for _, n in ipairs(need) do
+        if lastFlags["BoolMap:IAF_BloodCrystal_BrokenNormal_" .. n] ~= "true" then ret = false; missing[#missing + 1] = n end
+    end
+    local flag = defeat .. (ret and "_Ret" or "_Suc")
+    flagQueue[#flagQueue + 1] = flag
+    journal("HOST", "ending " .. defeat .. " decided at the kill: " .. flag .. " (missing vestiges: " .. (#missing > 0 and table.concat(missing, " ") or "none") .. ")")
+end
+
 -- Boss kill. Runs on host and guest in co-op, and in solo play (solo tests, 2026-10-28), once per boss phase.
 hook("/Script/Extensions.BossAreaBase:MulticastGainRewards", function(ctx, ...)
     local area = try(function() return ctx:get() end)
@@ -380,6 +399,10 @@ hook("/Script/Extensions.BossAreaBase:MulticastGainRewards", function(ctx, ...)
         table.sort(branch)
         journal("VESTIGES", defeat .. " broken vestiges: " .. table.concat(parts, " ") .. " | " .. table.concat(branch, " "))
     end
+    if hostPublishes() and last ~= false then
+        local ok, err = pcall(hostEnding, tostring(defeat))
+        if not ok then journal("HOST", "ending error: " .. tostring(err):sub(1, 120)) end
+    end
     if not isGuestSide() or (cfg.guest_rewards ~= "1" and cfg.guest_progress ~= "1") then return end
     if last == false then journal("GUEST", defeat .. ": not the last phase, waiting"); return end
     if cfg.guest_rewards == "1" then
@@ -391,8 +414,9 @@ hook("/Script/Extensions.BossAreaBase:MulticastGainRewards", function(ctx, ...)
         if not ok then journal("GUEST", "progress error: " .. tostring(err):sub(1, 120)) end
         -- 2026-11-03: the host's <defeat>_Suc flips right before its final cutscene and reached the guest ~5 s later; when his
         -- final cutscene started first, his game chose the other ending. Set it here, at the kill, if his flag store has it.
+        -- (the four Successor bosses: the host's decision arrives on the flag channel instead, see hostEnding)
         local suc = tostring(defeat) .. "_Suc"
-        if lastFlags and lastFlags["BoolMap:" .. suc] ~= nil then
+        if not RETURN_FLAGS[tostring(defeat)] and lastFlags and lastFlags["BoolMap:" .. suc] ~= nil then
             local ok2, err2 = pcall(setFlag, suc)
             if not ok2 then journal("GUEST", "early " .. suc .. " error: " .. tostring(err2):sub(1, 120)) end
         end
@@ -525,7 +549,18 @@ local function position()
     end
 end
 
+-- 2026-11-04: with these mods polling during the load the first engine tick came after 80 s, without them after 22 s. Nothing here
+-- is needed before the first tick, so the loops wait for CoopNative's signal (or 120 s, should CoopNative be missing).
+local coopReadyFile = (debug.getinfo(1, "S").source:match("^@(.*)[/\\]ue4ss[/\\]Mods[/\\]") or ".") .. "\\plugins\\CoopNative.ticked"
+local coopReadyStart, coopReady = os.time(), false
+local function coopEngineReady()
+    if coopReady then return true end
+    local f = io.open(coopReadyFile, "r")
+    if f then f:close(); coopReady = true elseif os.time() - coopReadyStart > 120 then coopReady = true end
+    return coopReady
+end
 LoopAsync(DIFF_S * 1000, function()
+    if not coopEngineReady() then return false end
     ExecuteInGameThread(function()
         local ok, err = pcall(diffFlags)
         if not ok then log("flag diff error: " .. tostring(err):sub(1, 120)) end

@@ -434,6 +434,8 @@ static uint64_t detour_assert_fatal(void *a, void *b, void *c, void *d, void *e,
         // return 0x145D8361B = "[0x14413C40C] > 0" (+0xB84 holders), return 0x145D78817 = "[0x14413C404] > 0" (start counter)
         if (ret == 0x145D8361BULL && *(volatile int *)0x14413C40CULL <= 0) *(volatile int *)0x14413C40CULL = 1;
         if (ret == 0x145D78817ULL && *(volatile int *)0x14413C404ULL <= 0) *(volatile int *)0x14413C404ULL = 1;
+        // return 0x145D83247 = AppCharacter.cpp:823 "NumInCharacterSetup > 0" on [0x14413C404] (2026-11-04: went negative -> clamp)
+        if (ret == 0x145D83247ULL && *(volatile int *)0x14413C404ULL <= 0) *(volatile int *)0x14413C404ULL = 1;
         LONG n = InterlockedIncrement(&g_assert_skips);
         if (n <= 50) logf_("appear lock: engine check in the lock code skipped (from 0x%llX, count %d, +0xB84 holders %d, %ld so far)",
                            (unsigned long long)ret, *(volatile int *)0x14413C404ULL, *(volatile int *)0x14413C40CULL, n);
@@ -752,11 +754,25 @@ typedef uint8_t (*checkprog_fn)(void *symbol, void *ctx);
 typedef void *(*ctxdata_fn)(void *ctx);
 static checkprog_fn g_orig_check_progress;
 static volatile LONG g_cgp_logs, g_cgp_boss_logs;
+// 2026-11-04: the trace stopped after 1500 calls, inside the memory, before the vestige checks that decide the ending. After the
+// kill every symbol is now logged only when its answer changes, so the whole 10 minutes fit (hash -> last answer + 1).
+static struct { uint32_t h; uint8_t v; } g_cgp_seen[4096];
+static int cgp_changed(const char *name, uint8_t r) {
+    uint32_t h = 2166136261u;
+    for (const char *p = name; *p; p++) h = (h ^ (uint8_t)*p) * 16777619u;
+    if (!h) h = 1;
+    for (uint32_t i = 0; i < 4096; i++) {
+        uint32_t k = (h + i) & 4095;
+        if (g_cgp_seen[k].h == 0) { g_cgp_seen[k].h = h; g_cgp_seen[k].v = (uint8_t)(r + 1); return 1; }
+        if (g_cgp_seen[k].h == h) { if (g_cgp_seen[k].v == r + 1) return 0; g_cgp_seen[k].v = (uint8_t)(r + 1); return 1; }
+    }
+    return 0;
+}
 static uint8_t detour_check_progress(void *symbol, void *ctx) {
     // the symbol is read BEFORE the call (2026-11-03: read afterwards it came out garbled; the impl consumes the FString)
     int boss = g_branch_kill_at && GetTickCount64() - g_branch_kill_at < 600000;
-    int want = InterlockedIncrement(&g_cgp_logs) <= 150 || (boss && InterlockedIncrement(&g_cgp_boss_logs) <= 1500);
-    if (!want) return g_orig_check_progress(symbol, ctx);
+    int first = InterlockedIncrement(&g_cgp_logs) <= 150;
+    if (!first && !boss) return g_orig_check_progress(symbol, ctx);
     char name[120] = "";
     uintptr_t e = (uintptr_t)symbol;
     if (e && readable(e, 16)) {
@@ -769,6 +785,7 @@ static uint8_t detour_check_progress(void *symbol, void *ctx) {
         }
     }
     uint8_t r = g_orig_check_progress(symbol, ctx);
+    if (!first && (!cgp_changed(name, r) || InterlockedIncrement(&g_cgp_boss_logs) > 4000)) return r;
     uintptr_t c = (uintptr_t)ctx, d = 0;
     int cc = -1, dc = -1, dn = -1;
     if (c && readable(c + 0x10, 0x10)) { uintptr_t cl = *(uintptr_t *)(c + 0x10); if (cl && readable(cl + 0x18, 4)) cc = *(int *)(cl + 0x18); }
@@ -789,7 +806,14 @@ static enginetick_fn g_orig_engine_tick;
 static volatile LONG64 g_engine_ticks;
 static void detour_engine_tick(void *self, float delta, uint8_t idle) {
     g_heartbeat = GetTickCount64(); g_game_tid = GetCurrentThreadId();
-    if (InterlockedIncrement64(&g_engine_ticks) == 1) logf_("game-thread pump: first GameEngine::Tick (thread %lu)", GetCurrentThreadId());
+    if (InterlockedIncrement64(&g_engine_ticks) == 1) {
+        logf_("game-thread pump: first GameEngine::Tick (thread %lu)", GetCurrentThreadId());
+        // 2026-11-04: first tick 22 s with the Lua mods off, 80 s with them on: their polling slows the load. They wait for this file.
+        char tp[MAX_PATH + 32];
+        snprintf(tp, sizeof tp, "%sCoopNative.ticked", g_dir);
+        FILE *tf = fopen(tp, "w");
+        if (tf) { fputs("1", tf); fclose(tf); }
+    }
     game_thread_work();
     g_orig_engine_tick(self, delta, idle);
 }
@@ -2571,6 +2595,16 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         snprintf(path, sizeof path, "%sCoopNative.log", g_dir);
         g_log = _fsopen(path, "w", _SH_DENYWR);
         logf_("CoopNative loaded (probes: GetRescueSignalState, SessionStateHandler; EndCooperativeMode veto and Mistle rest are off unless enabled)");
+        {   // the kit number in every log (2026-11-04: nothing showed which kit the guest really ran)
+            char kp[MAX_PATH + 32], kv[80] = "none";
+            snprintf(kp, sizeof kp, "%sCoopKitVersion.txt", g_dir);
+            FILE *kf = fopen(kp, "r");
+            if (kf) { if (!fgets(kv, sizeof kv, kf)) strcpy(kv, "empty"); fclose(kf); }
+            kv[strcspn(kv, "\r\n")] = 0;
+            logf_("kit: %s", kv);
+            snprintf(kp, sizeof kp, "%sCoopNative.ticked", g_dir);
+            DeleteFileA(kp);   // a leftover from the last run must not release the mods early
+        }
         HANDLE h = CreateThread(NULL, 0, worker, NULL, 0, NULL);
         if (h) CloseHandle(h);
     }
