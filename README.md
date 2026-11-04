@@ -59,12 +59,16 @@ Everything goes into `<game dir>\CodeVein\Binaries\Win64`.
    ```
    CoopNative writes `plugins\CoopNative.log` on every launch.
 4. Everyone in the group uses the **same matchmaking password**; the automatic search joins the first matching signal.
-   Proposal, untested, all off in `mods/CoopSeamless/config.txt`: `sessiondiag=1` (log the search/join signatures and the
-   names of the signals found), `lockhost=1` (a guest rejoins only the host he joined by hand), `remember=1` (role and
+   Proposal, all off in `mods/CoopSeamless/config.txt`: `sessiondiag=1` (log the search/join signatures and the info
+   string of each signal found), `lockhost=1` (a guest looks for the host he joined by hand among the signals; it logs the
+   match but does not join yet, see below), `remember=1` (role and
    host kept in `state.txt` across a crash or restart; a `state.txt` written by another player, e.g. inside a kit zipped from
    the host's folder, is ignored), `versioncheck=1` (the host sends his kit number from `plugins\CoopKitVersion.txt` and a
-   fingerprint of the three Lua mods, the guest logs what differs). `lockhost` needs a `sessiondiag` run first to confirm the
-   signatures. Guests still join through the distress signal; no Steam invite is used.
+   fingerprint of the three Lua mods, the guest logs what differs). Solo offline test (2026-11-04): the signatures are
+   logged; `remember` restores host mode from a `state.txt` with our own name and ignores one written by another player.
+   `GetOnlineSessionResult` returns a bool, not a session, so a found signal cannot be passed to `Event_JoinSession` from
+   Lua; `lockhost` waits for a `sessiondiag` search log showing what `GetFoundOnlineSessionInfo` holds. Guests still join
+   through the distress signal; no Steam invite is used.
 
 Uninstall: remove the two mod folders, `winmm.dll` and `plugins\`.
 
