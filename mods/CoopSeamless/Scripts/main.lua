@@ -7,9 +7,9 @@
 --   again after a disconnect (boss kill, death).
 -- Cancelling the signal or leaving through the menu turns auto mode off until you host or join again by hand.
 -- config.txt in the mod folder (read every second):  enabled=1  host=auto|always|off  guest=auto|always|off
--- Proposal 2026-11-03, all off by default (untested in game):
---   sessiondiag=1   log only: signatures of the search/join functions, and after any search the found signals with their names
---   lockhost=1      guest: rejoin only the host he joined by hand (search, pick that host's signal, join); no join if he is absent
+-- Proposal 2026-11-03, all off by default (solo offline test 2026-11-04: sessiondiag signatures and remember; the rest untested):
+--   sessiondiag=1   log only: signatures of the search/join functions, and after any search the info string of each found signal
+--   lockhost=1      guest: search and look for the host he joined by hand among the signals; logs the match, does not join yet
 --   remember=1      keep the role and the host's name in state.txt, so auto mode is back after a crash or a restart
 --   versioncheck=1  host sends his kit number (plugins\CoopKitVersion.txt) and a fingerprint of CoopSeamless/CoopProbe/
 --                   CoopProgress to a guest who joins; the guest logs what differs
@@ -153,11 +153,14 @@ local function callWithCaller(what, f)
     log(what .. (ok and " sent" or (" FAILED " .. tostring(err))))
 end
 
--- Search/join by host (proposal 2026-11-03). From the paks and the exe (not run yet): App_GameInstance has Event_SearchLobby
--- (MaxResult) and Event_JoinSession(SearchResult) next to Event_FindAndJoinSession; UAppOnlineWrapperIF has
--- GetFoundOnlineSessionsCount, GetOnlineSessionResult, GetFoundOnlineSessionInfo; the engine's
--- FindSessionsCallbackProxy:GetServerName(BlueprintSessionResult) gives the owner's name (Steam OSS). Parameter names and
--- order are read from the UFunctions at run time, nothing is assumed: an unknown parameter stops the call.
+-- Search/join by host (proposal 2026-11-03). App_GameInstance has Event_SearchLobby(MaxResult, UseLAN, Caller) and
+-- Event_JoinSession(SearchResult: BlueprintSessionResult, Caller) next to Event_FindAndJoinSession. The game's session manager
+-- (AppSessionManager_0, an AppOnlineWrapper) has GetFoundOnlineSessionsCount() -> int, GetFoundOnlineSessionInfo(index) ->
+-- string and JoinOnlineSessionLatent(WorldContextObject, LatentInfo, index, ConnectOption). GetOnlineSessionResult() returns a
+-- bool, not a session (sessiondiag, solo offline test 2026-11-04), so no BlueprintSessionResult can be read from Lua and
+-- Event_JoinSession cannot be called with a found signal: lockhost finds the host's signal by its info string and logs it, but
+-- does not join yet. What the info string holds (owner name or not) is unknown until a search with a real signal is logged.
+-- Parameter names and order are read from the UFunctions at run time: an unknown parameter stops the call.
 -- Guests join through the distress signal only: ShowInviteUI (Steam invite) is listed by sessiondiag, never called.
 -- Next to CoopProbe (polls IsOnlineMultiplay / GetRescueSignalState every second) and CoopNative (answers some session checks
 -- on the guest): the search below only runs while the guest is out of any session, the same moment as the vanilla retry.
@@ -204,23 +207,20 @@ local function logSignatures()
     log("diag: FindSessionsCallbackProxy:GetServerName(" .. (n and table.concat(n, ", ") or "NOT FOUND") .. ")")
 end
 
--- the found signals after a search: { {result = <BlueprintSessionResult>, name = <owner name or nil>}, ... } or nil + reason
+-- the found signals after a search: { {index = i, info = <GetFoundOnlineSessionInfo string>}, ... } or nil + reason
 local SEARCH_VALUES_BASE = {Caller = "nil", JoinSessionCaller = "nil", SearchLobbyCaller = "nil", MaxResult = 50, UseLAN = false, bUseLAN = false}
 local function foundSessions(s)
     local cPath, cNames = findFn("GetFoundOnlineSessionsCount")
-    local rPath, rNames = findFn("GetOnlineSessionResult")
-    if not (cPath and rPath) then return nil, "count/result functions not found" end
-    local ctx = {WorldContextObject = s.gs}
-    local ok, count = callByNames(s.sm, "GetFoundOnlineSessionsCount", cNames, ctx)
+    local iPath, iNames = findFn("GetFoundOnlineSessionInfo")
+    if not (cPath and iPath) then return nil, "count/info functions not found" end
+    local ok, count = callByNames(s.sm, "GetFoundOnlineSessionsCount", cNames, {WorldContextObject = s.gs})
     if not ok or type(count) ~= "number" then return nil, "count: " .. tostring(count) end
-    local proxy = StaticFindObject("/Script/OnlineSubsystemUtils.Default__FindSessionsCallbackProxy")
     local list = {}
     for i = 0, count - 1 do
-        local vals = {WorldContextObject = s.gs, InSearchResultsIndex = i, Index = i}
-        local okR, res = callByNames(s.sm, "GetOnlineSessionResult", rNames, vals)
-        if not okR then return nil, "result " .. i .. ": " .. tostring(res) end
-        local name = valid(proxy) and try(function() return proxy:GetServerName(res):ToString() end) or nil
-        list[#list + 1] = {result = res, name = name}
+        local okI, info = callByNames(s.sm, "GetFoundOnlineSessionInfo", iNames, {WorldContextObject = s.gs, InSearchResultsIndex = i})
+        if not okI then return nil, "info " .. i .. ": " .. tostring(info) end
+        info = type(info) == "string" and info or try(function() return info:ToString() end)
+        list[#list + 1] = {index = i, info = info}
     end
     return list
 end
@@ -238,20 +238,15 @@ local function pickHost(s)
     pickPending = false
     local list, why = foundSessions(s)
     if not list then log("lockhost: cannot read the results (" .. tostring(why) .. ") -> no join"); return end
-    local names = {}
+    local infos = {}
     for _, e in ipairs(list) do
-        names[#names + 1] = tostring(e.name)
-        if e.name and e.name == lockedHost then
-            local n = paramNames(GI_PATH .. "Event_JoinSession")
-            local vals = {}
-            for k, v in pairs(SEARCH_VALUES_BASE) do vals[k] = v end
-            vals.SearchResult = e.result
-            local ok, err = n and callByNames(s.gi, "Event_JoinSession", n, vals)
-            log("lockhost: joining " .. lockedHost .. ((n and ok) and "" or (" FAILED " .. tostring(n and err or "Event_JoinSession not found"))))
+        infos[#infos + 1] = tostring(e.info)
+        if e.info and e.info:find(lockedHost, 1, true) then
+            log("lockhost: " .. lockedHost .. " found at index " .. e.index .. " (" .. e.info .. "); joining by index is not written yet -> no join")
             return
         end
     end
-    log("lockhost: " .. lockedHost .. " is not among " .. #list .. " signal(s) [" .. table.concat(names, ", ") .. "] -> waiting")
+    log("lockhost: " .. lockedHost .. " is not among " .. #list .. " signal(s) [" .. table.concat(infos, " | ") .. "] -> waiting")
 end
 
 -- versioncheck: the kit number (plugins\CoopKitVersion.txt, read the way CoopProbe shows it on the title screen) and FNV-1a of
@@ -336,9 +331,9 @@ local function tick()
     if wasSearching and not s.searching and cfg.sessiondiag == "1" then
         local list, why = foundSessions(s)
         if list then
-            local names = {}
-            for _, e in ipairs(list) do names[#names + 1] = tostring(e.name) end
-            log("diag: search over, " .. #list .. " signal(s): [" .. table.concat(names, ", ") .. "]")
+            local infos = {}
+            for _, e in ipairs(list) do infos[#infos + 1] = e.index .. ": " .. tostring(e.info) end
+            log("diag: search over, " .. #list .. " signal(s): [" .. table.concat(infos, " | ") .. "]")
         else
             log("diag: search over, results not readable (" .. tostring(why) .. ")")
         end
