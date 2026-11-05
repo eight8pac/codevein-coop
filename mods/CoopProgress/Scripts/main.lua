@@ -360,14 +360,23 @@ local RETURN_FLAGS = {Boss_St07 = {10, 13, 14, 15, 16}, Boss_St09 = {19, 20, 22,
 local function hostEnding(defeat)
     local need = RETURN_FLAGS[defeat]
     if not need then return end
-    if not lastFlags then journal("HOST", "ending " .. defeat .. ": flag store not read yet, nothing sent"); return end
-    local ret, missing = true, {}
+    -- the game's own question, the same one IsReturn asks; a plain call is safe (only hooking it froze the load, Rikka); the flag
+    -- copy is the fallback
+    local gs = FindFirstOf("BP_AppGameState_C")
+    local ret, missing, source = true, {}, "game"
     for _, n in ipairs(need) do
-        if lastFlags["BoolMap:IAF_BloodCrystal_BrokenNormal_" .. n] ~= "true" then ret = false; missing[#missing + 1] = n end
+        local sym = "IAF_BloodCrystal_BrokenNormal_" .. n
+        local ok, v = pcall(function() return saveManager():CheckGameProgress(sym, gs) end)
+        if not ok or type(v) ~= "boolean" then
+            source = "copy"
+            if not lastFlags then journal("HOST", "ending " .. defeat .. ": no answer for " .. sym .. " and no flag copy, nothing sent"); return end
+            v = lastFlags["BoolMap:" .. sym] == "true"
+        end
+        if not v then ret = false; missing[#missing + 1] = n end
     end
     local flag = defeat .. (ret and "_Ret" or "_Suc")
     flagQueue[#flagQueue + 1] = flag
-    journal("HOST", "ending " .. defeat .. " decided at the kill: " .. flag .. " (missing vestiges: " .. (#missing > 0 and table.concat(missing, " ") or "none") .. ")")
+    journal("HOST", "ending " .. defeat .. " decided at the kill: " .. flag .. " (missing vestiges: " .. (#missing > 0 and table.concat(missing, " ") or "none") .. ", from the " .. source .. ")")
 end
 
 -- Boss kill. Runs on host and guest in co-op, and in solo play (solo tests, 2026-10-28), once per boss phase.
