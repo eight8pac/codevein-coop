@@ -1788,6 +1788,87 @@ function bloodCodeSyncGuest()
     end
     bcIn = {}
 end
+-- Chest loot for the guest (R8 step 1, 2026-11-04). The host watches the chests' ChestState (0 closed, 1 opening, 2 opened); when one
+-- leaves 0, its fixed contents go to the guests by asset path (ClientMessage "CoopChest:<chest>|<class>|<path>|<count>|<degeneration>|
+-- <grind>"). Weapons and blood veils have their own functions; RPCClient_GainItem crashes on them (test 19:48). Entries with a
+-- weight under 100 or a progress symbol may be random or conditional: logged and skipped until we know how they work.
+chestSeen, chestAt, chestIn, chestGot = {}, -1000, {}, {}
+function chestSyncHost()
+    if os.clock() - chestAt < 2 then return end
+    chestAt = os.clock()
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not valid(gs) or try(function() return gs.Role end) ~= 3 then return end
+    for _, ch in ipairs(FindAllOf("BP_ItemBox_C") or {}) do
+        local n = valid(ch) and name(ch)
+        local st = n and try(function() return ch.ChestState end)
+        if st ~= nil then
+            local old = chestSeen[n]
+            chestSeen[n] = st
+            if old == 0 and st ~= 0 then
+                local guests = {}
+                for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+                    if valid(c) and not try(function() return c:IsLocalController() end) then guests[#guests + 1] = c end
+                end
+                local sent, skipped = 0, 0
+                pcall(function()
+                    ch.SpawnItemInfos:ForEach(function(_, x)
+                        local r = x:get()
+                        local art = try(function() return r.ItemArticle end)
+                        local weight = try(function() return r.Weight end) or 0
+                        local sym = try(function() return r.DropProgressSymbol:ToString() end) or ""
+                        local pth = valid(art) and bcPath(art)
+                        if pth and weight >= 100 and sym == "" then
+                            local msg = string.format("CoopChest:%s|%s|%s|%s|%s|%s", n, tostring(try(function() return name(art:GetClass()) end)), pth,
+                                tostring(try(function() return r.ItemCount end) or 1), tostring(try(function() return r.DegenerationType end) or 0),
+                                tostring(try(function() return r.Grind end) or 0))
+                            for _, c in ipairs(guests) do pcall(function() c:ClientMessage(msg, FName("None"), 0) end) end
+                            sent = sent + 1
+                        else
+                            skipped = skipped + 1
+                            log("chest sync: " .. n .. " entry skipped: " .. tostring(pth) .. " weight=" .. tostring(weight) .. " sym=" .. sym)
+                        end
+                    end)
+                end)
+                log("chest sync: " .. n .. " opened (state " .. tostring(st) .. "): " .. sent .. " entries to " .. #guests .. " guest(s), " .. skipped .. " skipped")
+            end
+        end
+    end
+end
+pcall(function()
+    RegisterHook("/Script/Engine.PlayerController:ClientMessage", function(ctx, s)
+        local text = try(function() return s:get():ToString() end)
+        if text and text:find("^CoopChest:") then chestIn[#chestIn + 1] = text:sub(11) end
+    end)
+end)
+function chestSyncGuest()
+    if #chestIn == 0 then return end
+    local pc = localPC()
+    local mine = valid(pc) and try(function() return pc.Pawn end) or nil
+    if not valid(mine) then return end
+    if try(function() return pc:IsMoveInputIgnored() end) ~= false then return end   -- in a cutscene the game shows no message
+    local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+    for _, line in ipairs(chestIn) do
+        local chest, cls, pth, cnt, deg, grind = line:match("^([^|]*)|([^|]*)|([^|]*)|([^|]*)|([^|]*)|([^|]*)$")
+        local key = tostring(chest) .. "|" .. tostring(pth)
+        if not pth then log("chest sync: bad line " .. line:sub(1, 120))
+        elseif chestGot[key] then log("chest sync: " .. key .. " already received")
+        else
+            chestGot[key] = true
+            local a = StaticFindObject(pth)
+            if not valid(a) then pcall(function() a = LoadAsset(pth) end) end
+            local n, d, g = tonumber(cnt) or 1, tonumber(deg) or 0, tonumber(grind) or 0
+            local ok, e = false, "article not found"
+            if valid(a) then
+                if cls:find("Weapon", 1, true) then ok, e = pcall(function() helper:UpdateWeaponInventoryInfo(mine, a, n, d, g, false) end)
+                elseif cls:find("Jinkaku", 1, true) then ok, e = pcall(function() helper:UpdateJinkakuInventoryInfo(mine, a, n, d, g, false) end)
+                elseif cls:find("Item", 1, true) then ok, e = pcall(function() helper:GainItem(mine, a, n) end)
+                else e = "unknown class " .. cls end
+            end
+            log("chest sync: " .. pth .. " x" .. n .. " from " .. chest .. " -> " .. (ok and "received" or ("FAILED " .. tostring(e):sub(1, 120))))
+        end
+    end
+    chestIn = {}
+end
 -- Co-op version on the title screen (owner 2026-11-03: to see that both PCs run the same kit). The game's version text on the
 -- title gets "  /  co-op <kit>" appended (plugins\\CoopKitVersion.txt).
 -- v2 (2026-11-03, after title-screen crashes inside UE4SS): no search while menus are being built. Every 2 s only a cheap check
@@ -1874,6 +1955,8 @@ local function probeCommands()
     if not world then pcall(titleVersion) else titleDone = false end
     if world then pcall(bloodCodeSyncHost) end
     if world then pcall(bloodCodeSyncGuest) end
+    if world then pcall(chestSyncHost) end
+    if world then pcall(chestSyncGuest) end
     pcall(guestMemoryControl)
     pcall(guestTeleportFade)
     if world then pcall(memoryFollow) end
@@ -1961,7 +2044,7 @@ local function probeCommands()
                             tostring(try(function() return r.DropProgressSymbol:ToString() end)))
                         if valid(art) then
                             local list = tostring(cls):find("Item", 1, true) and items or others
-                            list[#list + 1] = {art, cnt > 0 and cnt or 1}
+                            list[#list + 1] = {art, cnt > 0 and cnt or 1, try(function() return r.DegenerationType end), try(function() return r.Grind end)}
                         end
                     end)
                 end)
@@ -1973,7 +2056,15 @@ local function probeCommands()
         if c ~= "chests" and valid(comp) then
             local list = c == "chestgive" and items or others
             for i = 1, math.min(3, #list) do
-                local ok, e = pcall(function() comp:RPCClient_GainItem(list[i][1], list[i][2]) end)
+                -- RPCClient_GainItem takes item articles only: a weapon article crashed the game (2026-11-04, 0x146302C4E)
+                local art, cnt = list[i][1], list[i][2]
+                local cls = tostring(try(function() return name(art:GetClass()) end))
+                local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+                local ok, e = pcall(function()
+                    if cls:find("Weapon", 1, true) then helper:UpdateWeaponInventoryInfo(mine, art, cnt, list[i][3] or 0, list[i][4] or 0, false)
+                    elseif cls:find("Jinkaku", 1, true) then helper:UpdateJinkakuInventoryInfo(mine, art, cnt, list[i][3] or 0, list[i][4] or 0, false)
+                    else comp:RPCClient_GainItem(art, cnt) end
+                end)
                 log("chests: give " .. name(list[i][1]) .. " x" .. tostring(list[i][2]) .. " -> " .. (ok and "called" or ("ERROR " .. tostring(e):sub(1, 120))))
             end
         end
