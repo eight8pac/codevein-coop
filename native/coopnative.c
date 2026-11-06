@@ -199,6 +199,8 @@ static void run_levelup(void) {
 #define ADDR_SYNC_ALL 0x140465CA0ULL
 static volatile uintptr_t g_syncall_pawn;
 static volatile LONG g_syncall_pending;
+static volatile LONG g_vols_pending;
+static void run_volcheck(void);
 static void run_syncall(void) {
     uintptr_t pawn = g_syncall_pawn;
     if (!pawn) return;
@@ -661,6 +663,7 @@ static void game_thread_work(void) {
     }
     if (g_levelup_pending && InterlockedExchange(&g_levelup_pending, 0)) run_levelup();
     if (g_syncall_pending && InterlockedExchange(&g_syncall_pending, 0)) run_syncall();
+    if (g_vols_pending && InterlockedExchange(&g_vols_pending, 0)) run_volcheck();
     if (g_lvlinfo_pending && InterlockedExchange(&g_lvlinfo_pending, 0)) run_lvlinfo();
 }
 // Scene relay (2026-10-30, after the Lies of P study, which plays cutscenes on every PC and relays only start/skip by name).
@@ -1484,6 +1487,174 @@ static uint8_t detour_prompt_block1(void *a) {
     return r;
 }
 
+// Home Base seats and jukeboxes for guests (2026-11-06, guest_seats=1 in the ini; none of this is hooked without it). What stopped him (kit 159 and the game's code):
+//  1. AFieldTriggerBase / AFieldTriggerItemBase IsActionButtonActive (vtable +0x660) end in "is this the server": his prompt never turns on. CoopProbe lists the
+//     seat and jukebox triggers in CoopNative.seats ("btn"), only those answer yes. Mistles, NPCs, chests have their own versions and stay as they are.
+//  2. A seat gives the view to its camera with PlayerController:Possess, which does nothing without authority. On a guest, for a seat camera and for the way back,
+//     the Possess exec thunk calls ClientRestart_Implementation (vtable +0x8B8) instead: what his PC does when the host hands him a pawn, so input, the seat camera
+//     and the head run as on the host. The host's controller keeps his real character.
+//  3. ClientRestart acknowledges the pawn to the server, and a pawn that is not the server's would make the host hand him back at once: the host drops an
+//     acknowledge of a seat camera (or of none) in Home Base.
+//  4. The seat's Blueprints use GetAllActorsOfClass(BP_Player_C)[0] as "the player". With two players that may be the other one, on the host too, where standing up
+//     would Possess the guest's character. GetAllActorsOfClass puts our own character first while CoopNative.seats names it ("me").
+#define ADDR_BTN_BASE            0x1406E7670ULL
+#define ADDR_BTN_ITEM            0x1406E7860ULL
+#define ADDR_EXEC_POSSESS        0x142314E40ULL
+#define ADDR_EXEC_ACK_POSSESSION 0x1423D27D0ULL
+#define ADDR_GET_ALL_ACTORS      0x141DF1430ULL
+#define ADDR_FRAME_STEP          0x140EA1500ULL   // FFrame::Step(frame, object, result)
+#define VT_POSSESS        0x670
+#define VT_CLIENT_RESTART 0x8B8
+typedef char (*btn_fn)(void *self, void *inputter);
+typedef void (*pawn_fn)(void *pc, void *pawn);
+typedef void (*frame_step_fn)(void *frame, void *object, void *result);
+typedef void (*get_all_fn)(void *ctx, void *cls, rec_ptrs *out);
+static volatile LONG g_seats_on, g_seat_logs, g_seat_ncam, g_seat_nbtn;
+static volatile uintptr_t g_seat_me, g_seat_cam;
+static uintptr_t g_seat_cams[64], g_seat_btns[64];
+static btn_fn g_orig_btn_base, g_orig_btn_item;
+static exec_fn g_orig_exec_possess, g_orig_exec_ack;
+static get_all_fn g_orig_get_all;
+static int seat_in(const uintptr_t *list, LONG n, uintptr_t a) {
+    for (LONG i = 0; i < n && i < 64; i++) if (list[i] == a) return 1;
+    return 0;
+}
+static int seat_log(void) { return InterlockedIncrement(&g_seat_logs) <= 40; }
+static void seats_read(void) {
+    static char sb[8192];
+    if (!read_small_file("CoopNative.seats", sb, sizeof sb)) return;
+    uintptr_t me = 0;
+    LONG nc = 0, nb = 0;
+    g_seat_ncam = 0; g_seat_nbtn = 0;
+    char *line = sb;
+    while (line && *line) {
+        char *next = strchr(line, '\n');
+        if (next) *next++ = 0;
+        int kind = strncmp(line, "me ", 3) == 0 ? 0 : strncmp(line, "cam ", 4) == 0 ? 1 : strncmp(line, "btn ", 4) == 0 ? 2 : -1;
+        char *q = strchr(line, ' ');
+        while (kind >= 0 && q && *q) {
+            char *end; unsigned long long v = strtoull(q, &end, 16);
+            if (end == q) break;
+            if (kind == 0) me = (uintptr_t)v;
+            else if (kind == 1 && nc < 64) g_seat_cams[nc++] = (uintptr_t)v;
+            else if (kind == 2 && nb < 64) g_seat_btns[nb++] = (uintptr_t)v;
+            q = end;
+        }
+        line = next;
+    }
+    g_seat_me = me; g_seat_ncam = nc; g_seat_nbtn = nb;
+    if (!me) g_seat_cam = 0;
+    logf_("seats: our character 0x%llX, %ld seat cameras, %ld triggers open for us", (unsigned long long)me, nc, nb);
+}
+static char btn_answer(char r, void *self) {
+    if (!r && g_seats_on && seat_in(g_seat_btns, g_seat_nbtn, (uintptr_t)self)) {
+        static uintptr_t last;
+        if (last != (uintptr_t)self) { last = (uintptr_t)self; if (seat_log()) logf_("seats: button of 0x%llX turned on for the guest", (unsigned long long)(uintptr_t)self); }
+        return 1;
+    }
+    return r;
+}
+static char detour_btn_base(void *self, void *inputter) { return btn_answer(g_orig_btn_base(self, inputter), self); }
+static char detour_btn_item(void *self, void *inputter) { return btn_answer(g_orig_btn_item(self, inputter), self); }
+static void detour_exec_possess(void *ctx, void *stack, void *result) {
+    uintptr_t s = (uintptr_t)stack;
+    // Blueprint calls only (Code set), on a guest only; the rest of this function is the game's thunk with the one choice added
+    if (!g_seats_on || rec_client_flag() <= 0 || !s || *(uintptr_t *)(s + 0x20) == 0) { g_orig_exec_possess(ctx, stack, result); return; }
+    uintptr_t pawn = 0;
+    ((frame_step_fn)ADDR_FRAME_STEP)(stack, *(void **)(s + 0x18), &pawn);
+    *(uintptr_t *)(s + 0x20) += 1;
+    void **vt = *(void ***)ctx;
+    int to_cam = pawn && seat_in(g_seat_cams, g_seat_ncam, pawn);
+    if (to_cam || (pawn && g_seat_cam)) {
+        uintptr_t target = to_cam ? pawn : (g_seat_me ? g_seat_me : pawn);
+        if (seat_log()) logf_("seats: Possess 0x%llX on the guest -> local restart with 0x%llX (%s)", (unsigned long long)pawn, (unsigned long long)target, to_cam ? "sitting down" : "standing up");
+        g_seat_cam = to_cam ? pawn : 0;
+        ((pawn_fn)vt[VT_CLIENT_RESTART / 8])(ctx, (void *)target);
+        return;
+    }
+    ((pawn_fn)vt[VT_POSSESS / 8])(ctx, (void *)pawn);
+}
+static void detour_exec_ack(void *ctx, void *stack, void *result) {
+    uintptr_t s = (uintptr_t)stack;
+    if (g_seats_on && g_seat_ncam > 0 && s && *(uintptr_t *)(s + 0x20) == 0) {
+        uintptr_t locals = *(uintptr_t *)(s + 0x28);
+        if (locals && readable(locals, 8)) {
+            uintptr_t p = *(uintptr_t *)locals;
+            // Controller::Pawn +0x388: 11-06 22:30 this also dropped the host's own seat cameras, which are real on the server
+            if (!p || (seat_in(g_seat_cams, g_seat_ncam, p) && *(uintptr_t *)((uintptr_t)ctx + 0x388) != p)) {
+                if (seat_log()) logf_("seats: the guest's acknowledge of 0x%llX dropped (his seat camera)", (unsigned long long)p);
+                return;
+            }
+        }
+    }
+    g_orig_exec_ack(ctx, stack, result);
+}
+// Head on a seat (11-06 22:3x, owner: "it's using his mouse movement"): ABP_ScenarioChara_Sitting* turns the head from GetPlayerCameraManager(0):GetCameraRotation, the
+// viewer's camera, for every character that sits. CoopProbe writes CoopNative.head ("<anim instance> <pitch> <yaw>", the other player's camera): the exec thunk answers
+// with those numbers when that anim instance is the caller (FFrame+0x18). Everything else gets the real camera.
+#define ADDR_EXEC_CAM_ROT 0x1423D0080ULL
+static exec_fn g_orig_exec_camrot;
+static volatile uintptr_t g_head_anim;
+static volatile float g_head_pitch, g_head_yaw;
+static void head_read(void) {
+    char hb[96];
+    if (!read_small_file("CoopNative.head", hb, sizeof hb)) return;
+    unsigned long long a = 0; float p = 0, y = 0;
+    if (sscanf(hb, "%llx %f %f", &a, &p, &y) != 3) return;
+    g_head_pitch = p; g_head_yaw = y; g_head_anim = (uintptr_t)a;
+}
+static void detour_exec_camrot(void *ctx, void *stack, void *result) {
+    uintptr_t s = (uintptr_t)stack, a = g_head_anim;
+    if (a && s && result && *(uintptr_t *)(s + 0x18) == a) {
+        uintptr_t code = *(uintptr_t *)(s + 0x20);
+        if (code) *(uintptr_t *)(s + 0x20) = code + 1;
+        float *r = (float *)result;
+        r[0] = g_head_pitch; r[1] = g_head_yaw; r[2] = 0;
+        return;
+    }
+    g_orig_exec_camrot(ctx, stack, result);
+}
+// Leaving Home Base (11-06 22:34): "vols" takes CoopNative.vols ("x y z", then one volume address per line) and writes the volumes around that point to
+// CoopNative.volsout. AVolume::EncompassesPoint, the check the teleport driver makes; on the game thread with the other pending calls.
+#define ADDR_ENCOMPASSES 0x1422BB980ULL
+typedef char (*encompass_fn)(void *self, float *pt, float radius, float *out);
+static volatile LONG g_vols_pending;
+static void run_volcheck(void) {
+    static char vb[32768];
+    if (!read_small_file("CoopNative.vols", vb, sizeof vb)) return;
+    float pt[3];
+    if (sscanf(vb, "%f %f %f", &pt[0], &pt[1], &pt[2]) != 3) return;
+    char op[MAX_PATH];
+    snprintf(op, sizeof op, "%sCoopNative.volsout", g_dir);
+    FILE *f = fopen(op, "w");
+    if (!f) return;
+    int n = 0, hit = 0;
+    char *line = strchr(vb, '\n');
+    while (line && *++line) {
+        unsigned long long a = strtoull(line, NULL, 16);
+        if (a && readable((uintptr_t)a, 0x410)) {
+            n++;
+            if (((encompass_fn)ADDR_ENCOMPASSES)((void *)(uintptr_t)a, pt, 0.0f, NULL)) { fprintf(f, "%llX\n", a); hit++; }
+        }
+        line = strchr(line, '\n');
+    }
+    fprintf(f, "done\n");
+    fclose(f);
+    logf_("vols: %d of %d volumes around %.0f %.0f %.0f", hit, n, pt[0], pt[1], pt[2]);
+}
+static void detour_get_all(void *ctx, void *cls, rec_ptrs *out) {
+    g_orig_get_all(ctx, cls, out);
+    uintptr_t me = g_seat_me;
+    if (!me || !out || !out->data || out->num < 2 || out->data[0] == me) return;
+    for (int i = 1; i < out->num; i++) {
+        if (out->data[i] == me) {
+            out->data[i] = out->data[0]; out->data[0] = me;
+            if (seat_log()) logf_("seats: GetAllActorsOfClass had 0x%llX first, our character 0x%llX put there", (unsigned long long)out->data[i], (unsigned long long)me);
+            return;
+        }
+    }
+}
+
 // ---- small file channel next to the DLL: CoopNative.cmd (one-shot commands), .ini (settings), .flags (from Lua) ----
 static char g_dir[MAX_PATH];
 
@@ -1691,6 +1862,10 @@ static void run_command(char *buf) {
         rec_window(atoi(buf + 7), "event");
     } else if (strncmp(buf, "reccensus", 9) == 0) {
         if (g_rec) rec_census();
+    } else if (strncmp(buf, "seats", 5) == 0) {
+        seats_read();
+    } else if (strncmp(buf, "vols", 4) == 0) {
+        InterlockedExchange(&g_vols_pending, 1);
     } else if (strncmp(buf, "hbstart", 7) == 0) {
         g_hb_at = GetTickCount64();   // the guest has no teleport of his own, and his lock stuck the same way
         rec_window(85, "Home Base trip");
@@ -2051,6 +2226,14 @@ static void detour_server_addexp(void *ctx, void *stack, void *result) {
     if (stack && readable((uintptr_t)stack + 0x20, 16) && *(uintptr_t *)((uintptr_t)stack + 0x20) == 0) {
         uintptr_t locals = *(uintptr_t *)((uintptr_t)stack + 0x28);
         if (locals && readable(locals, 4)) value = *(int *)locals;
+    }
+    // Home Base flavor sync (2026-11-06): the guest's only way to the host is a number. Values from -3000000 down are not exp: handed to CoopProbe, swallowed.
+    if (value <= -3000000) {
+        char fp_[MAX_PATH + 32];
+        snprintf(fp_, sizeof fp_, "%sCoopNative.flavorin", g_dir);
+        FILE *ff = fopen(fp_, "a");
+        if (ff) { fprintf(ff, "%d\n", -value - 3000000); fclose(ff); }
+        return;
     }
     // item 6b: the guest's rest asks the host for an enemy reset with Server_AddExp(-2601) (a value no real exp gain has); swallowed
     if (value == GUEST_REST_MAGIC) {
@@ -2452,6 +2635,15 @@ static DWORD WINAPI worker(LPVOID unused) {
             "\xE9\x1B\x56\xCB\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_get_state, (void **)&g_orig_get_state);
     {
         char ini[4096];
+        if (read_small_file("CoopNative.ini", ini, sizeof ini) && strstr(ini, "guest_seats=1")) {
+            g_seats_on = 1;
+            install("SeatButtonBase", ADDR_BTN_BASE, "\xE9\xDB\xEA\x3E\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_btn_base, (void **)&g_orig_btn_base);
+            install("SeatButtonItem", ADDR_BTN_ITEM, "\xE9\x2B\xF1\x3E\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_btn_item, (void **)&g_orig_btn_item);
+            install("SeatPossess", ADDR_EXEC_POSSESS, "\xE9\x4B\x49\x1C\x0E\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_exec_possess, (void **)&g_orig_exec_possess);
+            install("SeatAcknowledge", ADDR_EXEC_ACK_POSSESSION, "\xE9\xDB\xA7\xED\x0E\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_exec_ack, (void **)&g_orig_exec_ack);
+            install("SeatHead", ADDR_EXEC_CAM_ROT, "\xE9\x9B\x19\xED\x0E\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_exec_camrot, (void **)&g_orig_exec_camrot);
+            install("SeatGetAllActors", ADDR_GET_ALL_ACTORS, "\xE9\xAB\x44\xE3\x0C\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_get_all, (void **)&g_orig_get_all);
+        }
         if (read_small_file("CoopNative.ini", ini, sizeof ini) && strstr(ini, "rec=1")) {
             g_rec = 1;
             install("RecSetVis", 0x140913E80ULL, "\xE9\x4B\x34\x77\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_setvis, (void **)&g_orig_setvis);
@@ -2591,6 +2783,7 @@ static DWORD WINAPI worker(LPVOID unused) {
         Sleep(200);
         read_settings();
         run_commands();
+        if (g_seats_on) head_read();
         guest_memory_watch();
         {
             static int gm_open;

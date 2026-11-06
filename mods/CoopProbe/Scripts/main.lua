@@ -67,6 +67,7 @@ local lastWindow
 local rewardsAt = -1000
 bossReviveUntil, bossReviveDue, bossReviveDoneUntil = -1000, false, -1000
 hbUntil, hbReady, hbGuestWait, hbTarget, hbHostHold, hbRelease = -1000, false, false, nil, false, nil   -- Home Base teleport with the session kept (hbWatch)
+hbBrought, hbVolAt = false, -1000
 hbLeave, hbLeaveIn, hbLeaveArrived, hbLeaveOk = false, false, false, nil                                 -- the same on the way out
 pcall(function()
     RegisterHook("/Script/Extensions.BossAreaBase:MulticastGainRewards", function()
@@ -737,11 +738,96 @@ end)
 function hbApplyLook(hlp, p)
     local a, ea = pcall(function() hlp:UpdateJinkakuVisibility(p) end)
     local b, eb = pcall(function() hlp:OnAnimNotifyStateChangeVisibilityOfWeapon(p, false, 0.0) end)
-    log("hb: veil and weapon re-applied on " .. name(p) .. " -> " .. (a and "ok" or tostring(ea):sub(1, 80)) .. ", " .. (b and "ok" or tostring(eb):sub(1, 80)))
+    -- 11-06: the face mask stayed on in the lounge. Home Base info has both mask flags off, the same call for them as for the veil.
+    local c, ec = pcall(function() hlp:SetToxicGuardMaskVisibility(p, false); hlp:SetToxicGuardMaskInnerVisibility(p, false); hlp:SetToxicGuardMaskOuterVisibility(p, false) end)
+    log("hb: veil, weapon and mask re-applied on " .. name(p) .. " -> " .. (a and "ok" or tostring(ea):sub(1, 80)) .. ", " .. (b and "ok" or tostring(eb):sub(1, 80)) .. ", " .. (c and "ok" or tostring(ec):sub(1, 80)))
 end
 function hbInBase()
     local fm = FindFirstOf("AppFieldManager")
     return valid(fm) and try(function() return fm:IsInHideout(fm) end) == true
+end
+-- Leaving Home Base, 11-06 22:34: the teleport driver had nothing to wait for and the game asked for no stage level in 44 s, with both of us at the target and LSV_Base01
+-- still wanted: the volumes did not react to where we stand. Why is open, so this finds the volumes around us (CoopNative "vols"), logs their state, clears a disabled one,
+-- and after 3 s more asks for their levels itself, as the volume would.
+hbAskNext, hbAskPending, hbAskVols, hbAskClearedAt, hbAskLevels, hbAllLevels, hbVolMap = 0, false, nil, nil, nil, {}, {}
+function hbAskReset()
+    hbAskNext, hbAskPending, hbAskVols, hbAskClearedAt, hbAskLevels, hbAllLevels, hbVolMap = 0, false, nil, nil, nil, {}, {}
+end
+function hbAskSend(loc)
+    os.remove(WIN64 .. "\\plugins\\CoopNative.volsout")
+    local f = io.open(WIN64 .. "\\plugins\\CoopNative.vols", "w")
+    if not f then return end
+    f:write(string.format("%.0f %.0f %.0f\n", loc.X, loc.Y, loc.Z))
+    hbVolMap = {}
+    for _, v in ipairs(FindAllOf("AppLevelStreamingVolume") or {}) do
+        local a = valid(v) and try(function() return v:GetAddress() end)
+        if a then hbVolMap[string.format("%X", a)] = v; f:write(string.format("%X\n", a)) end
+    end
+    f:close()
+    local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
+    if c then c:write("vols\n"); c:close() end
+    hbAskPending = true
+end
+function hbAskRead()
+    local f = io.open(WIN64 .. "\\plugins\\CoopNative.volsout", "r")
+    if not f then return nil end
+    local s = f:read("*a") or ""
+    f:close()
+    if not s:find("done", 1, true) then return nil end
+    local out = {}
+    for a in s:gmatch("(%x+)%s") do
+        local v = hbVolMap[a]
+        if valid(v) and not name(v):find("Base", 1, true) then out[#out + 1] = v end
+    end
+    return out
+end
+function hbAskForce(want)
+    if hbAskLevels then
+        for _, l in ipairs(hbAskLevels) do if valid(l) then pcall(function() l.bShouldBeLoaded = true; l.bShouldBeVisible = true end) end end
+        return
+    end
+    local names, nn = {}, 0
+    for _, v in ipairs(hbAskVols) do
+        pcall(function() v.StreamingLevelNames:ForEach(function(_, e)
+            local s = e:get():ToString()
+            names[s:match("[^/]+$") or s] = true
+            nn = nn + 1
+        end) end)
+    end
+    hbAskLevels = {}
+    for _, e in ipairs(hbAllLevels) do
+        if names[e.p:match("[^/]+$") or e.p] then hbAskLevels[#hbAskLevels + 1] = e.l end
+    end
+    log("hb: leaving, the game asked for " .. want .. " stage levels; asking for " .. #hbAskLevels .. " levels of " .. nn .. " names in " .. #hbAskVols .. " volumes ourselves")
+    hbAskForce(want)
+end
+function hbLeaveAsk(now, want, mine)
+    if hbAskLevels then hbAskForce(want); return end
+    if hbAskVols then
+        if want == 0 and hbAskClearedAt and now - hbAskClearedAt >= 3 then hbAskForce(want) end
+        return
+    end
+    if hbAskPending then
+        local vols = hbAskRead()
+        if not vols then return end
+        hbAskPending = false
+        if #vols == 0 then return end
+        local fm = FindFirstOf("AppFieldManager")
+        log("hb: leaving, field tracking " .. tostring(valid(fm) and try(function() return fm:IsFieldTrackingActive(fm) end)) .. ", in Home Base " .. tostring(hbInBase()))
+        local parts, cleared = {}, 0
+        for _, v in ipairs(vols) do
+            local dis = try(function() return v.bDisabled end)
+            parts[#parts + 1] = name(v) .. " disabled=" .. tostring(dis) .. " wants=" .. tostring(try(function() return v:IsEitherLevelShouldBeLoaded() end))
+            if dis == true and pcall(function() v:SetForceDisable(false); v.bDisabled = false end) then cleared = cleared + 1 end
+        end
+        log("hb: leaving, volumes around us: " .. table.concat(parts, " | "):sub(1, 500) .. (cleared > 0 and (" -> " .. cleared .. " enabled") or ""))
+        hbAskVols, hbAskClearedAt = vols, now
+        return
+    end
+    if now < hbAskNext then return end
+    hbAskNext = now + 1
+    local loc = valid(mine) and try(function() return mine:K2_GetActorLocation() end)
+    if loc then hbAskSend(loc) end
 end
 -- Leaving Home Base with a guest: the same hold as on the way in (11-06 14:32)
 function hbLeaveStart()
@@ -752,6 +838,7 @@ function hbLeaveStart()
     if #guests == 0 then return end
     hbUntil, hbAt, hbNext, hbForced, hbReady, hbLevels = os.clock() + 45, os.clock(), 0, false, false, nil
     hbLeave, hbLeaveArrived, hbLeaveOk, hbHostHold, hbRelease = true, false, nil, true, nil
+    hbAskReset()
     log("hb: leaving Home Base with " .. #guests .. " guest(s): held until the stage is there")
     local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
     for _, c in ipairs(guests) do
@@ -832,6 +919,7 @@ function hbWatch()
         hbLeaveIn = false
         hbUntil, hbAt, hbNext, hbForced, hbReady, hbLevels = os.clock() + 45, os.clock(), 0, false, false, nil
         hbLeave, hbLeaveArrived, hbLeaveOk, hbGuestWait, hbTarget = true, true, nil, false, nil
+        hbAskReset()
         log("hb: the host leaves Home Base, we hover until the stage is here")
         if iniHas("hb_base_mode=1") then
             local pcl = localPC()
@@ -842,6 +930,7 @@ function hbWatch()
     end
     local now = os.clock()
     if hbHostHold then
+        if hbBrought and (hbReady or now > hbUntil) then hbBrought, hbRelease = false, now + 2 end
         -- 11-06 13:58: the move answered "ok" but he stayed in the old area, was let go 2 s later and fell. He stays held until he is really here.
         if hbRelease and now >= hbRelease and now < hbUntil + 60 and not hbGuestsHere() then
             hbRelease = now + 1
@@ -895,6 +984,7 @@ function hbWatch()
                     if type(pkg) ~= "string" then pkg = "" end
                     if #samples < 4 then samples[#samples + 1] = name(l) .. "=" .. pkg:sub(-40) end
                     if hbLeave then
+                        hbAllLevels[#hbAllLevels + 1] = { l = l, p = pkg }
                         -- leaving: the static mesh levels of any other area; the ones the game asks for decide
                         if pkg:find("/Environment/", 1, true) and pkg:find("_SM", 1, true) and not pkg:find("Base0", 1, true) then hbLevels[#hbLevels + 1] = { l = l, n = pkg:match("([^/]+)$") or pkg } end
                     elseif pkg:find("Base01_Hideout", 1, true) and pkg:find("Environment", 1, true) then hbLevels[#hbLevels + 1] = { l = l, n = pkg:match("Hideout_([%w_]+)$") or pkg:match("([^/]+)$") } end
@@ -932,6 +1022,15 @@ function hbWatch()
             geo = now - hbLeaveOk >= 1.5
         else hbLeaveOk = nil end
         parts[1] = string.format("leaving: %d of %d stage levels shown", shown, want)
+        if hbLeaveArrived then pcall(hbLeaveAsk, now, want, mine) end
+        if now - hbVolAt > 5 then
+            hbVolAt = now
+            local on = {}
+            for _, v in ipairs(FindAllOf("AppLevelStreamingVolume") or {}) do
+                if valid(v) and try(function() return v:IsEitherLevelShouldBeLoaded() end) then on[#on + 1] = name(v) end
+            end
+            log("hb: leaving, volumes that want their levels: " .. table.concat(on, " "):sub(1, 400))
+        end
     end
     local loc = valid(mine) and try(function() return mine:K2_GetActorLocation() end)
     log(string.format("hb: %.1f s, %d loaded, %d visible (should load/should show/loaded/shown) %s | pawn %s z=%s", now - hbAt, loaded, visible, table.concat(parts, " "),
@@ -1104,7 +1203,9 @@ local function groupTeleport()
     if not arrived then return end
     pendingTp.newSeenAt = pendingTp.newSeenAt or os.clock()
     if os.clock() - pendingTp.newSeenAt < 3 then return end   -- let the host's area finish loading
-    if os.clock() < hbUntil and not hbReady then return end   -- Home Base: not before its levels are there, or he falls
+    -- Home Base: not before its levels are there, or he falls. Leaving it: the opposite (11-06 19:43): 45 s hovering at the target and the game asked for none of the
+    -- stage's levels while his character stood in Home Base, and both times the stage came only after he was gone from there. So he comes along now, held in the air.
+    if os.clock() < hbUntil and not hbReady and not hbLeave then return end
     if pendingTp.memend then
         -- 2026-11-05: "can move" came 2 s into the final cutscene (it does not block move input): the guest spawned into the host's
         -- cutscene with the join message. The game's own report of the finished scene is the real end.
@@ -1158,7 +1259,7 @@ local function groupTeleport()
         end
     end
     log("group teleport: " .. n .. " guest(s) brought to the host")
-    if hbLeave then hbRelease = os.clock() + 2 end
+    if hbLeave then hbBrought = true end
     memendBring = false
 end
 -- memory state on the host (set by the scene relay): memHostOn while the memory runs; memFollowAt = a host skip to follow;
@@ -1785,6 +1886,7 @@ pcall(function()
         local text = try(function() return s:get():ToString() end)
         if text and text:find("^CoopVis:") then visIn[#visIn + 1] = text:sub(9) end
         if text and text:find("^CoopRec") then recIn[#recIn + 1] = text end
+        if text and text:find("^CoopFS:") then fsIn[#fsIn + 1] = text end
     end)
 end)
 -- the guest keeps the host's last state per name and re-applies it every 3 s (his own logic switched the wall back on before)
@@ -1916,6 +2018,7 @@ function recCensus(why)
 end
 function recTick()
     if not REC then return end
+    if FLAVOR then pcall(flavorTick) end
     local gs = FindFirstOf("BP_AppGameState_C")
     local host = valid(gs) and try(function() return gs.Role end) == 3
     local now = os.clock()
@@ -1975,6 +2078,83 @@ end
 -- (11-06: the recording's Lua hooks on LoadStreamLevel and ScenarioStarter:Start* are gone. UE4SS's hook dispatcher, UE4SS.dll +0x4A47A0, walks
 -- FFrame::OutParms of the calling Blueprint frame; called from some NPC scripts that list has a bad link: endless loop (host 14:00, guest 12:47) or
 -- access violation (host 14:13). So nothing Blueprints call on a conversation may be hooked from Lua.)
+-- Flavor recording (11-06, solo in Home Base): what changes when someone sits, plays the piano or uses the jukebox, for the relay to the other PC.
+-- Polling only: no hooks on anything Blueprints call (see the OutParms note above).
+flavorAt, flavorJukeAt, flavorKey, flavorState, flavorJuke, flavorPianoOn, flavorPianoKey, flavorPianoLogs = 0, 0, nil, nil, nil, false, nil, 0
+flavorYaw, flavorPitch, flavorHeadLogs = 0, 0, 0
+FLAVOR = iniHas("rec_flavor=1")
+PIANO_KEYS = {"IsDecideDown", "IsDirection_DownDown", "IsDirection_LeftDown", "IsDirection_RightDown", "IsDirection_UpDown", "IsFaceLeftDown", "IsFaceTopDown",
+              "IsTrigger_L1Down", "IsTrigger_L2Down", "IsTrigger_L3Down", "IsTrigger_R1Down", "IsTrigger_R2Down", "IsTrigger_R3Down"}
+function flavorPianoPoll()
+    local cam = FindFirstOf("BP_SittingPianoChair_Camera_C")
+    if not valid(cam) then return end
+    local down = {}
+    for _, k in ipairs(PIANO_KEYS) do
+        if try(function() return cam[k] end) == true then down[#down + 1] = k:gsub("^Is", ""):gsub("Down$", "") end
+    end
+    local pc = localPC()
+    local pawn = valid(pc) and try(function() return pc.Pawn end) or nil
+    local m = valid(pawn) and try(function() return pawn.Mesh end) or nil
+    local anim = valid(m) and try(function() return m:GetAnimInstance() end) or nil
+    local key = table.concat(down, "+") .. " play=" .. tostring(valid(anim) and try(function() return anim.IsPianoPlay end)) .. "/" ..
+        tostring(valid(anim) and try(function() return anim.IsPianoPlay2 end)) .. " switcher=" .. tostring(try(function() return cam.Switcher end))
+    if key ~= flavorPianoKey then
+        flavorPianoKey = key
+        flavorPianoLogs = flavorPianoLogs + 1
+        if flavorPianoLogs <= 500 then log("rec piano: " .. key) end
+    end
+end
+function flavorTick()
+    local now = os.clock()
+    if now - flavorAt < 0.2 then return end
+    flavorAt = now
+    if not hbInBase() then flavorPianoOn = false; return end
+    local pc = localPC()
+    local pawn = valid(pc) and try(function() return pc.Pawn end) or nil
+    if not valid(pawn) then return end
+    local m = try(function() return pawn.Mesh end)
+    local anim = valid(m) and try(function() return m:GetAnimInstance() end) or nil
+    local cls = (valid(anim) and name(anim) or "none"):gsub("_%d+$", "")
+    local vt = try(function() return pc:GetViewTarget() end)
+    local view = valid(vt) and name(vt) or "none"
+    flavorPianoOn = cls:find("PianoChair", 1, true) ~= nil   -- (the view target stays the player while sitting)
+    local key = cls .. " | " .. view
+    if key ~= flavorKey then
+        flavorKey = key
+        local loc = try(function() return pawn:K2_GetActorLocation() end)
+        local rot = try(function() return pawn:K2_GetActorRotation() end)
+        local va = valid(vt) and try(function() return vt:GetAddress() end)
+        log(string.format("rec sit: anim %s, view %s (%s), pawn %s at %s yaw %s, hidden %s, move mode %s", cls, view, va and string.format("%X", va) or "?", name(pawn),
+            loc and string.format("%.0f,%.0f,%.0f", loc.X, loc.Y, loc.Z) or "?", rot and string.format("%.1f", rot.Yaw) or "?",
+            tostring(try(function() return pawn.bHidden end)), tostring(try(function() return pawn.CharacterMovement.MovementMode end))))
+    end
+    if cls:find("Sitting", 1, true) then
+        local st = string.format("start=%s loop=%s end=%s state=%s pressX=%s stay=%s/%s/%s", tostring(try(function() return anim.isSittingStart end)), tostring(try(function() return anim.isSittingLoop end)),
+            tostring(try(function() return anim.isSittingEnd end)), tostring(try(function() return anim._stateName:ToString() end)), tostring(try(function() return anim.PressX end)),
+            tostring(try(function() return anim._isSittingStayDefault end)), tostring(try(function() return anim._isSittingStay1 end)), tostring(try(function() return anim._isSittingStay2 end)))
+        if st ~= flavorState then flavorState = st; log("rec sit state: " .. st) end
+        -- head following the camera (owner: on E): the sitting animation blueprints have these
+        local dy, dp = try(function() return anim.DirectionYaw end), try(function() return anim.DirectionPitch end)
+        local d1 = try(function() return anim.DirectionYaw_type1 end)
+        if type(dy) == "number" and type(dp) == "number" and (math.abs(dy - flavorYaw) > 4 or math.abs(dp - flavorPitch) > 4) then
+            flavorYaw, flavorPitch, flavorHeadLogs = dy, dp, flavorHeadLogs + 1
+            if flavorHeadLogs <= 200 then log(string.format("rec head: yaw %.1f pitch %.1f type1 %s", dy, dp, tostring(d1))) end
+        end
+    end
+    if now - flavorJukeAt > 0.5 then
+        flavorJukeAt = now
+        local parts = {}
+        for _, j in ipairs(FindAllOf("BP_FieldTrigger_Jukebox_C") or {}) do
+            if valid(j) then
+                parts[#parts + 1] = string.format("%s play index %s, select %s, played %s, should play %s, machine %s", name(j), tostring(try(function() return j.PlayIndex end)), tostring(try(function() return j.SelectIndex end)),
+                    tostring(try(function() return j.bPlayed end)), tostring(try(function() return j.bShouldPlay end)), tostring(try(function() return j.MachineType end)))
+            end
+        end
+        table.sort(parts)
+        local s = table.concat(parts, " | ")
+        if s ~= flavorJuke then flavorJuke = s; log("rec jukebox: " .. s) end
+    end
+end
 function npcCensus(reason)
     if REC then return end
     local list, other, others = {}, 0, nil
@@ -2163,6 +2343,348 @@ local function writeMyComponent()
     if f then f:write(string.format("%X", a)); f:close(); log(string.format("guest rest: own HumanContextComponent 0x%X handed to CoopNative", a)) end
     return c
 end
+-- Home Base flavor sync (flavor_sync=1, 11-06): sitting, the head on a seat, the jukeboxes. The game does all of it on one PC only: a seat swaps the local
+-- character's anim class and moves it; the seat's camera writes DirectionYaw/Pitch into that anim instance; a jukebox is a local sound with a requested
+-- track (SelectIndex) and bShouldPlay. Polling only, no hooks. Host -> guest: ClientMessage "CoopFS:...". Guest -> host: numbers through Server_AddExp, below
+-- -3000000: payload = kind * 2^24 + data; CoopNative hands them over in CoopNative.flavorin.
+-- kinds: 1 seat, 2 x, 3 y, 4 z, 5 yaw, 6 head, 7 jukebox, 8 hello. The host moves its copy of him to the seat (the host simulates his character).
+FS_ON = iniHas("flavor_sync=1")
+FS_BASE, FS_KIND = 3000000, 16777216
+FS_DIR = "/Game/Cinematics/Scenario/Base01_Hideout/Others/SittingEvent/"
+FS_ANIMS = {"base_chair/ABP_ScenarioChara_SittingChair", "base_chair/ABP_ScenarioChara_SittingChair02", "base_chair/ABP_ScenarioChara_SittingChair03",
+            "Base_Sofa/ABP_ScenarioChara_SittingSofa", "Base_Sofa/ABP_ScenarioChara_SittingSofa02", "Base_Sofa/ABP_ScenarioChara_SittingSofa03",
+            "Base_MiaChair/ABP_ScenarioChara_SittingMiaChair", "Base_MiaChair/ABP_ScenarioChara_SittingMiaChair02", "Base_Bed/ABP_ScenarioChara_SittingBed",
+            "Base_PianoChair/ABP_ScenarioChara_SittingPianoChair", "Base_GardenChair/ABP_ScenarioChara_SittingGardenChair", "Base_GardenChair/ABP_ScenarioChara_SittingGardenChair02"}
+FS_INDEX = {}
+for i, p in ipairs(FS_ANIMS) do FS_INDEX[p:match("([^/]+)$") .. "_C"] = i end
+fsIn, fsAt, fsBaseAt, fsInBase, fsJukeAt, fsHello, fsComp, fsErr = {}, 0, 0, false, 0, false, nil, false
+fsMine = { idx = 0, since = 0, sent = true }
+fsRem = { idx = 0 }
+fsHeadY, fsHeadP, fsHeadX = 0, 0, false
+fsJukeSeen = {}
+-- Seats for guests (guest_seats=1, see CoopNative): which triggers and seat cameras CoopNative may treat specially, and which character is ours. While sitting the
+-- controller holds the seat's camera (host and guest), so the character is the last BP_Player we had, not pc.Pawn.
+FS_SEATS = iniHas("guest_seats=1")
+fsSeatOn, fsSeatNew, fsTrigOff, fsHeadOn = {}, 0, {}, false
+fsMyChar, fsSeatsAt, fsSeatsSince, fsSeatsSent, fsKitSent = nil, -1000, 0, nil, false
+function fsSeatsWrite(text, what)
+    if text == fsSeatsSent then return end
+    fsSeatsSent = text
+    local f = io.open(WIN64 .. "\\plugins\\CoopNative.seats", "w")
+    if f then f:write(text); f:close() end
+    local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
+    if c then c:write("seats\n"); c:close() end
+    log("flavor: seats list for CoopNative: " .. what)
+end
+function fsSeatsTick(host, now)
+    if not FS_SEATS then return end
+    if fsSeatsSince == 0 then fsSeatsSince = now end
+    if now - fsSeatsAt < (now - fsSeatsSince < 30 and 2 or 10) then return end
+    fsSeatsAt = now
+    local me = valid(fsMyChar) and try(function() return fsMyChar:GetAddress() end) or 0
+    local cams, btns = {}, {}
+    for _, q in ipairs(FindAllOf("Character") or {}) do
+        if valid(q) and name(q):find("^BP_Sitting") then
+            local a = try(function() return q:GetAddress() end)
+            if a then cams[#cams + 1] = string.format("%X", a) end
+        end
+    end
+    if not host then
+        for _, q in ipairs(FindAllOf("FieldTriggerBase") or {}) do
+            local n = valid(q) and name(q) or ""
+            if n:find("Sitting", 1, true) or n:find("Jukebox", 1, true) or n:find("JukeBox", 1, true) then
+                local a = try(function() return q:GetAddress() end)
+                if a then btns[#btns + 1] = string.format("%X", a) end
+                -- 11-06 22:3x: his jukebox prompt came on, no seat's did, and the button check never ran for a seat. BP_FieldTriggerMessage switches its overlap on in
+                -- OnProgressFlagUpdated, and the game calls that on the server only.
+                if a and n:find("FieldTriggerMessage_Sitting", 1, true) and not fsSeatOn[a] then
+                    fsSeatOn[a] = pcall(function() q:SetMessageTriggerActive(true) end) and true or false
+                    fsSeatNew = fsSeatNew + 1
+                end
+            end
+        end
+    end
+    if fsSeatNew > 0 then log("flavor: " .. fsSeatNew .. " seats turned on for us"); fsSeatNew = 0 end
+    -- the prompt on the wrong screen (11-06): each character's FieldTriggerActionComponent elects triggers, on every PC, and a jukebox opens its menu when elected. The copy
+    -- of the other player has no business electing anything here.
+    local tcl = StaticFindObject("/Script/Extensions.FieldTriggerActionComponent")
+    for _, q in ipairs(FindAllOf("BP_Player_C") or {}) do
+        local a = valid(q) and try(function() return q:GetAddress() end)
+        if a and a ~= me and not fsTrigOff[a] then
+            local c = valid(tcl) and try(function() return q:GetComponentByClass(tcl) end)
+            if valid(c) then
+                fsTrigOff[a] = true
+                local ok = pcall(function() c:SetComponentTickEnabled(false) end)
+                log("flavor: trigger choice off for the other player's " .. name(q) .. " -> " .. tostring(ok))
+            end
+        end
+    end
+    table.sort(cams); table.sort(btns)
+    fsSeatsWrite(string.format("me %X\ncam %s\nbtn %s\n", me, table.concat(cams, " "), table.concat(btns, " ")), #cams .. " cameras, " .. #btns .. " triggers")
+end
+function fsKitNumber()
+    local f = io.open(WIN64 .. "\\plugins\\CoopKitVersion.txt", "r")
+    if not f then return 0 end
+    local s = f:read("*a") or ""
+    f:close()
+    return tonumber(s:match("update%-(%d+)")) or 0
+end
+function fsClassOf(i)
+    local p = FS_ANIMS[i]
+    if not p then return nil end
+    local leaf = p:match("([^/]+)$")
+    local path = FS_DIR .. p .. "." .. leaf .. "_C"
+    local c = StaticFindObject(path)
+    if not valid(c) then
+        pcall(function() LoadAsset(FS_DIR .. p .. "." .. leaf) end)
+        c = StaticFindObject(path)
+    end
+    return c
+end
+function fsStandClass(pawn)
+    local hlp = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+    local male = try(function() return hlp:IsMaleByAppearance(pawn) end)
+    local leaf = male and "ABP_PlayerMale" or "ABP_PlayerFemale"
+    return StaticFindObject("/Game/character/BodyBase/Male/" .. leaf .. "." .. leaf .. "_C")
+end
+function fsGuests()
+    local out = {}
+    for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+        if valid(c) and not try(function() return c:IsLocalController() end) then out[#out + 1] = c end
+    end
+    return out
+end
+function fsOther(host)
+    if host then
+        local g = fsGuests()[1]
+        return g and try(function() return g.Pawn end) or nil
+    end
+    local pc = localPC()
+    local mine = valid(fsMyChar) and fsMyChar or (valid(pc) and try(function() return pc.Pawn end) or nil)
+    local ma = valid(mine) and try(function() return mine:GetAddress() end)
+    for _, q in ipairs(FindAllOf("BP_Player_C") or {}) do
+        if valid(q) and try(function() return q:GetAddress() end) ~= ma and try(function() return q.Role end) ~= 3 then return q end
+    end
+    return nil
+end
+function fsToHost(kind, data)
+    if not valid(fsComp) then
+        local ok, c = pcall(writeMyComponent)
+        fsComp = ok and c or nil
+    end
+    if valid(fsComp) then return (pcall(function() fsComp:Server_AddExp(-(FS_BASE + kind * FS_KIND + data)) end)) end
+    return false
+end
+function fsToGuests(text)
+    for _, c in ipairs(fsGuests()) do pcall(function() c:ClientMessage(text, FName("None"), 0) end) end
+end
+function fsHeadWrite(anim, pt, y)
+    if not anim and not fsHeadOn then return end
+    fsHeadOn = anim ~= nil
+    local a = anim and try(function() return anim:GetAddress() end) or 0
+    local f = io.open(WIN64 .. "\\plugins\\CoopNative.head", "w")
+    if f then f:write(string.format("%X %d %d\n", a, pt or 0, y or 0)); f:close() end
+end
+function fsApplyStand(host)
+    local p = fsOther(host)
+    local m = valid(p) and try(function() return p.Mesh end) or nil
+    local anim = valid(m) and try(function() return m:GetAnimInstance() end) or nil
+    if not valid(anim) then return end
+    local ok = pcall(function() anim.isSittingEnd = true end)
+    log("flavor: other player stands up " .. tostring(ok))
+end
+function fsApplySit(host, idx)
+    fsRem.idx = idx
+    if idx == 0 then fsHeadWrite(nil) end
+    local p = fsOther(host)
+    local m = valid(p) and try(function() return p.Mesh end) or nil
+    if not valid(m) then log("flavor: no character for the other player's seat " .. idx); return end
+    local cls = idx > 0 and fsClassOf(idx) or fsStandClass(p)
+    if not valid(cls) then log("flavor: animation class for seat " .. idx .. " not found"); return end
+    local ok, e = pcall(function() m:SetAnimInstanceClass(cls) end)
+    if idx > 0 then
+        local anim = try(function() return m:GetAnimInstance() end)
+        if valid(anim) then
+            pcall(function() anim.isSittingLoop = true end)
+            -- until his first numbers come: looking straight ahead, not where our own camera looks
+            fsHeadWrite(anim, 0, math.floor(try(function() return p:K2_GetActorRotation().Yaw end) or 0))
+        end
+        if host and fsRem.x and fsRem.y and fsRem.z then
+            -- the host simulates his character: without this he stays where he stood, here and after the next correction on his PC too
+            local to, rot = { X = fsRem.x, Y = fsRem.y, Z = fsRem.z }, { Pitch = 0, Yaw = fsRem.yaw or 0, Roll = 0 }
+            local gm = try(function() return p.CharacterMovement end)
+            if valid(gm) then pcall(function() gm:StopMovementImmediately() end) end
+            local okm = pcall(function() p:K2_SetActorLocationAndRotation(to, rot, false, {}, true) end)
+            if not okm then pcall(function() p:K2_TeleportTo(to, rot) end) end
+        end
+    end
+    log("flavor: other player's seat -> " .. idx .. " " .. (ok and "ok" or tostring(e):sub(1, 100)))
+end
+function fsApplyHead(host, y, pt, px)
+    if fsRem.idx == 0 then return end
+    local p = fsOther(host)
+    local m = valid(p) and try(function() return p.Mesh end) or nil
+    local anim = valid(m) and try(function() return m:GetAnimInstance() end) or nil
+    if not valid(anim) then return end
+    fsHeadWrite(anim, pt, y)
+    pcall(function() anim.PressX = px end)
+end
+function fsJukes()
+    local out = {}
+    for _, j in ipairs(FindAllOf("BP_FieldTrigger_Jukebox_C") or {}) do if valid(j) then out[#out + 1] = { n = name(j), j = j } end end
+    table.sort(out, function(a, b) return a.n < b.n end)
+    return out
+end
+function fsApplyJuke(id, idx, on)
+    local e = fsJukes()[id]
+    if not e then return end
+    fsJukeSeen[id] = idx .. ":" .. tostring(on)
+    pcall(function() e.j.SelectIndex = idx end)
+    local ok, er = pcall(function() if on then e.j:RequestPlay() else e.j:RequestStop() end end)
+    log("flavor: jukebox " .. e.n .. " -> track " .. idx .. ", " .. (on and "on" or "off") .. " " .. (ok and "ok" or tostring(er):sub(1, 100)))
+end
+function fsHostIn()
+    local path = WIN64 .. "\\plugins\\CoopNative.flavorin"
+    local f = io.open(path, "r")
+    if not f then return end
+    local text = f:read("*a") or ""
+    f:close(); os.remove(path)
+    for line in text:gmatch("[^\r\n]+") do
+        local v = tonumber(line)
+        if v then
+            local kind, data = v // FS_KIND, v % FS_KIND
+            if kind == 1 then fsApplySit(true, data)
+            elseif kind == 2 then fsRem.x = data - 8388608
+            elseif kind == 3 then fsRem.y = data - 8388608
+            elseif kind == 4 then fsRem.z = data - 8388608
+            elseif kind == 5 then fsRem.yaw = data / 10 - 360
+            elseif kind == 6 then
+                local px = data >= 4194304
+                if px then data = data - 4194304 end
+                fsApplyHead(true, data // 2048 - 512, data % 2048 - 512, px)
+            elseif kind == 10 then fsApplyStand(true)
+            elseif kind == 7 then fsApplyJuke(data // 4096, (data % 4096) // 2, data % 2 == 1)
+            elseif kind == 9 then
+                local ours = fsKitNumber()
+                log("flavor: the guest runs kit " .. data .. ", we run " .. ours .. (data == ours and "" or "  *** DIFFERENT KITS ***"))
+            elseif kind == 8 then
+                log("flavor: the guest is in Home Base, sending our state")
+                for id, e in ipairs(fsJukes()) do
+                    local idx, on = try(function() return e.j.SelectIndex end), try(function() return e.j.bShouldPlay end)
+                    if idx then fsToGuests(string.format("CoopFS:juke:%d:%d:%d", id, idx, on and 1 or 0)) end
+                end
+                if fsMine.idx > 0 then fsToGuests("CoopFS:sit:" .. fsMine.idx) end
+            end
+        end
+    end
+end
+function fsGuestIn()
+    for _, m in ipairs(fsIn) do
+        local s = m:match("^CoopFS:sit:(%d+)$")
+        if s then fsApplySit(false, tonumber(s)) end
+        local y, pt, px = m:match("^CoopFS:head:(-?%d+):(-?%d+):(%d)$")
+        if y then fsApplyHead(false, tonumber(y), tonumber(pt), px == "1") end
+        if m == "CoopFS:stand" then fsApplyStand(false) end
+        local id, idx, on = m:match("^CoopFS:juke:(%d+):(%d+):(%d)$")
+        if id then fsApplyJuke(tonumber(id), tonumber(idx), on == "1") end
+    end
+end
+function flavorSyncTick()
+    if not FS_ON then return end
+    local now = os.clock()
+    if now - fsAt < 0.2 then return end
+    fsAt = now
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not valid(gs) then return end
+    local host = try(function() return gs.Role end) == 3
+    if host then fsHostIn() else fsGuestIn() end
+    fsIn = {}
+    if now - fsBaseAt > 1 then fsBaseAt = now; fsInBase = hbInBase() end
+    if not fsInBase then
+        if fsRem.idx ~= 0 then fsRem.idx = 0 end
+        fsMine = { idx = 0, since = 0, sent = true }
+        fsHello, fsJukeSeen = false, {}
+        if fsSeatsSent then fsSeatsWrite("me 0\n", "cleared"); fsSeatsSent = nil end
+        fsSeatsSince, fsMyChar = 0, nil
+        fsSeatOn, fsTrigOff = {}, {}
+        fsHeadWrite(nil)
+        return
+    end
+    if host and #fsGuests() == 0 then return end
+    if not host and not fsHello then fsHello = true; fsToHost(8, 0) end
+    if not host and not fsKitSent then fsKitSent = fsToHost(9, fsKitNumber()) end
+    local pc = localPC()
+    local pawn = valid(pc) and try(function() return pc.Pawn end) or nil
+    if valid(pawn) and name(pawn):find("BP_Player", 1, true) then fsMyChar = pawn end
+    pawn = fsMyChar
+    if not valid(pawn) then return end
+    fsSeatsTick(host, now)
+    local m = try(function() return pawn.Mesh end)
+    local anim = valid(m) and try(function() return m:GetAnimInstance() end) or nil
+    if not valid(anim) then return end
+    local idx = FS_INDEX[(name(anim):gsub("_%d+$", ""))] or 0
+    if idx ~= fsMine.idx then
+        fsMine = { idx = idx, since = now, sent = idx == 0 }
+        if idx == 0 then
+            if host then fsToGuests("CoopFS:sit:0") else fsToHost(1, 0) end
+            log("flavor: we stood up")
+        end
+    end
+    if fsMine.idx > 0 and not fsMine.sent and now - fsMine.since >= 0.5 then   -- the seat move comes a moment after the animation
+        fsMine.sent = true
+        if host then
+            fsToGuests("CoopFS:sit:" .. fsMine.idx)
+        else
+            local loc = try(function() return pawn:K2_GetActorLocation() end)
+            local rot = try(function() return pawn:K2_GetActorRotation() end)
+            if loc and rot then
+                fsToHost(2, math.floor(loc.X) + 8388608)
+                fsToHost(3, math.floor(loc.Y) + 8388608)
+                fsToHost(4, math.floor(loc.Z) + 8388608)
+                fsToHost(5, math.floor((rot.Yaw + 360) * 10))
+            end
+            fsToHost(1, fsMine.idx)
+        end
+        log("flavor: we sat down, seat " .. fsMine.idx)
+        fsHeadY, fsHeadP = 100000, 100000
+    end
+    if fsMine.idx > 0 and fsMine.sent then
+        -- our camera, which is what the animation reads; 11-06 22:3x: DirectionYaw written from here was overwritten every frame
+        local cmr = valid(pc) and try(function() return pc.PlayerCameraManager end) or nil
+        local r = valid(cmr) and try(function() return cmr:GetCameraRotation() end) or nil
+        local y, pt = r and try(function() return r.Yaw end), r and try(function() return r.Pitch end)
+        local px = try(function() return anim.PressX end) == true
+        if type(y) == "number" and type(pt) == "number" then
+            y, pt = (y + 180) % 360 - 180, (pt + 180) % 360 - 180
+            if math.abs(y - fsHeadY) > 2 or math.abs(pt - fsHeadP) > 2 or px ~= fsHeadX then
+                fsHeadY, fsHeadP, fsHeadX = y, pt, px
+                local yi, pi = math.floor(y), math.floor(pt)
+                if host then fsToGuests(string.format("CoopFS:head:%d:%d:%d", yi, pi, px and 1 or 0))
+                else fsToHost(6, (px and 4194304 or 0) + (yi + 512) * 2048 + pi + 512) end
+            end
+        end
+        if not fsMine.standing and try(function() return anim.isSittingEnd end) == true then
+            fsMine.standing = true
+            if host then fsToGuests("CoopFS:stand") else fsToHost(10, 0) end
+            log("flavor: we are standing up")
+        end
+    end
+    if now - fsJukeAt > 0.5 then
+        fsJukeAt = now
+        for id, e in ipairs(fsJukes()) do
+            local jx, on = try(function() return e.j.SelectIndex end), try(function() return e.j.bShouldPlay end)
+            if type(jx) == "number" then
+                local key = jx .. ":" .. tostring(on == true)
+                if fsJukeSeen[id] == nil then fsJukeSeen[id] = key
+                elseif key ~= fsJukeSeen[id] then
+                    fsJukeSeen[id] = key
+                    if host then fsToGuests(string.format("CoopFS:juke:%d:%d:%d", id, jx, on and 1 or 0)) else fsToHost(7, id * 4096 + jx * 2 + (on and 1 or 0)) end
+                    log("flavor: our jukebox " .. e.n .. " -> track " .. jx .. ", " .. (on and "on" or "off"))
+                end
+            end
+        end
+    end
+end
 local function guestRestRequest()
     local f = io.open(RESTREQ, "r"); if not f then return end
     f:close(); os.remove(RESTREQ)
@@ -2231,6 +2753,10 @@ local function resyncAfterMenu()
     if os.clock() - menuClosedAt < 2 then return end
     menuClosedAt = nil
     menuWatch = false
+    -- 11-06 22:21: the host's game had crashed, he was back in his own world and this resync still ran: the game's join-time sender never returned (realloc fatal error).
+    -- Only with a host: the game state has role 1 on a guest and 3 when he is alone.
+    local gsr = FindFirstOf("BP_AppGameState_C")
+    if not valid(gsr) or tostring(try(function() return gsr.Role end)) ~= "1" then log("guest rest: no host any more, no resync"); return end
     local pc = localPC()
     local mine = valid(pc) and try(function() return pc.Pawn end) or nil
     if not valid(mine) then return end
@@ -2631,6 +3157,10 @@ local function probeCommands()
     if world then pcall(visMirrorHost) end
     if world then pcall(visMirrorGuest) end
     if world then
+        local okf, ef = pcall(flavorSyncTick)
+        if not okf and not fsErr then fsErr = true; log("flavor sync ERROR " .. tostring(ef):sub(1, 160)) end
+    end
+    if world then
         local okr, er = pcall(recTick)
         if not okr and not recErr then recErr = true; log("rec ERROR " .. tostring(er):sub(1, 160)) end
     end
@@ -2702,6 +3232,21 @@ local function probeCommands()
         log("fname: " .. table.concat(out, " "))
     elseif c == "rec" then
         recEvent("mark")
+    elseif c == "recforcehost" then
+        -- solo: the game's own "force this layout" slot on the host, to the other layout of the same group
+        for _, l in ipairs(FindAllOf("ScenarioProgressLoader") or {}) do
+            if valid(l) and name(l):find("Base0", 1, true) then
+                local cur = try(function() return l.ProgressName:ToString() end) or ""
+                if cur:find("ScenarioLayout", 1, true) then
+                    local nm = cur:sub(1, -2) .. (cur:sub(-1) == "2" and "1" or "2")
+                    local okS, eS = pcall(function() l.ForcedProgressName = FName(nm) end)
+                    local got = try(function() return l.ForcedProgressName:ToString() end)
+                    local okR, eR = pcall(function() l:ReloadProgress() end)
+                    log("rec force: " .. name(l) .. " was " .. cur .. ", forced " .. tostring(got) .. " set " .. (okS and "ok" or tostring(eS):sub(1, 100)) .. ", reload " .. (okR and "ok" or tostring(eR):sub(1, 100)))
+                end
+            end
+        end
+        recEvent("force")
     elseif c == "recforce" then
         local nm
         for _, l in ipairs(FindAllOf("ScenarioProgressLoader") or {}) do
@@ -2907,6 +3452,17 @@ LoopAsync(200, function()
     end)
     return false
 end)
+
+-- key presses at the piano are short: 50 ms, only while sitting there
+-- (off by default: the only crash at the piano, UE4SS.dll +0x2AE933 on standing up, 17:38, came with this poll; two stand-ups without it were fine)
+if FLAVOR then
+    LoopAsync(50, function()
+        if not coopEngineReady() then return false end
+        if not flavorPianoOn then return false end
+        ExecuteInGameThread(function() pcall(flavorPianoPoll) end)
+        return false
+    end)
+end
 
 -- engine leave/kick/travel paths (client RPCs run on the guest; game mode calls on the host)
 local HOOKS = {
