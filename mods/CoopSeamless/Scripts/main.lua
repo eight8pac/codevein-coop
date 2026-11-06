@@ -9,8 +9,9 @@
 -- config.txt in the mod folder (read every second):  enabled=1  host=auto|always|off  guest=auto|always|off
 -- Proposal 2026-11-03, all off by default (solo offline test 2026-11-04: sessiondiag signatures and remember; the rest untested):
 --   sessiondiag=1   log only: signatures of the search/join functions, and after any search the info string of each found signal
---   lockhost=1      guest: search and look for the host he joined by hand among the signals; logs the match, does not join yet
 --   remember=1      keep the role and the host's name in state.txt, so auto mode is back after a crash or a restart
+-- (lockhost, "rejoin only this host", was dropped on 2026-11-05: the info string of a found signal is a lobby ID, which a
+-- re-host changes, and the session now stays alive through deaths and boss kills; #4)
 --   versioncheck=1  host sends his kit number (plugins\CoopKitVersion.txt) and a fingerprint of CoopSeamless/CoopProbe/
 --                   CoopProgress to a guest who joins; the guest logs what differs
 local TAG = "[CoopSeamless] "
@@ -23,7 +24,7 @@ local function log(s) print(TAG .. os.date("%H:%M:%S ") .. tostring(s) .. "\n") 
 local function valid(o) return o ~= nil and o:IsValid() end
 local function try(f, ...) local ok, v = pcall(f, ...); if ok then return v end return nil end
 
-local cfg = {enabled = "1", host = "auto", guest = "auto", sessiondiag = "0", lockhost = "0", remember = "0", versioncheck = "0"}
+local cfg = {enabled = "1", host = "auto", guest = "auto", sessiondiag = "0", remember = "0", versioncheck = "0"}
 local function readConfig()
     local f = io.open(MOD_DIR .. "\\config.txt", "r")
     if not f then return end
@@ -41,7 +42,7 @@ local publicConnections = 3        -- what the vanilla field menu passes (BP_Fie
 local calmSince, lastCreate, lastOpen, lastSearch = nil, -1e9, -1e9, -1e9
 local lastLine, lastPawnName = "", ""
 local wasHosting, wasJoined = false, false   -- previous tick, for start-of-session detection
-local lockedHost = nil             -- lockhost: the one host this guest rejoins (his PlayerName, i.e. the Steam name)
+local savedHost = nil              -- remember: the host's PlayerName (Steam name), written to state.txt and logged
 
 local function localName()         -- our own PlayerName (Steam name), nil while there is no local PlayerState
     for _, pc in ipairs(FindAllOf("PlayerController") or {}) do
@@ -153,17 +154,14 @@ local function callWithCaller(what, f)
     log(what .. (ok and " sent" or (" FAILED " .. tostring(err))))
 end
 
--- Search/join by host (proposal 2026-11-03). App_GameInstance has Event_SearchLobby(MaxResult, UseLAN, Caller) and
+-- Session diagnostics (proposal 2026-11-03). App_GameInstance has Event_SearchLobby(MaxResult, UseLAN, Caller) and
 -- Event_JoinSession(SearchResult: BlueprintSessionResult, Caller) next to Event_FindAndJoinSession. The game's session manager
 -- (AppSessionManager_0, an AppOnlineWrapper) has GetFoundOnlineSessionsCount() -> int, GetFoundOnlineSessionInfo(index) ->
 -- string and JoinOnlineSessionLatent(WorldContextObject, LatentInfo, index, ConnectOption). GetOnlineSessionResult() returns a
--- bool, not a session (sessiondiag, solo offline test 2026-11-04), so no BlueprintSessionResult can be read from Lua and
--- Event_JoinSession cannot be called with a found signal: lockhost finds the host's signal by its info string and logs it, but
--- does not join yet. What the info string holds (owner name or not) is unknown until a search with a real signal is logged.
+-- bool, not a session (solo offline test 2026-11-04), so no BlueprintSessionResult can be read from Lua. On two PCs
+-- (2026-11-04) the info string of a found signal was an 18-digit number starting with 109775, most likely the Steam lobby ID.
 -- Parameter names and order are read from the UFunctions at run time: an unknown parameter stops the call.
--- Guests join through the distress signal only: ShowInviteUI (Steam invite) is listed by sessiondiag, never called.
--- Next to CoopProbe (polls IsOnlineMultiplay / GetRescueSignalState every second) and CoopNative (answers some session checks
--- on the guest): the search below only runs while the guest is out of any session, the same moment as the vanilla retry.
+-- ShowInviteUI (Steam invite) is listed by sessiondiag, never called.
 local GI_PATH = "/Game/Modes/App_GameInstance.App_GameInstance_C:"
 local IF_OWNERS = {"/Script/Extensions.AppSessionManager:", "/Script/Extensions.AppOnlineWrapper:", "/Script/Extensions.AppOnlineWrapperIF:"}
 local function paramNames(path)
@@ -208,7 +206,6 @@ local function logSignatures()
 end
 
 -- the found signals after a search: { {index = i, info = <GetFoundOnlineSessionInfo string>}, ... } or nil + reason
-local SEARCH_VALUES_BASE = {Caller = "nil", JoinSessionCaller = "nil", SearchLobbyCaller = "nil", MaxResult = 50, UseLAN = false, bUseLAN = false}
 local function foundSessions(s)
     local cPath, cNames = findFn("GetFoundOnlineSessionsCount")
     local iPath, iNames = findFn("GetFoundOnlineSessionInfo")
@@ -223,30 +220,6 @@ local function foundSessions(s)
         list[#list + 1] = {index = i, info = info}
     end
     return list
-end
-
--- lockhost: 1) Event_SearchLobby, 2) when the search is over, join the signal whose owner is lockedHost, else wait
-local pickPending, pickSince = false, 0
-local function searchForHost(s)
-    local n = paramNames(GI_PATH .. "Event_SearchLobby")
-    if not n then log("lockhost: Event_SearchLobby not found -> no join"); return end
-    local ok, err = callByNames(s.gi, "Event_SearchLobby", n, SEARCH_VALUES_BASE)
-    log("lockhost: searching for " .. tostring(lockedHost) .. (ok and "" or (" FAILED " .. tostring(err))))
-    if ok then pickPending, pickSince = true, os.time() end
-end
-local function pickHost(s)
-    pickPending = false
-    local list, why = foundSessions(s)
-    if not list then log("lockhost: cannot read the results (" .. tostring(why) .. ") -> no join"); return end
-    local infos = {}
-    for _, e in ipairs(list) do
-        infos[#infos + 1] = tostring(e.info)
-        if e.info and e.info:find(lockedHost, 1, true) then
-            log("lockhost: " .. lockedHost .. " found at index " .. e.index .. " (" .. e.info .. "); joining by index is not written yet -> no join")
-            return
-        end
-    end
-    log("lockhost: " .. lockedHost .. " is not among " .. #list .. " signal(s) [" .. table.concat(infos, " | ") .. "] -> waiting")
 end
 
 -- versioncheck: the kit number (plugins\CoopKitVersion.txt, read the way CoopProbe shows it on the title screen) and FNV-1a of
@@ -324,7 +297,7 @@ local function tick()
         if st and st.role == "host" and cfg.host ~= "off" then
             hostSticky = true; log("remember: host mode on from state.txt")
         elseif st and st.role == "guest" and cfg.guest ~= "off" then
-            guestSticky = true; lockedHost = st.host; log("remember: guest mode on from state.txt (host: " .. tostring(st.host) .. ")")
+            guestSticky = true; savedHost = st.host; log("remember: guest mode on from state.txt (host: " .. tostring(st.host) .. ")")
         end
     end
     if cfg.sessiondiag == "1" and not sigLogged then sigLogged = true; logSignatures() end
@@ -371,12 +344,14 @@ local function tick()
         end
         hostName = table.concat(names, " + ")   -- everyone in the session; logged only
         log("guest mode on (joined a host; players: " .. hostName .. ")")
-        -- lockhost: with one guest (vanilla cap) the one other name is the host
-        local me = localName()
-        local others = {}
-        for _, n in ipairs(names) do if n ~= me then others[#others + 1] = n end end
-        if #others == 1 then lockedHost = others[1] else log("lockhost: " .. #others .. " other players, host not known") end
-        if cfg.remember == "1" then saveState("guest", lockedHost) end
+        if cfg.remember == "1" then
+            -- with one guest (vanilla cap) the one other name is the host
+            local me = localName()
+            local others = {}
+            for _, n in ipairs(names) do if n ~= me then others[#others + 1] = n end end
+            savedHost = #others == 1 and others[1] or nil
+            saveState("guest", savedHost)
+        end
     end
     local wantHost = s.authority and (cfg.host == "always" or (cfg.host == "auto" and hostSticky))
     local wantGuest = cfg.guest == "always" or (cfg.guest == "auto" and guestSticky)
@@ -407,14 +382,7 @@ local function tick()
             if not ok then log("OpenOnlineSession FAILED " .. tostring(err)) end
         end
     elseif wantGuest and s.authority and not s.multi and not s.created and not s.searching then
-        if cfg.lockhost == "1" and lockedHost then
-            if pickPending then
-                if now - pickSince >= 3 then pickHost(s) end
-            elseif now - lastSearch >= GUEST_RETRY_S then
-                lastSearch = now
-                searchForHost(s)
-            end
-        elseif now - lastSearch >= GUEST_RETRY_S then
+        if now - lastSearch >= GUEST_RETRY_S then
             lastSearch = now
             log("guest: not connected -> Event_FindAndJoinSession (last host: " .. tostring(hostName) .. ")")
             callWithCaller("Event_FindAndJoinSession", function(c) s.gi:Event_FindAndJoinSession(c) end)
