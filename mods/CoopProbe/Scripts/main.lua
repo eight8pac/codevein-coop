@@ -651,8 +651,15 @@ local function groupTeleport()
         end
     end
     if not pendingTp then return end
-    local limit = pendingTp.memend and 180 or 60
-    if os.clock() - pendingTp.at > limit then log("group teleport: host did not arrive within " .. limit .. " s, given up"); pendingTp = nil; return end
+    local limit = pendingTp.memend and 300 or 60
+    if os.clock() - pendingTp.at > limit then
+        if pendingTp.memend and not pendingTp.finishedAt then
+            log("group teleport: no finished report within " .. limit .. " s -> bringing the guests anyway")
+            pendingTp.finishedAt = os.clock() - 2
+        elseif not pendingTp.memend then
+            log("group teleport: host did not arrive within " .. limit .. " s, given up"); pendingTp = nil; return
+        end
+    end
     local gs = FindFirstOf("BP_AppGameState_C")
     if not valid(gs) or try(function() return gs.Role end) ~= 3 then return end
     local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
@@ -666,25 +673,34 @@ local function groupTeleport()
     pendingTp.newSeenAt = pendingTp.newSeenAt or os.clock()
     if os.clock() - pendingTp.newSeenAt < 3 then return end   -- let the host's area finish loading
     if pendingTp.memend then
-        local ignored = try(function() return pc:IsMoveInputIgnored() end)
-        if ignored ~= false then pendingTp.freeAt = nil; return end
-        pendingTp.freeAt = pendingTp.freeAt or os.clock()
-        if os.clock() - pendingTp.freeAt < 2 then return end
-        log("group teleport: host can move again after the final cutscene -> bringing the guests")
+        -- 2026-11-05: "can move" came 2 s into the final cutscene (it does not block move input): the guest spawned into the host's
+        -- cutscene with the join message. The game's own report of the finished scene is the real end.
+        if not pendingTp.finishedAt or os.clock() - pendingTp.finishedAt < 2 then return end
+        log("group teleport: the final cutscene finished -> bringing the guests")
+        memendBring = true
     end
     pendingTp = nil
     -- by remote controller: right after the teleport the host's old pawn still exists and was taken for a guest (spawned twice)
     local n = 0
     for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
-        local p = valid(c) and not try(function() return c:IsLocalController() end) and try(function() return c.Pawn end) or nil
-        if valid(p) and name(p):find("BP_Player_C", 1, true) and not try(function() return helper:IsDeath(p) end) then
-            if respawnGuest(helper, p, mine, true) then
-                oldPawns[#oldPawns + 1] = { p = p, n = name(p), at = os.clock() }
-                n = n + 1
+        if valid(c) and not try(function() return c:IsLocalController() end) then
+            local p = try(function() return c.Pawn end)
+            local isPlayer = valid(p) and name(p):find("BP_Player_C", 1, true) ~= nil
+            if isPlayer and not try(function() return helper:IsDeath(p) end) then
+                if respawnGuest(helper, p, mine, true) then
+                    oldPawns[#oldPawns + 1] = { p = p, n = name(p), at = os.clock() }
+                    n = n + 1
+                end
+            elseif not isPlayer and memendBring then
+                -- 2026-11-05: at the end of the final cutscene his character was gone ("0 guests brought") and he stayed out of bounds until
+                -- the host's rest: the spawn works from the controller alone, as at a rest
+                log("group teleport: guest has no character -> spawning him next to the host")
+                if respawnGuest(helper, nil, mine, true) then n = n + 1 end
             end
         end
     end
     log("group teleport: " .. n .. " guest(s) brought to the host")
+    memendBring = false
 end
 -- memory state on the host (set by the scene relay): memHostOn while the memory runs; memFollowAt = a host skip to follow;
 -- memRespawnAt = a guest character removed during the memory, to be spawned again next to the host
@@ -938,6 +954,15 @@ local function tpfadeSend(ctx, on)
     c:write(string.format("tpfade %X %d\n", ctx, on and 1 or 0)); c:close()
     return true
 end
+-- 2026-11-05: at the final cutscene his scene started on time, but under this fade, which lifted only when his new character stood
+-- next to the host, 6 s later (owner: "not synced"). The game's own reports say when the scene starts: lift the fade when both are in.
+tpfReady = {}
+pcall(function()
+    RegisterHook("/Script/Extensions.ScenarioPlayerComponent:MulticastSetReadyToPlay", function(ctx, b)
+        local v = try(function() return b:get() end)
+        if v ~= nil then tpfReady[v and "host" or "guest"] = true end
+    end)
+end)
 local function guestTeleportFade()
     local gs = FindFirstOf("BP_AppGameState_C")
     if not valid(gs) or try(function() return gs.Role end) == 3 then return end
@@ -952,10 +977,12 @@ local function guestTeleportFade()
     local hostName = valid(host) and name(host) or nil
     if tpfOnAt then
         if mineName and mineName ~= tpfMine and not tpfMineAt then tpfMineAt = os.clock() end
-        local done = (tpfMineAt and os.clock() - tpfMineAt > 1.5) or os.clock() - tpfOnAt > 25
+        local scene = tpfReady.host and tpfReady.guest
+        local done = scene or (tpfMineAt and os.clock() - tpfMineAt > 1.5) or os.clock() - tpfOnAt > 25
         local ctx = valid(mine) and try(function() return mine:GetAddress() end)
+        if not ctx and valid(pc) then ctx = try(function() return pc:GetAddress() end) end
         if done and ctx and tpfadeSend(ctx, false) then
-            log("teleport fade: lifted (" .. (tpfMineAt and "our new character is next to the host" or "timeout") .. ")")
+            log("teleport fade: lifted (" .. (scene and "both games ready, the scene starts" or (tpfMineAt and "our new character is next to the host" or "timeout")) .. ")")
             tpfOnAt, tpfMineAt = nil, nil
         end
     elseif tpfMessageAt then
@@ -964,6 +991,7 @@ local function guestTeleportFade()
         elseif ctx and tpfadeSend(ctx, true) then
             log("teleport fade: host's message -> fade")
             tpfOnAt, tpfMine, tpfMessageAt = os.clock(), mineName, nil
+            tpfReady = {}
         end
     elseif false then
         if tpfHost and tpfHostAlive and hostName ~= tpfHost and tpfHostPos and not tpfWaitAt then
@@ -1091,6 +1119,14 @@ function veilWatch()
         end
     end
 end
+-- 2026-11-05: the guest was only pulled along on a skip; when a scene in the memory ended by itself he stayed behind. The game's own
+-- report of a finished scene starts the same follow.
+pcall(function()
+    RegisterHook("/Script/Extensions.ScenarioPlayerComponent:MulticastSetReadyToFinish", function(ctx, b)
+        if memHostOn then memFollowAt = os.clock() end
+        if pendingTp and pendingTp.memend and not pendingTp.finishedAt then pendingTp.finishedAt = os.clock() end
+    end)
+end)
 local RELAY_PATH = WIN64 .. "\\plugins\\CoopNative.relay"
 os.remove(RELAY_PATH)
 local relayAt, localEvents, relayIn = -1000, {}, {}
@@ -1869,6 +1905,19 @@ function chestSyncGuest()
     end
     chestIn = {}
 end
+-- Cutscene sync trace (2026-11-05, log only): CoopNative samples the scenario manager's ready flags, it only needs the address.
+sceneMgrAt, sceneMgrSent = -1000, nil
+function sceneMgrSend()
+    if os.clock() - sceneMgrAt < 5 then return end
+    sceneMgrAt = os.clock()
+    local m = FindFirstOf("ScenarioManager")
+    local ad = valid(m) and try(function() return m:GetAddress() end)
+    if not ad or ad == sceneMgrSent then return end
+    sceneMgrSent = ad
+    local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
+    if c then c:write(string.format("scenmgr %X\n", ad)); c:close() end
+    log(string.format("scene flags: manager %X %s", ad, name(m)))
+end
 -- Co-op version on the title screen (owner 2026-11-03: to see that both PCs run the same kit). The game's version text on the
 -- title gets "  /  co-op <kit>" appended (plugins\\CoopKitVersion.txt).
 -- v2 (2026-11-03, after title-screen crashes inside UE4SS): no search while menus are being built. Every 2 s only a cheap check
@@ -1957,6 +2006,7 @@ local function probeCommands()
     if world then pcall(bloodCodeSyncGuest) end
     if world then pcall(chestSyncHost) end
     if world then pcall(chestSyncGuest) end
+    if world then pcall(sceneMgrSend) end
     pcall(guestMemoryControl)
     pcall(guestTeleportFade)
     if world then pcall(memoryFollow) end

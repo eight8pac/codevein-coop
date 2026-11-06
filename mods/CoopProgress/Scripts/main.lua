@@ -432,6 +432,12 @@ hook("/Script/Extensions.BossAreaBase:MulticastGainRewards", function(ctx, ...)
     end
 end)
 
+-- 2026-11-06: when a cutscene's picture really starts: the ready flags and the audio prepare line do not show it (5 s gap on screen)
+hook("/Script/MovieScene.MovieSceneSequencePlayer:Play", function(ctx)
+    local o = try(function() return ctx:get() end)
+    journal("SYNC", "SequencePlayer:Play " .. (valid(o) and tostring(try(function() return o:GetFullName() end)):sub(1, 140) or "?"))
+end)
+
 -- Story flags. Hooks on the UAppSaveManager setters register but saw nothing while Boss_St07's flags changed (solo test
 -- 2026-10-28): the game sets them natively. They stay as a cheap signal; the flag store itself is diffed below.
 for _, fn in ipairs({"SetGameProgress", "SetGameProgressInt"}) do
@@ -442,6 +448,11 @@ end
 -- the guest asks with ServerSetSyncedSymbols, the host answers everyone with MulticastSetSyncedSymbols (symbols, results).
 for _, fn in ipairs({"ScenarioPlayerComponent:MulticastSetSyncedSymbols", "ScenarioPlayerComponent:ServerSetSyncedSymbols",
                      "ScenarioPlayerComponent:MulticastFlowDiagramSetSyncedSymbols", "ScenarioPlayerComponent:ServerFlowDiagramSetSyncedSymbols",
+                     "ScenarioManager:StartLargePolyLoad", "ScenarioManager:PrepareLargePolySequence", "ScenarioManager:PlayLargePolySequence", "ScenarioManager:PlayLargePoly",
+                     "ScenarioPlayerComponent:ServerSetReadyToPlay", "ScenarioPlayerComponent:MulticastSetReadyToPlay",
+                     "ScenarioPlayerComponent:ServerSetReadyToFinish", "ScenarioPlayerComponent:MulticastSetReadyToFinish",
+                     "ScenarioPlayerComponent:ServerSetReadyToSkip", "ScenarioPlayerComponent:ServerSetOnlineMultiplaySynced",
+                     "ScenarioPlayerComponent:MulticastSetOnlineMultiplaySynced",
                      "HumanContextComponent:Client_AddExp", "HumanContextComponent:Server_AddExp"}) do
     hook("/Script/Extensions." .. fn, function(ctx, ...)
         local parts = {}
