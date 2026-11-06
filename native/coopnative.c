@@ -83,6 +83,7 @@ static volatile LONG g_keep_outro;        // keep_outro=1: keep the guest throug
 static volatile LONG g_guest_outro;       // guest_outro=1 (guest): play the outro along, block his own copy of the memory
 static volatile LONG g_guest_mem_block;   // guest_memory_block=1: block the guest's own memory copy (step a); off = both run it (step 2)
 static volatile LONG g_partner_override = 1;
+static volatile LONG g_scene_wait = 1;   // scene_start_wait=0: scenes in the memory window start without waiting for the other player
 static volatile ULONGLONG g_memory_start_at;   // PlayMemoryResidue seen (both PCs): option A answers the partner checks for 15 min
 static volatile LONG g_memstart_tp = 1;   // memory_start_teleport=0: no group teleport of the guest at the memory start (step 2)   // outro_partner_override=0: the four "partner ready" answers off (session 10)
 // Player 0 on the host (session 10): the museum (memory) asks GetPlayerController(ctx, 0) whether "the player" is ready and stayed
@@ -600,7 +601,21 @@ static void dump_game_thread(ULONGLONG silent_ms) {
 // Work that must run on the game thread. Pumped every frame by the GameEngine::Tick hook below and, as before, by the
 // GetRescueSignalState hook (fallback: that one only runs while Blueprints poll it, about once a second). Each item is taken with
 // an InterlockedExchange, so whichever pump comes first runs it once.
+// Cutscene sync trace (2026-11-05, log only): the scenario manager's ready flags, logged on every change. +0x20C own models ready,
+// +0x20D partner's, +0x20E partner finished, +0x20F/+0x210 the cutscene's finished check, +0x211/+0x212 multiplay synced.
+static volatile uintptr_t g_scen_mgr;
+static void scene_flags_sample(void) {
+    static uint8_t last[7]; static int have; static uintptr_t lastm;
+    uintptr_t m = g_scen_mgr;
+    if (!m || !readable(m + 0x20C, 7)) return;
+    const uint8_t *f = (const uint8_t *)(m + 0x20C);
+    if (have && lastm == m && memcmp(last, f, 7) == 0) return;
+    memcpy(last, f, 7); have = 1; lastm = m;
+    logf_("scene flags: ready own %u partner %u | partner finished %u | finished %u %u | synced %u %u",
+          last[0], last[1], last[2], last[3], last[4], last[5], last[6]);
+}
 static void game_thread_work(void) {
+    scene_flags_sample();
     if (g_unfade_pending && InterlockedExchange(&g_unfade_pending, 0)) run_unfade();
     if (g_memunfade_pending && InterlockedExchange(&g_memunfade_pending, 0)) {
         uintptr_t actor = g_memory_actor;
@@ -1135,6 +1150,17 @@ static uint8_t detour_multiplay(void *ctx) {
     // option A (session 10): the outro keeps the game's own sync (outro_partner_override=0); from the memory start on (15 min:
     // memory, its scenes, the cutscene out of it) the checks are answered again, so neither game waits for the other's copy
     int memwin = g_memory_start_at && GetTickCount64() - g_memory_start_at < 900000;
+    // 2026-11-05: the trace showed both games send their ready reports in the memory and the final cutscene too; the 5 s gap between
+    // the PCs came from the answer below (the guest did not wait for the host's load). The scene start now gets the game's real answer,
+    // so each game waits for the other, for at most 10 s; then the old answer takes over, so a missing report cannot hang a scene.
+    if (r && g_keep_outro && g_scene_wait && memwin && caller == OUTRO_POLY_CALLER) {
+        static ULONGLONG start, lastp; static int gaveup;
+        ULONGLONG now = GetTickCount64();
+        if (now - lastp > 3000) { start = now; gaveup = 0; logf_("scene start: waiting for the other player (game's own sync, 10 s at most)"); }
+        lastp = now;
+        if (now - start < 10000) return r;
+        if (!gaveup) { gaveup = 1; logf_("scene start: no report after 10 s -> not waiting any longer"); }
+    }
     if (r && g_keep_outro && (g_partner_override || memwin) && (caller == OUTRO_POLY_CALLER || caller == OUTRO_POLY_END_CALLER || caller == OUTRO_POLY_FIN_CALLER ||
                               caller == OUTRO_POLY_X_CALLER)) {
         ULONGLONG now = GetTickCount64();
@@ -1408,6 +1434,9 @@ static void run_command(char *buf) {
     } else if (strncmp(buf, "tpfade ", 7) == 0) {
         unsigned long long ctx = 0; int on = 0;
         if (sscanf(buf + 7, "%llx %d", &ctx, &on) == 2) { g_tpfade_ctx = (uintptr_t)ctx; InterlockedExchange(&g_tpfade_pending, on ? 1 : 0); }
+    } else if (sscanf(buf, "scenmgr %llx", &a) == 1) {
+        if (g_scen_mgr != (uintptr_t)a) logf_("scene flags: scenario manager 0x%llX", a);
+        g_scen_mgr = (uintptr_t)a;
     } else if (sscanf(buf, "restclass %llx", &a) == 1) {
         g_restore_class = (uintptr_t)a;
         logf_("vestige_keep: BP_BCRestorationUIComponent_C class = 0x%llX", a);
@@ -1459,6 +1488,8 @@ static void read_settings(void) {
     if (InterlockedExchange(&g_memstart_tp, mst) != mst) logf_("setting memory_start_teleport = %ld", mst);
     LONG pov = !(have_ini && strstr(buf, "outro_partner_override=0") != NULL);
     if (InterlockedExchange(&g_partner_override, pov) != pov) logf_("setting outro_partner_override = %ld", pov);
+    LONG swt = !(have_ini && strstr(buf, "scene_start_wait=0") != NULL);
+    if (InterlockedExchange(&g_scene_wait, swt) != swt) logf_("setting scene_start_wait = %ld", swt);
     LONG gout = have_ini && strstr(buf, "guest_outro=1") != NULL;
     if (InterlockedExchange(&g_guest_outro, gout) != gout) logf_("setting guest_outro = %ld", gout);
     LONG kout = have_ini && strstr(buf, "keep_outro=1") != NULL;
