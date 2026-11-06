@@ -393,6 +393,30 @@ static void clear_one_lock_flags(uintptr_t a) {
         *(volatile uint8_t *)(a + 0xB83) = 0; *(volatile uint8_t *)(a + 0xB84) = 0; *(volatile uint8_t *)(a + 0xB85) = 0;
     }
 }
+// 2026-11-06: v6 freed the players only. The 22 other holders are the Home Base NPCs: their flags stayed, so they stayed unfinished and invisible
+// until the session ended (12:47:01, all at once; 44 releases on counters already at 0). CoopProbe lists every character in CoopNative.holders.
+static int clear_holder_flags(void) {
+    static char hb[16384];
+    if (!read_small_file("CoopNative.holders", hb, sizeof hb)) return 0;
+    int n = 0;
+    char *q = hb;
+    while (*q) {
+        char *end; unsigned long long v = strtoull(q, &end, 16);
+        if (end == q) break;
+        uintptr_t a = (uintptr_t)v;
+        if (a > 0x10000 && readable(a + 0xB80, 8) && readable(a + 0x28, 0x10) && readable(a + 0xC10, 4)) {
+            uint8_t b83 = *(volatile uint8_t *)(a + 0xB83), b84 = *(volatile uint8_t *)(a + 0xB84), b85 = *(volatile uint8_t *)(a + 0xB85);
+            if ((b83 == 1 || b84 == 1 || b85 == 1) && b83 <= 1 && b84 <= 1 && b85 <= 1) {
+                if (n < 4) logf_("appear lock: holder 0x%llX b83 %u b84 %u b85 %u, tick registered %u enabled %u, pending %u", v, b83, b84, b85,
+                                 *(volatile uint8_t *)(a + 0x35), *(volatile uint8_t *)(a + 0x37), *(volatile uint8_t *)(a + 0xC12));
+                clear_one_lock_flags(a);
+                n++;
+            }
+        }
+        q = end; while (*q == ' ') q++;
+    }
+    return n;
+}
 // only character addresses: "hpawn"/"gpawn" lines of tpinfo (it also lists controllers and drivers) and CoopNative.pawns
 static void clear_player_lock_flags(void) {
     char buf[600];
@@ -933,6 +957,8 @@ static volatile LONG g_group_teleport;
 typedef uint64_t (*spawnimpl_fn)(void *self, int64_t field, int64_t point, void *d, void *e, void *f, void *g, void *h, void *i, void *j, void *k, void *l);
 static spawnimpl_fn g_orig_spawn_impl;
 static volatile LONG g_tp_skip;            // 1 while the current teleport goes to a skipped destination
+static volatile ULONGLONG g_hb_at;         // Home Base teleport with the session kept: start
+static void rec_window(int seconds, const char *why);
 static int g_skip_fields[16], g_skip_n;
 static uint64_t detour_spawn_impl(void *self, int64_t field, int64_t point, void *d, void *e, void *f, void *g, void *h, void *i, void *j, void *k, void *l) {
     int skip = 0;
@@ -940,6 +966,14 @@ static uint64_t detour_spawn_impl(void *self, int64_t field, int64_t point, void
     for (int i = 0; i < g_skip_n; i++) if (g_skip_fields[i] == fid) skip = 1;
     InterlockedExchange(&g_tp_skip, skip);
     logf_("teleport destination: FieldID %d, PointIndex %d%s", fid, pid, skip ? "  (teleport_skip_fields: vanilla behaviour)" : "");
+    if (fid == 0 && !skip) {   // Home Base with the session kept (2026-11-06): CoopProbe watches the levels and holds the character
+        g_hb_at = GetTickCount64();
+        rec_window(85, "Home Base trip");
+        char hp[MAX_PATH + 32];
+        snprintf(hp, sizeof hp, "%sCoopNative.hbwatch", g_dir);
+        FILE *hf = fopen(hp, "w");
+        if (hf) { fputs("1", hf); fclose(hf); }
+    }
     return g_orig_spawn_impl(self, field, point, d, e, f, g, h, i, j, k, l);
 }
 // Second far-teleport test: with that veto the same area-entry code went on to 0x1409F1BA0 (called from 0x146D62972, result
@@ -1001,6 +1035,7 @@ static void detour_switch_end_coop(void *sm) {
         g_vetoed_sm = sm; InterlockedExchange(&g_vetoed_kind, 1);
         return;
     }
+    rec_window(20, "session end");
     logf_("SwitchToEndCoop from 0x%llX (allowed)", (unsigned long long)caller);
     g_orig_switch_end_coop(sm);
 }
@@ -1130,6 +1165,213 @@ static void note_rest_event(void *frame) {
     logf_("rest_in_coop: rest started, enemy-reset overrides active for %d ms", REST_WINDOW_MS);
 }
 
+// Talking to NPCs as a guest (2026-11-06): BP_ScenarioStarter:ProcessInputButtonEvent shows "Unable to start the conversation in online mode"
+// when AppOnlineWrapper:IsOnlineMultiplay is true and GetHostActor != Inputter. Blueprint functions cannot be hooked on our UE4SS, so the
+// exec thunk of IsOnlineMultiplay answers false when the calling script function has that name (FFrame+0x10 = Node, UObject+0x18 = FName
+// index; the index comes from CoopProbe: "talkfn <hex>"). Every other caller gets the real answer.
+#define ADDR_EXEC_ONLINE_MULTIPLAY 0x140A056C0ULL
+static exec_fn g_orig_exec_multiplay;
+static volatile LONG g_talk_name = -1, g_talk_answers;
+static void detour_exec_multiplay(void *ctx, void *stack, void *result) {
+    g_orig_exec_multiplay(ctx, stack, result);
+    LONG want = g_talk_name;
+    if (want >= 0 && stack && result) {
+        uintptr_t node = *(uintptr_t *)((uintptr_t)stack + 0x10);
+        if (node && *(int *)(node + 0x18) == want && *(uint8_t *)result) {
+            *(uint8_t *)result = 0;
+            if (InterlockedIncrement(&g_talk_answers) <= 20) logf_("talk: IsOnlineMultiplay answered false for ProcessInputButtonEvent (Node 0x%llX, object 0x%llX)", (unsigned long long)node, (unsigned long long)*(uintptr_t *)((uintptr_t)stack + 0x18));
+        }
+    }
+}
+
+// Recording round (2026-11-06, rec=1 in the ini; none of this is hooked without it). Log only: what the game itself does with NPCs on each PC.
+// Lines start with "rec ". Windows (rec_window) reset the per-kind caps, so every event of interest gets its own share of the log.
+//   setvis/hide   SetProgressVisibility impl 0x140913E80, hide-all-components 0x140913E90
+//   onrep         exec OnRepProgressVisibility: the replicated value really arrived here
+//   npcstart      NPC start 0x1408E54F0 (+0xBD8 value, +0xBD9 a replicated value is waiting, +0xBDA started)
+//   unique        duplicate pick 0x14090C6A0: did the Destroy work on this PC? (UE refuses it without authority)
+//   exclude       ExcludeCharacters 0x1408F2DA0
+//   release       +0xB84 drop 0x140448000 and 0x140447ED0 with a backtrace: who finishes a character's setup
+//   flag          UScenarioManager::SetProgressFlag 0x140913590 (does nothing on a guest: shows what his game tried)
+//   lock          [404]/[408]/[40C]/block sampled every 50 ms inside a window, on change
+//   raw           census of the addresses in CoopNative.recset (command "reccensus")
+static volatile LONG g_rec;
+static volatile ULONGLONG g_rec_until;
+static volatile LONG g_rec_win[8];
+#define REC_CAP(kind, cap) (g_rec && InterlockedIncrement(&g_rec_win[kind]) <= (cap))
+static void rec_window(int seconds, const char *why) {
+    if (!g_rec) return;
+    g_rec_until = GetTickCount64() + (ULONGLONG)seconds * 1000;
+    for (int i = 0; i < 8; i++) InterlockedExchange(&g_rec_win[i], 0);
+    logf_("rec window: %d s (%s)", seconds, why);
+}
+static int rec_killed(uintptr_t o) {   // bit 29 of the FUObjectItem flags, as the game checks it
+    if (o < 0x10000 || !readable(o + 0xC, 4)) return -1;
+    int idx = *(int *)(o + 0xC);
+    uintptr_t base = *(volatile uintptr_t *)0x14429EC50ULL;
+    if (idx < 0 || idx >= *(volatile int *)0x14429EC5CULL || !base || !readable(base + (uintptr_t)idx * 0x18 + 8, 4)) return -1;
+    return (int)((*(uint32_t *)(base + (uintptr_t)idx * 0x18 + 8) >> 29) & 1);
+}
+static int rec_client_flag(void) {     // what 0x141EBAA10 (IsServer) reads: [0x144380950]+0xE39, 0 = server
+    uintptr_t g = *(volatile uintptr_t *)0x144380950ULL;
+    return g && readable(g + 0xE39, 1) ? *(uint8_t *)(g + 0xE39) : -1;
+}
+static void rec_bt(char *out, size_t size) {
+    void *f[14];
+    USHORT n = RtlCaptureStackBackTrace(2, 14, f, NULL);
+    size_t at = 0;
+    out[0] = 0;
+    for (USHORT i = 0; i < n && at + 20 < size; i++) at += (size_t)snprintf(out + at, size - at, " %llX", (unsigned long long)(uintptr_t)f[i]);
+}
+typedef void (*rec_v1)(void *self);
+typedef void (*rec_vb)(void *self, char v);
+typedef uint64_t (*rec_r4)(uint64_t a, uint64_t b, uint64_t c, uint64_t d);
+static rec_vb g_orig_setvis, g_orig_hide;
+static void detour_setvis(void *self, char v) {
+    uintptr_t a = (uintptr_t)self;
+    if (REC_CAP(0, 250) && readable(a + 0xBD8, 4) && readable(a + 0x118, 2))
+        logf_("rec setvis 0x%llX -> %d (value %u, waiting %u, started %u, role %u)", (unsigned long long)a, (int)v, *(uint8_t *)(a + 0xBD8),
+              *(uint8_t *)(a + 0xBD9), *(uint8_t *)(a + 0xBDA), *(uint8_t *)(a + 0x118));
+    g_orig_setvis(self, v);
+}
+static void detour_hide(void *self, char v) {
+    uintptr_t a = (uintptr_t)self;
+    if (REC_CAP(1, 250) && readable(a + 0xBD8, 4) && readable(a + 0x118, 2))
+        logf_("rec hide 0x%llX hide=%d (value %u, waiting %u, started %u, role %u)", (unsigned long long)a, (int)v, *(uint8_t *)(a + 0xBD8),
+              *(uint8_t *)(a + 0xBD9), *(uint8_t *)(a + 0xBDA), *(uint8_t *)(a + 0x118));
+    g_orig_hide(self, v);
+}
+static exec_fn g_orig_onrep;
+static void detour_onrep(void *ctx, void *stack, void *result) {
+    uintptr_t a = (uintptr_t)ctx;
+    if (REC_CAP(2, 300) && readable(a + 0xBD8, 4))
+        logf_("rec onrep 0x%llX value %u, started %u", (unsigned long long)a, *(uint8_t *)(a + 0xBD8), *(uint8_t *)(a + 0xBDA));
+    g_orig_onrep(ctx, stack, result);
+}
+static rec_v1 g_orig_npc_start;
+static void detour_npc_start(void *self) {
+    uintptr_t a = (uintptr_t)self;
+    if (REC_CAP(4, 300) && readable(a + 0xBD8, 4) && readable(a + 0x118, 2))
+        logf_("rec npcstart 0x%llX value %u, waiting %u, role %u, dormancy %u", (unsigned long long)a, *(uint8_t *)(a + 0xBD8), *(uint8_t *)(a + 0xBD9),
+              *(uint8_t *)(a + 0x118), *(uint8_t *)(a + 0x119));
+    g_orig_npc_start(self);
+}
+typedef struct { uintptr_t *data; int num; int max; } rec_ptrs;
+typedef void (*rec_unique_fn)(void *self, rec_ptrs *a);
+static rec_unique_fn g_orig_unique;
+static void detour_unique(void *self, rec_ptrs *a) {
+    uintptr_t c[6]; int n = a && a->data ? a->num : 0;
+    if (n > 6) n = 6;
+    for (int i = 0; i < n; i++) c[i] = a->data[i];
+    g_orig_unique(self, a);
+    if (!g_rec) return;
+    char line[260]; size_t at = 0; line[0] = 0;
+    for (int i = 0; i < n && at + 44 < sizeof line; i++)
+        at += (size_t)snprintf(line + at, sizeof line - at, " 0x%llX role %d gone %d", (unsigned long long)c[i],
+                               readable(c[i] + 0x118, 1) ? *(uint8_t *)(c[i] + 0x118) : -1, rec_killed(c[i]));
+    logf_("rec unique: %d of one character:%s", n, line);
+}
+static rec_r4 g_orig_exclude, g_orig_relc, g_orig_relb;
+static uint64_t detour_exclude(uint64_t self, uint64_t b, uint64_t c, uint64_t d) {
+    uintptr_t a = (uintptr_t)self;
+    int n0 = readable(a + 0x3B0, 4) ? *(int *)(a + 0x3A8) : -1;
+    uint64_t r = g_orig_exclude(self, b, c, d);
+    if (g_rec) logf_("rec exclude: loader 0x%llX, list %d before, %d after, tries %d", (unsigned long long)a, n0, readable(a + 0x3B0, 4) ? *(int *)(a + 0x3A8) : -1,
+                     readable(a + 0x3B0, 4) ? *(int *)(a + 0x3B0) : -1);
+    return r;
+}
+static void rec_release_log(const char *kind, uintptr_t a) {
+    char bt[300];
+    if (!g_rec || a < 0x10000 || !readable(a + 0xB80, 8) || *(uint8_t *)(a + 0xB84) != 1 || !REC_CAP(3, 120)) return;
+    rec_bt(bt, sizeof bt);
+    logf_("rec release %s 0x%llX (b83 %u b84 %u b85 %u, count %d, b84 holders %d) backtrace:%s", kind, (unsigned long long)a, *(uint8_t *)(a + 0xB83),
+          *(uint8_t *)(a + 0xB84), *(uint8_t *)(a + 0xB85), *(volatile int *)0x14413C404ULL, *(volatile int *)0x14413C40CULL, bt);
+}
+static uint64_t detour_relc(uint64_t o, uint64_t b, uint64_t c, uint64_t d) {
+    rec_release_log("C", (uintptr_t)o);
+    return g_orig_relc(o, b, c, d);
+}
+static uint64_t detour_relb(uint64_t o, uint64_t b, uint64_t c, uint64_t d) {
+    rec_release_log("B", (uintptr_t)o);
+    return g_orig_relb(o, b, c, d);
+}
+typedef void (*rec_flag_fn)(void *world, uint64_t *fstr, char v);
+static rec_flag_fn g_orig_setflag;
+static void detour_setflag(void *world, uint64_t *fstr, char v) {
+    if (REC_CAP(5, 600) && fstr && fstr[0] && readable(fstr[0], 2)) {
+        char s[90]; int n = *(int *)(fstr + 1), i = 0;
+        const uint16_t *w = (const uint16_t *)(uintptr_t)fstr[0];
+        if (n > 88) n = 88;
+        for (; i < n && w[i]; i++) s[i] = w[i] < 127 ? (char)w[i] : '?';
+        s[i] = 0;
+        logf_("rec flag %s -> %d (client flag %d)", s, (int)v, rec_client_flag());
+    }
+    g_orig_setflag(world, fstr, v);
+}
+static void rec_census(void) {
+    static char rb[8192];
+    logf_("rec raw census: client flag %d, count %d, b85 holders %d, b84 holders %d, block %s", rec_client_flag(), *(volatile int *)0x14413C404ULL,
+          *(volatile int *)0x14413C408ULL, *(volatile int *)0x14413C40CULL, *(volatile uint64_t *)0x14413C410ULL == ~0ULL ? "forever" : "frame");
+    if (!read_small_file("CoopNative.recset", rb, sizeof rb)) return;
+    char *q = rb;
+    while (*q) {
+        char *end; unsigned long long v = strtoull(q, &end, 16);
+        if (end == q) break;
+        uintptr_t a = (uintptr_t)v;
+        if (a > 0x10000 && readable(a + 0x8C, 4) && readable(a + 0x118, 2) && readable(a + 0xB80, 8) && readable(a + 0xBD8, 4) && readable(a + 0xC10, 4) && readable(a + 0x35, 3))
+            logf_("rec raw 0x%llX vt %llX net %02X %02X %02X role %u/%u dormancy %u | kind %u reports %d ba0 %u | b81-85 %u%u%u%u%u | value %u waiting %u started %u | c10-12 %u%u%u | tick %u%u | gone %d", v, *(unsigned long long *)a,
+                  *(uint8_t *)(a + 0x8C), *(uint8_t *)(a + 0x8D), *(uint8_t *)(a + 0x8E), *(uint8_t *)(a + 0x118), *(uint8_t *)(a + 0x8F), *(uint8_t *)(a + 0x119),
+                  *(uint8_t *)(a + 0xB80), *(int *)(a + 0xB9C), *(uint8_t *)(a + 0xBA0),
+                  *(uint8_t *)(a + 0xB81), *(uint8_t *)(a + 0xB82), *(uint8_t *)(a + 0xB83), *(uint8_t *)(a + 0xB84), *(uint8_t *)(a + 0xB85),
+                  *(uint8_t *)(a + 0xBD8), *(uint8_t *)(a + 0xBD9), *(uint8_t *)(a + 0xBDA), *(uint8_t *)(a + 0xC10), *(uint8_t *)(a + 0xC11), *(uint8_t *)(a + 0xC12),
+                  *(uint8_t *)(a + 0x35), *(uint8_t *)(a + 0x37), rec_killed(a));
+        q = end; while (*q == ' ') q++;
+    }
+}
+static DWORD WINAPI rec_thread(LPVOID unused) {
+    (void)unused;
+    int p4 = -99, p8 = -99, pc = -99, pb = -1;
+    for (;;) {
+        Sleep(50);
+        if (!g_rec || GetTickCount64() > g_rec_until) continue;
+        int c4 = *(volatile int *)0x14413C404ULL, c8 = *(volatile int *)0x14413C408ULL, cc = *(volatile int *)0x14413C40CULL;
+        int fb = *(volatile uint64_t *)0x14413C410ULL == ~0ULL;
+        if (c4 == p4 && c8 == p8 && cc == pc && fb == pb) continue;
+        p4 = c4; p8 = c8; pc = cc; pb = fb;
+        if (REC_CAP(6, 500)) logf_("rec lock: count %d, b85 holders %d, b84 holders %d, block %s", c4, c8, cc, fb ? "forever" : "frame");
+    }
+}
+
+// NPC layouts (2026-11-06): each area's ScenarioProgressLoader (Base01: SelectMap) picks its NPC layout with RandomChoice, so the two PCs loaded
+// different layouts, hence "the same NPCs in different places" and NPCs that are not on the host's screen. Hiding them afterwards was the wrong
+// end: with the same story flags and the same pick both games load the same level by themselves. Inner function of the exec thunk (only caller
+// 0x148FBF33F): (loader, FName *out, TArray<FChoiceContainer> *), element 0x10 bytes: FName, float Weight. The first entry with a weight wins.
+// Off with layout_fixed=0.
+#define ADDR_LAYOUT_CHOICE 0x14090C3C0ULL
+typedef struct { uint8_t *data; int num; int max; } choice_array;
+typedef uint64_t *(*layout_fn)(void *self, uint64_t *out, choice_array *a);
+static layout_fn g_orig_layout_choice;
+static volatile LONG g_layout_random, g_layout_logs;
+static uint64_t *detour_layout_choice(void *self, uint64_t *out, choice_array *a) {
+    // read everything BEFORE the call: the array is a by-value argument, the callee frees it (11-06 13:46: reading it afterwards gave a garbage
+    // name, and ToString on that name in the "rec stream" hook crashed the host at Home Base)
+    int pick = -1, num = 0;
+    uint64_t want = 0;
+    if (!g_layout_random && a && a->data && a->num > 0) {
+        num = a->num;
+        pick = 0;
+        for (int i = 0; i < a->num; i++) if (*(float *)(a->data + i * 0x10 + 8) > 0.0f) { pick = i; break; }
+        want = *(uint64_t *)(a->data + pick * 0x10);
+    }
+    uint64_t *r = g_orig_layout_choice(self, out, a);
+    if (pick < 0 || !r) return r;
+    uint64_t rolled = *r;
+    *r = want;
+    if (InterlockedIncrement(&g_layout_logs) <= 40)
+        logf_("layout: %d choices, rolled name %u, fixed to entry %d name %u", num, (unsigned)rolled, pick, (unsigned)want);
+    return r;
+}
+
 // Post-boss outro (session 10): the "large-poly prepared" check 0x14705DE20 (polled by ScenarioActor:WaitForPreparePolyFinished)
 // needs the manager's +0x20C (own models ready) and, when IsOnlineMultiplay is true, also +0x20D, which the guest's game never
 // sets; the host hung there until the guest left. With keep_outro=1 that one call is answered "not multiplayer".
@@ -1147,6 +1389,17 @@ static uint8_t detour_multiplay(void *ctx) {
     uint8_t r = g_orig_multiplay(ctx);
     uintptr_t caller = (uintptr_t)__builtin_return_address(0);
     note_rest_caller(0, caller, r);
+    // Character setup 0x145DA0600 (recording 11-06): online, the host keeps a character in setup until every guest has reported it (+0xB9C >= players - 1,
+    // retried every tick; solo it just finishes). The Home Base NPCs (22: layout + ForFastLoad) are not relevant to a guest who is still far away, so
+    // no report came, the appear lock stayed shut and the host's own arrival hung with it, until the session ended: IsOnlineMultiplay false, all finished
+    // within 2 ms. Story NPCs take the solo way during a Home Base trip, on each PC. Their visibility comes from the layout there, both PCs have the same one.
+    if (r && caller == 0x145DA0630ULL && g_hb_at && GetTickCount64() - g_hb_at < 300000 && ctx && readable((uintptr_t)ctx, 8) &&
+        *(uint64_t *)ctx == 0x142D8C268ULL) {
+        static volatile LONG npc_solo;
+        if (InterlockedIncrement(&npc_solo) <= 60)
+            logf_("hb: NPC 0x%llX takes the solo setup (reports %d)", (unsigned long long)(uintptr_t)ctx, readable((uintptr_t)ctx + 0xB9C, 4) ? *(int *)((uintptr_t)ctx + 0xB9C) : -1);
+        return 0;
+    }
     // option A (session 10): the outro keeps the game's own sync (outro_partner_override=0); from the memory start on (15 min:
     // memory, its scenes, the cutscene out of it) the checks are answered again, so neither game waits for the other's copy
     int memwin = g_memory_start_at && GetTickCount64() - g_memory_start_at < 900000;
@@ -1434,6 +1687,16 @@ static void run_command(char *buf) {
     } else if (strncmp(buf, "tpfade ", 7) == 0) {
         unsigned long long ctx = 0; int on = 0;
         if (sscanf(buf + 7, "%llx %d", &ctx, &on) == 2) { g_tpfade_ctx = (uintptr_t)ctx; InterlockedExchange(&g_tpfade_pending, on ? 1 : 0); }
+    } else if (strncmp(buf, "recwin ", 7) == 0) {
+        rec_window(atoi(buf + 7), "event");
+    } else if (strncmp(buf, "reccensus", 9) == 0) {
+        if (g_rec) rec_census();
+    } else if (strncmp(buf, "hbstart", 7) == 0) {
+        g_hb_at = GetTickCount64();   // the guest has no teleport of his own, and his lock stuck the same way
+        rec_window(85, "Home Base trip");
+        logf_("hb: Home Base trip started by the host");
+    } else if (sscanf(buf, "talkfn %llx", &a) == 1) {
+        if (a && readable((uintptr_t)a + 0x18, 4)) { g_talk_name = *(int *)((uintptr_t)a + 0x18); logf_("talk: ProcessInputButtonEvent 0x%llX, name index %ld", a, g_talk_name); }
     } else if (sscanf(buf, "scenmgr %llx", &a) == 1) {
         if (g_scen_mgr != (uintptr_t)a) logf_("scene flags: scenario manager 0x%llX", a);
         g_scen_mgr = (uintptr_t)a;
@@ -1492,6 +1755,7 @@ static void read_settings(void) {
     if (InterlockedExchange(&g_scene_wait, swt) != swt) logf_("setting scene_start_wait = %ld", swt);
     LONG gout = have_ini && strstr(buf, "guest_outro=1") != NULL;
     if (InterlockedExchange(&g_guest_outro, gout) != gout) logf_("setting guest_outro = %ld", gout);
+    g_layout_random = have_ini && strstr(buf, "layout_fixed=0") != NULL;
     LONG kout = have_ini && strstr(buf, "keep_outro=1") != NULL;
     if (InterlockedExchange(&g_keep_outro, kout) != kout) logf_("setting keep_outro = %ld", kout);
     LONG grest = have_ini && strstr(buf, "guest_rest=1") != NULL;
@@ -1792,6 +2056,12 @@ static void detour_server_addexp(void *ctx, void *stack, void *result) {
     if (value == GUEST_REST_MAGIC) {
         g_guest_rest_req_at = GetTickCount64();
         logf_("guest rest request (Server_AddExp(%d) from component 0x%llX): enemy reset wanted", value, (unsigned long long)(uintptr_t)ctx);
+        {   // 2026-11-06: tells CoopProbe where the last Mistle use was (a guest who dies in the field respawns there)
+            char rp_[MAX_PATH + 32];
+            snprintf(rp_, sizeof rp_, "%sCoopNative.guestrest", g_dir);
+            FILE *rf = fopen(rp_, "w");
+            if (rf) { fputs("1", rf); fclose(rf); }
+        }
         return;
     }
     if (g_levelup_relay && value != 0) logf_("Server_AddExp(%d) from component 0x%llX", value, (unsigned long long)(uintptr_t)ctx);
@@ -2180,6 +2450,27 @@ static DWORD WINAPI worker(LPVOID unused) {
     g_hook_batch = 1;
     install("GetRescueSignalState", ADDR_EXEC_GET_RESCUE_SIGNAL_STATE,
             "\xE9\x1B\x56\xCB\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_get_state, (void **)&g_orig_get_state);
+    {
+        char ini[4096];
+        if (read_small_file("CoopNative.ini", ini, sizeof ini) && strstr(ini, "rec=1")) {
+            g_rec = 1;
+            install("RecSetVis", 0x140913E80ULL, "\xE9\x4B\x34\x77\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_setvis, (void **)&g_orig_setvis);
+            install("RecHide", 0x140913E90ULL, "\xE9\xFB\x36\x77\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_hide, (void **)&g_orig_hide);
+            install("RecOnRep", 0x140B4AE00ULL, "\xE9\x4B\xE5\x28\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_onrep, (void **)&g_orig_onrep);
+            install("RecNpcStart", 0x1408E54F0ULL, "\x48\x89\x5C\x24\x08\x57\x48\x83\xEC\x20\x48\x8B\xD9\xE8\xBE\xDD", (void *)detour_npc_start, (void **)&g_orig_npc_start);
+            install("RecUnique", 0x14090C6A0ULL, "\xE9\x4B\x9B\x76\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_unique, (void **)&g_orig_unique);
+            install("RecExclude", 0x1408F2DA0ULL, "\xE9\x3B\x20\x74\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_exclude, (void **)&g_orig_exclude);
+            install("RecRelC", 0x140448000ULL, "\xE9\xBB\xB5\x93\x05\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_relc, (void **)&g_orig_relc);
+            install("RecRelB", 0x140447ED0ULL, "\xE9\x0B\xB3\x93\x05\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_relb, (void **)&g_orig_relb);
+            install("RecSetFlag", 0x140913590ULL, "\xE9\xFB\x2A\x77\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_setflag, (void **)&g_orig_setflag);
+            CreateThread(NULL, 0, rec_thread, NULL, 0, NULL);
+            rec_window(60, "game start");
+        }
+    }
+    install("LayoutChoice", ADDR_LAYOUT_CHOICE,
+            "\xE9\xAB\x98\x76\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_layout_choice, (void **)&g_orig_layout_choice);
+    install("IsOnlineMultiplayExec", ADDR_EXEC_ONLINE_MULTIPLAY,
+            "\xE9\x9B\xB1\xCB\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_exec_multiplay, (void **)&g_orig_exec_multiplay);
     install("IsOnlineMultiplay", ADDR_IS_ONLINE_MULTIPLAY_BODY,
             "\x40\x53\x48\x83\xEC\x20\x48\x89\xCB\xE8\x12\x79\x9A\xF9\x85\xC0", (void *)detour_multiplay, (void **)&g_orig_multiplay);
     install("MultiPlayersCheck", ADDR_MULTI_PLAYERS_BODY,
@@ -2341,6 +2632,38 @@ static DWORD WINAPI worker(LPVOID unused) {
                 *(volatile int *)0x14413C404ULL = 0; clear_player_lock_flags();
                 *(volatile int *)0x14413C40CULL = 0;
                 *(volatile uint64_t *)0x14413C410ULL = *(volatile uint64_t *)0x144194140ULL;
+            }
+        }
+        // v6 (2026-11-06): the same stuck lock on arriving at Home Base with a guest: [404]=23, [40C]=22, [410]=-1 (for good), no appear finish
+        // on the host's new character, a loading screen for ever (it worked once, by luck). Same reset, from 12 s after the teleport
+        // (arrival takes about 11 s; the levels load under the lock) while the block stays "for good"; inside the 60 s teleport window.
+        {
+            static ULONGLONG v6_last; static int v6_n; static ULONGLONG v6_for;
+            ULONGLONG now6 = GetTickCount64();
+            ULONGLONG hb = g_hb_at;
+            if (v6_for != hb) { v6_for = hb; v6_n = 0; }
+            if (hb && now6 - hb > 12000 && now6 - hb < 75000 && now6 - v6_last > 2000 && v6_n < 8 &&
+                *(volatile uint64_t *)0x14413C410ULL == ~0ULL && *(volatile int *)0x14413C404ULL > 0) {
+                v6_last = now6; v6_n++;
+                logf_("appear lock v6: stuck after the Home Base teleport (count %d, +0xB85 holders %d, +0xB84 holders %d, %d so far) -> lock reset",
+                      *(volatile int *)0x14413C404ULL, *(volatile int *)0x14413C408ULL, *(volatile int *)0x14413C40CULL, v6_n);
+                int held = clear_holder_flags();
+                logf_("appear lock v6: %d characters freed", held);
+                *(volatile int *)0x14413C404ULL = 0; clear_player_lock_flags();
+                *(volatile int *)0x14413C408ULL = 0;
+                *(volatile int *)0x14413C40CULL = 0;
+                *(volatile uint64_t *)0x14413C410ULL = *(volatile uint64_t *)0x144194140ULL;
+            } else if (hb && v6_n > 0 && now6 - hb < 75000 && now6 - v6_last > 2000) {
+                // characters that came in after the reset would hang the same way
+                v6_last = now6;
+                int held = clear_holder_flags();
+                if (held) {
+                    logf_("appear lock v6: %d more characters freed", held);
+                    *(volatile int *)0x14413C404ULL = 0;
+                    *(volatile int *)0x14413C408ULL = 0;
+                    *(volatile int *)0x14413C40CULL = 0;
+                    *(volatile uint64_t *)0x14413C410ULL = *(volatile uint64_t *)0x144194140ULL;
+                }
             }
         }
         // v5g (2026-10-31): the guest floated without control in the host's memory. Most likely his memory character hit the same
