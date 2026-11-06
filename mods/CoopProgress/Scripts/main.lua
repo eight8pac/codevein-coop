@@ -261,9 +261,17 @@ local function applyFull(entries)
         reloadAt = os.time() + 3   -- after the last batch: reload the story-dependent world once
     end
 end
+-- recording round (11-06): progress_reload=0 keeps this reload out of the picture; flag dumps on request from CoopProbe, for comparing the two PCs
+local PLUGINS = MOD_DIR .. "\\..\\..\\..\\plugins\\"
+local function iniHas(key)
+    local f = io.open(PLUGINS .. "CoopNative.ini", "r"); if not f then return false end
+    local s = f:read("*a") or ""; f:close()
+    return s:find(key, 1, true) ~= nil
+end
 local function reloadWorldProgress()
     if not reloadAt or os.time() < reloadAt then return end
     reloadAt = nil
+    if iniHas("progress_reload=0") then journal("GUEST", "world progress reload skipped (progress_reload=0)"); return end
     local loaders = FindAllOf("ScenarioProgressLoader") or {}
     local done = 0
     for _, l in ipairs(loaders) do
@@ -432,27 +440,15 @@ hook("/Script/Extensions.BossAreaBase:MulticastGainRewards", function(ctx, ...)
     end
 end)
 
--- 2026-11-06: when a cutscene's picture really starts: the ready flags and the audio prepare line do not show it (5 s gap on screen)
-hook("/Script/MovieScene.MovieSceneSequencePlayer:Play", function(ctx)
-    local o = try(function() return ctx:get() end)
-    journal("SYNC", "SequencePlayer:Play " .. (valid(o) and tostring(try(function() return o:GetFullName() end)):sub(1, 140) or "?"))
-end)
-
 -- Story flags. Hooks on the UAppSaveManager setters register but saw nothing while Boss_St07's flags changed (solo test
 -- 2026-10-28): the game sets them natively. They stay as a cheap signal; the flag store itself is diffed below.
-for _, fn in ipairs({"SetGameProgress", "SetGameProgressInt"}) do
-    hook("/Script/Extensions.AppSaveManager:" .. fn, function(_, ...) journal("FLAG", fn .. "(" .. args(...) .. ")") end)
-end
+-- Removed 11-06: the game thread froze for good inside the UE4SS hook on SetGameProgressInt when the Blueprint closeness check ran on talking to an
+-- NPC (host alone at 14:00, guest at 12:47, same stack). The flag diff below sees the changes anyway.
 
 -- The game's own co-op symbol sync and Haze RPCs (SDK), logged to learn when vanilla uses them in a two-player session:
 -- the guest asks with ServerSetSyncedSymbols, the host answers everyone with MulticastSetSyncedSymbols (symbols, results).
-for _, fn in ipairs({"ScenarioPlayerComponent:MulticastSetSyncedSymbols", "ScenarioPlayerComponent:ServerSetSyncedSymbols",
-                     "ScenarioPlayerComponent:MulticastFlowDiagramSetSyncedSymbols", "ScenarioPlayerComponent:ServerFlowDiagramSetSyncedSymbols",
-                     "ScenarioManager:StartLargePolyLoad", "ScenarioManager:PrepareLargePolySequence", "ScenarioManager:PlayLargePolySequence", "ScenarioManager:PlayLargePoly",
-                     "ScenarioPlayerComponent:ServerSetReadyToPlay", "ScenarioPlayerComponent:MulticastSetReadyToPlay",
-                     "ScenarioPlayerComponent:ServerSetReadyToFinish", "ScenarioPlayerComponent:MulticastSetReadyToFinish",
-                     "ScenarioPlayerComponent:ServerSetReadyToSkip", "ScenarioPlayerComponent:ServerSetOnlineMultiplaySynced",
-                     "ScenarioPlayerComponent:MulticastSetOnlineMultiplaySynced",
+-- (11-06: ServerSetSyncedSymbols and the two FlowDiagram ones were logging only and are called from conversation scripts: see the freeze note above)
+for _, fn in ipairs({"ScenarioPlayerComponent:MulticastSetSyncedSymbols",
                      "HumanContextComponent:Client_AddExp", "HumanContextComponent:Server_AddExp"}) do
     hook("/Script/Extensions." .. fn, function(ctx, ...)
         local parts = {}
@@ -510,6 +506,27 @@ local function readFlags()
         if not ok then return nil end
     end
     return flags
+end
+local function flagDump()
+    local p = PLUGINS .. "CoopProgress.dump"
+    local f = io.open(p, "r"); if not f then return end
+    local why = f:read("*l") or "?"; f:close(); os.remove(p)
+    local now = readFlags()
+    if not now then log("rec flags (" .. why .. "): store unreadable"); return end
+    local list, h = {}, 5381
+    for k, v in pairs(now) do
+        local b, vn = k:match("^BoolMap:(.+)$"), k:match("^ValMap:(.+)$")
+        if b and v == "true" then list[#list + 1] = "B:" .. b
+        elseif vn and v ~= "0" then list[#list + 1] = "V:" .. vn .. "=" .. v end
+    end
+    table.sort(list)
+    for _, e in ipairs(list) do
+        if not e:find("^B:IAF_") and not e:find("^B:WAF_") then
+            for i = 1, #e do h = (h * 33 + e:byte(i)) % 4294967296 end
+        end
+    end
+    log(string.format("rec flags (%s): %d entries, story hash %08X", why, #list, h))
+    for i = 1, #list, 40 do log("rec flags: " .. table.concat(list, " ", i, math.min(i + 39, #list))) end
 end
 local function diffFlags()
     local now = readFlags()
@@ -588,6 +605,8 @@ LoopAsync(DIFF_S * 1000, function()
         if not ok then log("position error: " .. tostring(err):sub(1, 120)) end
         ok, err = pcall(reloadWorldProgress)
         if not ok then log("reload error: " .. tostring(err):sub(1, 120)) end
+        ok, err = pcall(flagDump)
+        if not ok then log("flag dump error: " .. tostring(err):sub(1, 120)) end
         -- while full-sync batches or flags are queued, publish every DIFF_S instead of every PUBLISH_S
         if os.time() % PUBLISH_S < DIFF_S or #fullQueue > 0 or #flagQueue > 0 then
             ok, err = pcall(publishPosition)

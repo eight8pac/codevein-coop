@@ -4,8 +4,8 @@ Mods that turn Code Vein (2019) co-op into one continuous session. The guest sta
 kills that end a vanilla session: a dead guest spectates and comes back at the host's rest, the group teleports together, both
 play the boss, its outro and the memory, and the guest's story progress, world state and blood codes follow the host's. Co-op also
 works in areas whose boss is dead. Automatic re-hosting and re-joining remain as a fallback when a session does break.
-**Not a release**: tested by hand on two PCs only, one guest (vanilla cap). Cutscenes are still rough, and chests, ground items and
-NPC interaction for the guest are in progress (see Status).
+**Not a release**: tested by hand on two PCs only, one guest (vanilla cap). Cutscenes are still rough, and opening chests and ground
+items for the guest are in progress (see Status). Home Base works together; leaving it together does not yet.
 
 Findings, teardown table and QA live in the Co-op Anything write-up:
 <https://github.com/cranebeaker/coop-anything/tree/main/games/code-vein>
@@ -70,6 +70,20 @@ Needs [Zig](https://ziglang.org/download/) (0.17 used; its clang cross-compiles 
 ## Status
 
 Works (two PCs): rejoin after guest field death, host death, boss-room death + wipe, boss kill; co-op in beaten areas.
+
+Home Base together (two PCs, session kept):
+- Both arrive, the NPCs match on both screens, and host and guest can talk to NPCs and shopkeepers; a guest got a blood code from
+  an NPC on his own side. Tested with identical saves.
+- How NPCs work: each area's `ScenarioProgressLoader` picks a layout from the story flags on each PC (only Home Base rolls at random;
+  the pick is fixed here so both PCs load the same one). In a normal area the host's result reaches the guest by the game's own
+  replication; a recording with our visibility mirror off showed both PCs matching at join and after a boss. The mirror now only
+  covers side-quest NPCs in Home Base, whose replicated value does not reach the guest there (reason unknown).
+- Online, the host holds every character in setup until each guest has reported it (`0x145DA0600`). Home Base NPCs never got that
+  report, which also held the host's arrival, so story NPCs take the solo setup during the trip.
+- UE4SS's hook dispatcher walks `FFrame::OutParms` of the calling Blueprint frame, and from some NPC scripts that list has a bad
+  link: endless loop or access violation. So nothing Blueprints call on a conversation may be hooked from Lua.
+- Not tested yet: leaving Home Base together (the host arrived before the stage had loaded and both fell; a hold until the stage
+  is there is in the code) and hiding the guest's weapon and veil there.
 
 Works (two PCs, experiments):
 - `rest_in_coop`: the host rests at a Mistle with a guest connected; the guest stays and the enemies respawn when the host gets

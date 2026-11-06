@@ -65,6 +65,9 @@ local lastWindow
 -- A boss kill must close the window at once: the outro calls EndCooperativeMode ~2 s after MulticastGainRewards, and a veto
 -- there stalls the host on a black screen (session 7). Closed for 60 s after the rewards.
 local rewardsAt = -1000
+bossReviveUntil, bossReviveDue, bossReviveDoneUntil = -1000, false, -1000
+hbUntil, hbReady, hbGuestWait, hbTarget, hbHostHold, hbRelease = -1000, false, false, nil, false, nil   -- Home Base teleport with the session kept (hbWatch)
+hbLeave, hbLeaveIn, hbLeaveArrived, hbLeaveOk = false, false, false, nil                                 -- the same on the way out
 pcall(function()
     RegisterHook("/Script/Extensions.BossAreaBase:MulticastGainRewards", function()
         rewardsAt = os.clock()
@@ -76,10 +79,11 @@ pcall(function()
         local mine = valid(pc) and try(function() return pc.Pawn end) or nil
         local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
         local dead = not valid(mine) or try(function() return helper:IsDeath(mine) end)
-        if dead then
-            local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a"); if c then c:write("replay\n"); c:close() end
-        end
-        log("boss rewards: spectate window forced closed" .. (dead and ", own character dead -> replay requested" or ""))
+        -- 2026-11-06 (owner): when the boss dies, everyone dead comes back in the room, so the normal end sequence can run (with the host
+        -- dead it stood still, no "defeated" banner). No more going home; the host spawns everyone (bossKillRevive).
+        bossReviveUntil = os.clock() + 8
+        bossReviveDue = true
+        log("boss rewards: spectate window forced closed" .. (dead and ", own character dead -> everyone dead comes back in the room" or ""))
     end)
 end)
 -- Group respawn (group_respawn=1): outside boss fights the window also opens when a guest has died for good while the host lives,
@@ -105,6 +109,15 @@ local function isTrueDead(helper, p)
     local td = trueDeadAddr()
     return td ~= nil and td == try(function() return p:GetAddress() end)
 end
+-- Boss fights (owner 2026-11-06): nobody really dies while someone else lives. A real host death aborted the fight (no rewards, no banner,
+-- a stalemate), so the final death is vetoed for everyone (CoopNative.protect) and the player stays dying and spectates. The veto's
+-- marker (CoopNative.truedead) tells "down for good" from a normal dying player, whom Io or a partner can still revive.
+local function isDownFinal(helper, p)
+    if try(function() return helper:IsDeath(p) end) then return true end
+    if not try(function() return helper:IsDying(p) end) then return false end
+    local td = trueDeadAddr()
+    return td ~= nil and td == try(function() return p:GetAddress() end)
+end
 local function fieldWindow(gs, helper)
     keepDyingOn = iniHas("keep_dying=1")
     if not iniHas("group_respawn=1") and not keepDyingOn then return false end
@@ -123,7 +136,15 @@ local function fieldWindow(gs, helper)
             elseif me then aliveMine = true else aliveOther = true end
         end
     end
-    if isHost then return deadOther and aliveMine end            -- a guest died, the host lives
+    -- 2026-11-06 (owner: host death must not end the session; outside a boss fight he just respawns as usual): the same veto for a
+    -- dead host, on both PCs (each ends co-op on its own side). hostFieldDead keeps the host's camera out of spectating.
+    local hostKeep = not iniHas("host_death_keep=0")
+    if isHost then
+        local was = hostFieldDead
+        hostFieldDead = hostKeep and deadMine and aliveOther
+        if hostFieldDead and not was then log("host death: dead in the field with a guest alive -> session kept, normal respawn") end
+        return (deadOther and aliveMine) or hostFieldDead
+    end
     -- On a guest PC: we died, the host lives. Only a real dead pawn counts: while joining there is no pawn yet, and vetoing then
     -- blocked the join (2026-10-28: guest stuck on a black screen after loading into the host's world). Exception: after a true
     -- death the host removes our pawn (keep_dying) and we keep spectating; our own true-death marker tells that apart from a join.
@@ -159,11 +180,13 @@ local function fieldWindow(gs, helper)
         if td and td == try(function() return mine:GetAddress() end) then sawOwnTrueDeath = true end
     end
     if keepDyingOn and not valid(mine) and sawOwnTrueDeath and trueDeadAddr() then return aliveOther end
-    return deadMine and aliveOther
+    if hostKeep and deadOther and aliveMine and not hostDeadSeen then hostDeadSeen = true; log("host death: the host is dead, we stay in the session") end
+    if not deadOther then hostDeadSeen = false end
+    return (deadMine and aliveOther) or (hostKeep and deadOther and aliveMine)
 end
 postBossUntil = -1000   -- set when the host's memory starts/ends (scene relay); no spectate window until then
 local function spectateWindow()
-    if os.clock() - rewardsAt < 60 then return false end
+    if os.clock() - rewardsAt < 60 then hostFieldDead = false; return false end
     -- 2026-11-02: after the memory his BossAreaState still said "fight running" (his story flags) and leftover memory characters
     -- counted as dead -> the spectate window opened: camera on the host, death filter and crisis music in the final cutscene
     if os.clock() < postBossUntil then return false end
@@ -171,10 +194,11 @@ local function spectateWindow()
     if not valid(gs) then return false end
     local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
     if try(function() return gs.BossAreaState end) ~= 2 then return try(function() return fieldWindow(gs, helper) end) or false end
+    hostFieldDead = false   -- in a boss fight a dead host spectates (R7)
     local dead, alive = false, false
     for _, p in ipairs(FindAllOf("BP_Player_C") or {}) do
         if valid(p) then
-            if try(function() return helper:IsDeath(p) end) then dead = true else alive = true end
+            if isDownFinal(helper, p) then dead = true else alive = true end
         end
     end
     return dead and alive
@@ -328,6 +352,29 @@ local function unlockInput()
     end
 end
 local function spectateCam(window)
+    if os.clock() < bossReviveUntil then   -- keep the view and overlays until the new character is there
+        local pcr = localPC()
+        local pr = valid(pcr) and try(function() return pcr.Pawn end) or nil
+        local hr = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+        if not valid(pr) or try(function() return hr:IsDeath(pr) end) then return end
+    end
+    -- 2026-11-06 (owner): spectating only in boss fights. In the field a dead player gets the normal death screen and respawns: the host
+    -- by the game, a guest at the last Mistle either of them used (groupRespawn). Afterwards his death fade and input lock are lifted.
+    local gsw = FindFirstOf("BP_AppGameState_C")
+    if window and try(function() return gsw.BossAreaState end) ~= 2 then
+        if try(function() return gsw.Role end) ~= 3 then fieldDied = true end   -- only the guest needs the fade and input lifted
+        return
+    end
+    if not window and fieldDied then
+        local pcw = localPC()
+        local pw = valid(pcw) and try(function() return pcw.Pawn end) or nil
+        local hw = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+        if valid(pw) and name(pw):find("BP_Player_C", 1, true) and not try(function() return hw:IsDeath(pw) end) then
+            fieldDied = false
+            unlockUntil, unlockedPawn = os.clock() + 15, nil
+            log("field death: back in the world as " .. name(pw) .. ", lifting the death fade and input lock")
+        end
+    end
     if not window then
         local pc = localPC()
         local mine = valid(pc) and try(function() return pc.Pawn end) or nil
@@ -453,9 +500,93 @@ end
 -- Group respawn (R5 v1, host side, group_respawn=1). A guest who died for good is held by the veto (fieldWindow). Decided at the
 -- moment of death: in combat -> he spectates until the host rests at a Mistle; out of combat -> back after RESPAWN_DELAY s.
 -- He comes back through CharacterHelper:RequestPlayerSpawn for his PlayerController, next to the host, as a respawn.
-local RESPAWN_DELAY = 4
+local RESPAWN_DELAY = 7   -- the length of the death screen
 local downed = {}   -- dead guest pawn name -> {at = os.clock(), mode = "spectate"|"respawn"}
-local function respawnGuest(helper, deadPawn, hostPawn, withAppear)
+-- Boss killed with someone dead (owner 2026-11-06): the host spawns every dead player next to a living one, the host included.
+function bossKillRevive()
+    if not bossReviveDue then return end
+    bossReviveDue = false
+    if os.clock() < bossReviveDoneUntil then return end   -- the rewards hook arms it a second time for the same kill
+    bossReviveDoneUntil = os.clock() + 15
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not valid(gs) or try(function() return gs.Role end) ~= 3 then return end
+    local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+    local alive
+    for _, p in ipairs(FindAllOf("BP_Player_C") or {}) do
+        if valid(p) and not try(function() return helper:IsDeath(p) end) and not try(function() return helper:IsDying(p) end) then alive = p end
+    end
+    if not valid(alive) then log("boss revive: nobody alive?"); return end
+    local pcl = localPC()
+    local ownPawn = valid(pcl) and try(function() return pcl.Pawn end) or nil
+    local hostDown = not valid(ownPawn) or try(function() return helper:IsDeath(ownPawn) end) == true
+    local loc, rot, right = alive:K2_GetActorLocation(), alive:K2_GetActorRotation(), alive:GetActorRightVector()
+    local n = 0
+    for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+        local p = valid(c) and try(function() return c.Pawn end) or nil
+        if valid(p) and try(function() return helper:IsDying(p) end) and not try(function() return helper:IsDeath(p) end) then
+            local max = try(function() return helper:GetMaxHealth(p) end)
+            local ok = type(max) == "number" and max > 0 and pcall(function() helper:SetHealth(p, max) end)
+            log("boss revive: " .. name(p) .. " stands up (health " .. tostring(max) .. ") -> " .. tostring(ok))
+            n = n + 1
+        elseif valid(c) and (not valid(p) or try(function() return helper:IsDeath(p) end)) then
+            n = n + 1
+            local at = { X = loc.X + right.X * 150 * n, Y = loc.Y + right.Y * 150 * n, Z = loc.Z + 5 }
+            local r = { Pitch = 0, Yaw = rot.Yaw, Roll = 0 }
+            local ok, e = pcall(function() helper:RequestPlayerSpawn(alive, c, at, r, r, true, false) end)
+            log("boss revive: " .. name(c) .. " next to " .. name(alive) .. " -> " .. (ok and "called" or ("ERROR " .. tostring(e):sub(1, 120))))
+        end
+    end
+    log("boss revive: " .. n .. " player(s) brought back")
+    -- only with the host down: alive, the game sends rewards and the end itself (review 11-06)
+    if n > 0 and hostDown then bossForce = { at = os.clock() + 0.5, phase = 1, showAt = os.clock() + 1.5 } end
+    pcall(function() local f = io.open(TRUEDEAD_FILE, "w"); if f then f:write("0"); f:close() end end)
+    bossMark = nil
+end
+-- The game's own event for a boss area's enemy dying (owner: tie it to the game; test 07:59: it fires, also with the host down).
+pcall(function()
+    RegisterHook("/Script/Extensions.BossAreaBase:MulticastOnEnemyDead", function(ctx, e)
+        local area = try(function() return ctx:get() end)
+        local en = try(function() return e:get() end)
+        local hlp = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+        local boss = valid(en) and try(function() return hlp:IsBoss(en) end)
+        local last = valid(area) and try(function() return area:IsLastPhase() end)
+        log("boss event: MulticastOnEnemyDead " .. (valid(en) and name(en) or "?") .. " boss=" .. tostring(boss) .. " lastPhase=" .. tostring(last))
+        if boss and last ~= false then bossReviveUntil, bossReviveDue, bossArea = os.clock() + 8, true, area; recBossDue = true end
+    end)
+end)
+pcall(function()
+    RegisterHook("/Script/Extensions.BossAreaBase:OnAbortByPleyerCharacterDeath", function() log("boss event: OnAbortByPleyerCharacterDeath") end)
+end)
+-- 2026-11-06: Io kept trying to revive the dead host and stood still. A dead player in a boss fight gets the same "can never be
+-- revived" answer as a true death (CoopNative.truedead, read by the IsNeverRevive hook). AI partners live on the host.
+bossMark, bossMarkAt = nil, -1000
+function bossDeadMark()
+    if os.clock() - bossMarkAt < 1 then return end
+    bossMarkAt = os.clock()
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not valid(gs) or try(function() return gs.Role end) ~= 3 then return end
+    local now
+    if try(function() return gs.BossAreaState end) == 2 then
+        local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+        for _, p in ipairs(FindAllOf("BP_Player_C") or {}) do
+            if valid(p) and isDownFinal(helper, p) then now = try(function() return p:GetAddress() end) end
+        end
+    end
+    if now == bossMark then return end
+    bossMark = now
+    local f = io.open(TRUEDEAD_FILE, "w")
+    if f then f:write(now and string.format("%X B", now) or "0"); f:close() end
+    log("boss fight: never-revive mark " .. (now and string.format("on %X", now) or "cleared"))
+end
+-- Where a guest who died in the field comes back (owner 2026-11-06): the last Mistle used by the host or a guest in this session.
+lastMistle = nil
+function noteMistle(pawn, who)
+    local loc = valid(pawn) and try(function() return pawn:K2_GetActorLocation() end)
+    if not loc then return end
+    lastMistle = { X = loc.X, Y = loc.Y, Z = loc.Z, Yaw = try(function() return pawn:K2_GetActorRotation().Yaw end) or 0 }
+    log(string.format("last Mistle: used by the %s at %.0f,%.0f,%.0f", who, loc.X, loc.Y, loc.Z))
+end
+local function respawnGuest(helper, deadPawn, hostPawn, withAppear, atMistle)
     local pc
     for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
         if valid(c) and not try(function() return c:IsLocalController() end) then pc = c end
@@ -464,11 +595,12 @@ local function respawnGuest(helper, deadPawn, hostPawn, withAppear)
     local loc = hostPawn:K2_GetActorLocation()
     local rot = hostPawn:K2_GetActorRotation()
     local right = hostPawn:GetActorRightVector()
-    local at = { X = loc.X + right.X * 150, Y = loc.Y + right.Y * 150, Z = loc.Z + 50 }
+    local at = { X = loc.X + right.X * 150, Y = loc.Y + right.Y * 150, Z = loc.Z + 5 }   -- (2026-11-06: +50 left him floating for a moment)
     local r = { Pitch = 0, Yaw = rot.Yaw, Roll = 0 }
+    if atMistle then at = { X = atMistle.X, Y = atMistle.Y, Z = atMistle.Z + 5 }; r.Yaw = atMistle.Yaw end
     -- InIsSkipAppear = true: without it the guest's controller first got a PlayerSpawner (appear sequence) and he could not move
     local ok, e = pcall(function() helper:RequestPlayerSpawn(hostPawn, pc, at, r, r, true, not withAppear) end)
-    log("group respawn: RequestPlayerSpawn(" .. name(pc) .. ") next to the host" .. (withAppear and " with the appear effect" or "") ..
+    log("group respawn: RequestPlayerSpawn(" .. name(pc) .. ") " .. (atMistle and "at the last Mistle" or "next to the host") .. (withAppear and " with the appear effect" or "") ..
         " -> " .. (ok and "called" or ("ERROR " .. tostring(e):sub(1, 120))))
     return ok
 end
@@ -480,19 +612,27 @@ local function groupRespawn(rested)
     local pc = localPC()
     local hostPawn = valid(pc) and try(function() return pc.Pawn end) or nil
     local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+    if rested and valid(hostPawn) then noteMistle(hostPawn, "host") end
+    local grf = io.open(WIN64 .. "\\plugins\\CoopNative.guestrest", "r")
+    if grf then
+        grf:close(); os.remove(WIN64 .. "\\plugins\\CoopNative.guestrest")
+        for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+            if valid(c) and not try(function() return c:IsLocalController() end) then noteMistle(try(function() return c.Pawn end), "guest") end
+        end
+    end
     if not valid(hostPawn) or try(function() return helper:IsDeath(hostPawn) end) then downed = {}; return end
+    if os.clock() < postBossUntil or os.clock() - rewardsAt < 60 then return end   -- the outro and memory bring him back themselves
     local seen = {}
     for _, p in ipairs(FindAllOf("BP_Player_C") or {}) do
         if valid(p) and name(p) ~= name(hostPawn) and try(function() return helper:IsDeath(p) end) then
             local n = name(p); seen[n] = true
             local d = downed[n]
             if not d then
-                d = { at = os.clock(), mode = "spectate" }   -- owner, session 8: always back on the host's next rest
+                d = { at = os.clock(), mode = "respawn" }
                 downed[n] = d
-                log("group respawn: " .. n .. " died -> spectates until the host rests" .. (lastCombat and " (in combat)" or " (out of combat)"))
+                log("group respawn: " .. n .. " died in the field -> respawns " .. (lastMistle and "at the last Mistle" or "next to the host (no Mistle used yet)") .. " after " .. RESPAWN_DELAY .. " s")
             end
-            local due = (d.mode == "respawn" and os.clock() - d.at >= RESPAWN_DELAY) or (d.mode == "spectate" and rested)
-            if due and not d.done then d.done = true; respawnGuest(helper, p, hostPawn) end   -- one try per death
+            if os.clock() - d.at >= RESPAWN_DELAY and not d.done then d.done = true; respawnGuest(helper, p, hostPawn, true, lastMistle) end   -- one try per death
         end
     end
     for n in pairs(downed) do if not seen[n] then downed[n] = nil end end
@@ -556,6 +696,294 @@ local function makeVisible(helper, p, who)
     local after = tostring(try(function() return p.bIsDisappearExpression end)) .. "/" .. tostring(try(function() return helper:IsVanish(p) end))
     log("keep dying: " .. who .. " make " .. name(p) .. " visible: disappear/vanish " .. before .. " -> " .. after ..
         " (multicast " .. tostring(a) .. ", flag " .. tostring(b) .. ", meshes " .. tostring(c) .. ")")
+end
+-- Home Base with the session kept (2026-11-06, diagnostic). Home Base is streamed into MainGame like every stage (29 sublevels in its list), yet
+-- at the 10-29 test the host arrived in empty space and fell: its levels came up only after the session had ended. This logs every Home
+-- Base level twice a second for 45 s, holds the host in the air until the geometry is there, and forces the levels after 10 s if nothing moved.
+hbLevels, hbAt, hbNext, hbForced, hbStart = nil, 0, 0, false, false
+-- The game's Home Base mode (values read on the host at Home Base, 10-30): no weapon, no veil, no dash or attack. Each game sets it for its own
+-- character; on a guest nobody does, so he kept weapon and veil over the Home Base animations.
+function hbBaseInfo()
+    return { FieldType = 1, HeadUpDisplayType = 1, LimitMoveType = 0, bCanDash = false, bCanAttack = false, bWeaponVisibility = false, bCanStep = false, UseItemType = 1,
+             bCanFieldMenu = true, CameraType = 0, ClothType = 0, bToxicGuardMaskInnerVisibility = false, bToxicGuardMaskOuterVisibility = false, bJinkakuVisibility = false,
+             CameraLightIntensity = 0, bNowAvatarCustomizing = false, bSpecialGimmickActive = false }
+end
+-- the guest's talk fix needs the name of the script function (see CoopNative)
+talkSent, talkAt = false, -1000
+function talkFnSend()
+    if talkSent or os.clock() - talkAt < 5 then return end
+    talkAt = os.clock()
+    local f = StaticFindObject("/Game/Cinematics/Scenario/Common/Blueprints/Base/BP_ScenarioStarter.BP_ScenarioStarter_C:ProcessInputButtonEvent")
+    local a = valid(f) and try(function() return f:GetAddress() end)
+    if not a then return end
+    local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
+    if c then c:write(string.format("talkfn %X\n", a)); c:close(); talkSent = true; log(string.format("talk: ProcessInputButtonEvent at %X sent to CoopNative", a)) end
+end
+pcall(function()
+    RegisterHook("/Script/Engine.PlayerController:ClientMessage", function(ctx, s)
+        local text = try(function() return s:get():ToString() end)
+        if text == "CoopHBStart" then hbStart, hbGuestWait, hbTarget = true, true, nil
+        elseif text == "CoopHBLeave" then hbLeaveIn = true
+        elseif text and text:find("^CoopHBAt:") then
+            local x, y, z = text:match("^CoopHBAt:([-%d.]+),([-%d.]+),([-%d.]+)")
+            if z then hbTarget = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) } end
+        end
+    end)
+end)
+-- 11-06 09:28: held on his PC he still fell (39036, then 37222...) and died: the host simulates his character, and its copy lost the ground when
+-- the field streamed away there. So the host holds its copy in the air, from the teleport until he stands in Home Base.
+-- 11-06 baseinfo: his character has the mode (weapon and veil off, like the host's), yet both stayed: a character reads it when it is made, his already
+-- exists. These re-apply it. (Untested.)
+function hbApplyLook(hlp, p)
+    local a, ea = pcall(function() hlp:UpdateJinkakuVisibility(p) end)
+    local b, eb = pcall(function() hlp:OnAnimNotifyStateChangeVisibilityOfWeapon(p, false, 0.0) end)
+    log("hb: veil and weapon re-applied on " .. name(p) .. " -> " .. (a and "ok" or tostring(ea):sub(1, 80)) .. ", " .. (b and "ok" or tostring(eb):sub(1, 80)))
+end
+function hbInBase()
+    local fm = FindFirstOf("AppFieldManager")
+    return valid(fm) and try(function() return fm:IsInHideout(fm) end) == true
+end
+-- Leaving Home Base with a guest: the same hold as on the way in (11-06 14:32)
+function hbLeaveStart()
+    local guests = {}
+    for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+        if valid(c) and not try(function() return c:IsLocalController() end) then guests[#guests + 1] = c end
+    end
+    if #guests == 0 then return end
+    hbUntil, hbAt, hbNext, hbForced, hbReady, hbLevels = os.clock() + 45, os.clock(), 0, false, false, nil
+    hbLeave, hbLeaveArrived, hbLeaveOk, hbHostHold, hbRelease = true, false, nil, true, nil
+    log("hb: leaving Home Base with " .. #guests .. " guest(s): held until the stage is there")
+    local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+    for _, c in ipairs(guests) do
+        pcall(function() c:ClientMessage("CoopHBLeave", FName("None"), 0) end)
+        local g = try(function() return c.Pawn end)
+        if valid(g) and iniHas("hb_base_mode=1") then pcall(function() helper:ClearRestrictedActionInBaseInfoHost(g) end) end
+    end
+end
+function hbGuestsHere()
+    local pc = localPC()
+    local me = valid(pc) and try(function() return pc.Pawn end) or nil
+    local hp = valid(me) and try(function() return me:K2_GetActorLocation() end)
+    if not hp then return true end
+    for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+        local g = valid(c) and not try(function() return c:IsLocalController() end) and try(function() return c.Pawn end) or nil
+        local gp = valid(g) and try(function() return g:K2_GetActorLocation() end)
+        if gp then
+            local dx, dy, dz = gp.X - hp.X, gp.Y - hp.Y, gp.Z - hp.Z
+            if dx * dx + dy * dy + dz * dz > 2000 * 2000 then
+                local to = { X = hp.X + 150, Y = hp.Y, Z = hp.Z + 5 }
+                local ok, moved = pcall(function() return g:K2_TeleportTo(to, { Pitch = 0, Yaw = 0, Roll = 0 }) end)
+                hbRetryLogs = (hbRetryLogs or 0) + 1
+                if hbRetryLogs <= 10 then log(string.format("hb: %s is still at z=%.0f, moving him again -> %s, answer %s", name(g), gp.Z, tostring(ok), tostring(moved))) end
+                return false
+            end
+        end
+    end
+    return true
+end
+function hbHoldGuests(mode)
+    for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+        local g = valid(c) and not try(function() return c:IsLocalController() end) and try(function() return c.Pawn end) or nil
+        local gm = valid(g) and try(function() return g.CharacterMovement end) or nil
+        if valid(gm) and try(function() return gm.MovementMode end) ~= mode then
+            pcall(function() gm:StopMovementImmediately() end)
+            pcall(function() gm:SetMovementMode(mode, 0) end)
+        end
+    end
+end
+-- every character for CoopNative's appear lock (see clear_holder_flags)
+hbHoldersAt = -1000
+function hbHolders()
+    if os.clock() - hbHoldersAt < 2 then return end
+    hbHoldersAt = os.clock()
+    local list = {}
+    for _, q in ipairs(FindAllOf("Character") or {}) do
+        local a = valid(q) and try(function() return q:GetAddress() end)
+        if a then list[#list + 1] = string.format("%X", a) end
+    end
+    local f = io.open(WIN64 .. "\\plugins\\CoopNative.holders", "w")
+    if f then f:write(table.concat(list, " ")); f:close() end
+end
+function hbWatch()
+    local path = WIN64 .. "\\plugins\\CoopNative.hbwatch"
+    local f = io.open(path, "r")
+    if f or hbStart then
+        if f then f:close(); os.remove(path) end
+        hbStart = false
+        hbUntil, hbAt, hbNext, hbForced, hbReady, hbLevels = os.clock() + 45, os.clock(), 0, false, false, nil
+        hbLeave, hbLeaveArrived, hbLeaveOk = false, false, nil
+        log("hb: teleport to Home Base with the session kept, watching the levels")
+        if REC then recSchedule("hb") end
+        if not f then
+            local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
+            if c then c:write("hbstart\n"); c:close() end
+        end
+        -- 11-06: his ground streams away with the host's departure; twice he was already falling when the host moved him, and then the move
+        -- did not stop him (the 08:49 run just won that race). So he is held in the air from the very start.
+        local gss = FindFirstOf("BP_AppGameState_C")
+        if f and valid(gss) and try(function() return gss.Role end) == 3 then
+            hbHostHold, hbRelease = true, nil
+            for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+                if valid(c) and not try(function() return c:IsLocalController() end) then pcall(function() c:ClientMessage("CoopHBStart", FName("None"), 0) end) end
+            end
+        end
+    end
+    if hbLeaveIn then
+        hbLeaveIn = false
+        hbUntil, hbAt, hbNext, hbForced, hbReady, hbLevels = os.clock() + 45, os.clock(), 0, false, false, nil
+        hbLeave, hbLeaveArrived, hbLeaveOk, hbGuestWait, hbTarget = true, true, nil, false, nil
+        log("hb: the host leaves Home Base, we hover until the stage is here")
+        if iniHas("hb_base_mode=1") then
+            local pcl = localPC()
+            local me = valid(pcl) and try(function() return pcl.Pawn end) or nil
+            local hlp = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+            if valid(me) then pcall(function() hlp:ClearRestrictedActionInBaseInfo(me) end) end
+        end
+    end
+    local now = os.clock()
+    if hbHostHold then
+        -- 11-06 13:58: the move answered "ok" but he stayed in the old area, was let go 2 s later and fell. He stays held until he is really here.
+        if hbRelease and now >= hbRelease and now < hbUntil + 60 and not hbGuestsHere() then
+            hbRelease = now + 1
+            hbHoldGuests(5)
+        elseif hbRelease and now >= hbRelease or now > hbUntil + 60 then
+            hbHostHold, hbRelease, hbLeave = false, nil, false
+            hbHoldGuests(1)
+            log("hb: guests released, walking")
+        else hbHoldGuests(5) end
+    end
+    local pc = localPC()
+    local mine = valid(pc) and try(function() return pc.Pawn end) or nil
+    local cm = valid(mine) and try(function() return mine.CharacterMovement end) or nil
+    if now > hbUntil then
+        if hbHover then
+            hbHover = false
+            if valid(cm) then pcall(function() cm:SetMovementMode(1, 0) end) end
+            log("hb: window over without the geometry -> walking again")
+        end
+        return
+    end
+    if not hbReady and valid(cm) and try(function() return cm.MovementMode end) ~= 5 then pcall(function() cm:SetMovementMode(5, 0) end); hbHover = true end
+    if hbTarget and valid(mine) then   -- his own game moves him, until he is really there
+        local gp = try(function() return mine:K2_GetActorLocation() end)
+        if gp then
+            local dx, dy, dz = gp.X - hbTarget.X, gp.Y - hbTarget.Y, gp.Z - hbTarget.Z
+            if dx * dx + dy * dy + dz * dz < 300 * 300 then
+                log(string.format("hb: we are next to the host at z=%.0f", gp.Z))
+                hbTarget, hbGuestWait = nil, false
+            else
+                local ok, moved = pcall(function() return mine:K2_TeleportTo(hbTarget, try(function() return mine:K2_GetActorRotation() end) or { Pitch = 0, Yaw = 0, Roll = 0 }) end)
+                hbMoveLogs = (hbMoveLogs or 0) + 1
+                if hbMoveLogs <= 12 then log(string.format("hb: moving ourselves next to the host (z=%.0f -> %.0f) %s, answer %s", gp.Z, hbTarget.Z, tostring(ok), tostring(moved))) end
+            end
+        end
+    end
+    if now < hbNext then return end
+    hbNext = now + 0.5
+    pcall(hbHolders)
+    if not hbLevels or #hbLevels == 0 then
+        hbLevels = {}
+        local total, samples = 0, {}
+        for _, cls in ipairs({"LevelStreamingKismet", "LevelStreamingAlwaysLoaded", "LevelStreaming"}) do
+            for _, l in ipairs(FindAllOf(cls) or {}) do
+                if valid(l) then
+                    total = total + 1
+                    -- 11-06 08:34: PackageName:ToString found nothing; several ways, and raw samples in the log
+                    local pkg = try(function() return l:GetWorldAssetPackageFName():ToString() end)
+                    if type(pkg) ~= "string" then pkg = try(function() return l.PackageNameToLoad:ToString() end) end
+                    if type(pkg) ~= "string" then pkg = try(function() return l.PackageName:ToString() end) end
+                    if type(pkg) ~= "string" then pkg = "" end
+                    if #samples < 4 then samples[#samples + 1] = name(l) .. "=" .. pkg:sub(-40) end
+                    if hbLeave then
+                        -- leaving: the static mesh levels of any other area; the ones the game asks for decide
+                        if pkg:find("/Environment/", 1, true) and pkg:find("_SM", 1, true) and not pkg:find("Base0", 1, true) then hbLevels[#hbLevels + 1] = { l = l, n = pkg:match("([^/]+)$") or pkg } end
+                    elseif pkg:find("Base01_Hideout", 1, true) and pkg:find("Environment", 1, true) then hbLevels[#hbLevels + 1] = { l = l, n = pkg:match("Hideout_([%w_]+)$") or pkg:match("([^/]+)$") } end
+                end
+            end
+        end
+        log("hb: " .. #hbLevels .. " Home Base levels of " .. total .. " found; samples " .. table.concat(samples, " | "))
+        local vols = {}
+        for _, v in ipairs(FindAllOf("AppLevelStreamingVolume") or {}) do
+            if valid(v) and name(v):find("Base", 1, true) then vols[#vols + 1] = name(v) .. " should=" .. tostring(try(function() return v:IsEitherLevelShouldBeLoaded() end)) .. " autoKeep=" .. tostring(try(function() return v.bAutoEnableFromFirstSpawnToQuitGame end)) end
+        end
+        log("hb: volumes " .. table.concat(vols, " | "):sub(1, 500))
+    end
+    local parts, loaded, visible, geo = {}, 0, 0, false
+    local want, shown = 0, 0
+    for _, e in ipairs(hbLevels) do
+        local l = e.l
+        if valid(l) then
+            local sl = try(function() return l.bShouldBeLoaded end)
+            local sv = try(function() return l.bShouldBeVisible end)
+            local il = try(function() return l:IsLevelLoaded() end)
+            local iv = try(function() return l:IsLevelVisible() end)
+            if il then loaded = loaded + 1 end
+            if iv then visible = visible + 1 end
+            if iv and e.n == "SM" and not hbLeave then geo = true end
+            if sl then want = want + 1; if iv then shown = shown + 1 end end
+            if not hbLeave then parts[#parts + 1] = string.format("%s:%d%d%d%d", e.n, sl and 1 or 0, sv and 1 or 0, il and 1 or 0, iv and 1 or 0) end
+        end
+    end
+    if hbLeave then
+        -- 11-06 14:32: the host "arrived" 3.9 s after leaving Home Base, with no stage there yet, fell, and the guest with him. Ready = the host is at the
+        -- target and every level the game asked for has been shown for 1.5 s (the levels are asked for in steps).
+        if hbLeaveArrived and want > 0 and shown == want then
+            hbLeaveOk = hbLeaveOk or now
+            geo = now - hbLeaveOk >= 1.5
+        else hbLeaveOk = nil end
+        parts[1] = string.format("leaving: %d of %d stage levels shown", shown, want)
+    end
+    local loc = valid(mine) and try(function() return mine:K2_GetActorLocation() end)
+    log(string.format("hb: %.1f s, %d loaded, %d visible (should load/should show/loaded/shown) %s | pawn %s z=%s", now - hbAt, loaded, visible, table.concat(parts, " "),
+        valid(mine) and name(mine) or "none", loc and string.format("%.0f", loc.Z) or "?"))
+    if geo and not hbReady and not hbGuestWait then
+        hbReady = true
+        hbHover = false
+        if valid(cm) then pcall(function() cm:SetMovementMode(1, 0) end) end
+        log("hb: the geometry is there after " .. string.format("%.1f", now - hbAt) .. " s -> walking, the guests can follow")
+        local gsb = FindFirstOf("BP_AppGameState_C")
+        if not hbLeave and iniHas("hb_base_mode=1") and valid(mine) and valid(gsb) and try(function() return gsb.Role end) ~= 3 then
+            local hlp = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+            local ok, e = pcall(function() hlp:SetRestrictedActionInBaseInfo(mine, hbBaseInfo()) end)
+            log("hb: Home Base mode on our character -> " .. (ok and "ok" or ("ERROR " .. tostring(e):sub(1, 120))))
+            hbApplyLook(hlp, mine)
+        end
+    end
+    if not hbLeave and not hbReady and not hbGuestWait and not hbForced and now - hbAt > 10 then
+        hbForced = true
+        local n = 0
+        for _, e in ipairs(hbLevels) do
+            if valid(e.l) and pcall(function() e.l.bShouldBeLoaded = true; e.l.bShouldBeVisible = true end) then n = n + 1 end
+        end
+        log("hb: nothing after 10 s -> forcing " .. n .. " levels to load")
+    end
+end
+-- Boss killed with the host down (owner 2026-11-06): the game skips MulticastGainRewards and MulticastFinishBossBattle then (logs: both fire
+-- only with the host alive at the kill, 2.4 s apart), so call them in the same order. The host's spawned character stayed hidden on his
+-- own screen and without input: make it visible and lift the input lock once it is there.
+function bossForceTick()
+    if not bossForce then return end
+    local now = os.clock()
+    if bossForce.showAt and now >= bossForce.showAt then
+        bossForce.showAt = nil
+        local pc = localPC()
+        local mine = valid(pc) and try(function() return pc.Pawn end) or nil
+        local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+        if valid(mine) then makeVisible(helper, mine, "boss revive:") end
+        unlockUntil, unlockedPawn = now + 15, nil
+    end
+    if bossForce.phase == 1 and now >= bossForce.at then
+        bossForce.phase, bossForce.at = 2, now + 2.4
+        if now - rewardsAt > 20 then
+            local ok, e = pcall(function() bossArea:MulticastGainRewards() end)
+            log("boss end: MulticastGainRewards called by us -> " .. (ok and "ok" or ("ERROR " .. tostring(e):sub(1, 120))))
+        else log("boss end: the game sent the rewards itself") end
+    elseif bossForce.phase == 2 and now >= bossForce.at then
+        bossForce.phase = 3
+        local ok, e = pcall(function() bossArea:MulticastFinishBossBattle(false) end)
+        log("boss end: MulticastFinishBossBattle(false) called by us -> " .. (ok and "ok" or ("ERROR " .. tostring(e):sub(1, 120))))
+    end
+    if bossForce.phase == 3 and not bossForce.showAt then bossForce = nil end
 end
 -- Group teleport v1 (group_teleport=1, host; session 9). The host teleports through his Mistle menu as usual; CoopNative notes
 -- RequestPlayerSpawnToCheckPoint in CoopNative.teleport. Once the host's new pawn is up (a new pawn, or 8 s at the latest), each
@@ -638,6 +1066,9 @@ local function groupTeleport()
             -- move again (cutscene over: move input not ignored for 2 s), up to 3 minutes.
             pendingTp = { at = os.clock(), oldHost = valid(m0) and try(function() return m0:GetAddress() end) or nil, memend = what:find("memend") ~= nil }
             log("group teleport: host teleports, guests follow once the host has arrived")
+            if hbInBase() then hbLeaveStart() end
+        recTeleportDue = true
+        lastMistle = nil   -- the last rest may be in another area now: until the next rest he comes back next to the host
             -- item 8 v2: host -> guest message (PlayerController:ClientMessage is a client RPC): the guest fades now, at the start
             for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
                 if valid(c) and not try(function() return c:IsLocalController() end) then
@@ -647,6 +1078,7 @@ local function groupTeleport()
             end
         elseif what:find("^arrived") and pendingTp then
             pendingTp.arrivedAt = os.clock()
+            hbLeaveArrived = true
             log("group teleport: host's characters re-spawned at the target")
         end
     end
@@ -672,6 +1104,7 @@ local function groupTeleport()
     if not arrived then return end
     pendingTp.newSeenAt = pendingTp.newSeenAt or os.clock()
     if os.clock() - pendingTp.newSeenAt < 3 then return end   -- let the host's area finish loading
+    if os.clock() < hbUntil and not hbReady then return end   -- Home Base: not before its levels are there, or he falls
     if pendingTp.memend then
         -- 2026-11-05: "can move" came 2 s into the final cutscene (it does not block move input): the guest spawned into the host's
         -- cutscene with the join message. The game's own report of the finished scene is the real end.
@@ -680,6 +1113,31 @@ local function groupTeleport()
         memendBring = true
     end
     pendingTp = nil
+    -- Home Base (2026-11-06): RequestPlayerSpawn gave his new character a teleport driver that hung for good (state 7, no level to wait for: the
+    -- host had already loaded everything), with the host behind a loading screen. Move his existing character instead, as the memory
+    -- follow does: no driver. His PC loads Home Base itself; he hovers until his geometry is there (CoopHB -> hbWatch on his side).
+    if os.clock() < hbUntil and not hbLeave then
+        local hp2 = try(function() return mine:K2_GetActorLocation() end)
+        local hr2 = try(function() return mine:K2_GetActorRotation() end)
+        local right2 = try(function() return mine:GetActorRightVector() end)
+        for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+            local g = valid(c) and not try(function() return c:IsLocalController() end) and try(function() return c.Pawn end) or nil
+            if valid(g) and hp2 and right2 then
+                local to = { X = hp2.X + right2.X * 150, Y = hp2.Y + right2.Y * 150, Z = hp2.Z + 5 }
+                pcall(function() c:ClientMessage(string.format("CoopHBAt:%.1f,%.1f,%.1f", to.X, to.Y, to.Z), FName("None"), 0) end)
+                local ok, moved = pcall(function() return g:K2_TeleportTo(to, hr2 or { Pitch = 0, Yaw = 0, Roll = 0 }) end)
+                log("hb: " .. name(g) .. " moved next to the host (no new character) -> " .. tostring(ok) .. ", answer " .. tostring(moved))
+                hbRelease = os.clock() + 2
+                -- (11-06 09:10: with this the host stayed on a loading screen and the guest floated; off until understood)
+                if iniHas("hb_base_mode=1") then
+                    local okb, eb = pcall(function() helper:SetRestrictedActionInBaseInfoHost(g, hbBaseInfo()) end)
+                    log("hb: Home Base mode on " .. name(g) .. " -> " .. (okb and "ok" or ("ERROR " .. tostring(eb):sub(1, 120))))
+                    hbApplyLook(helper, g)
+                end
+            end
+        end
+        return
+    end
     -- by remote controller: right after the teleport the host's old pawn still exists and was taken for a guest (spawned twice)
     local n = 0
     for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
@@ -700,6 +1158,7 @@ local function groupTeleport()
         end
     end
     log("group teleport: " .. n .. " guest(s) brought to the host")
+    if hbLeave then hbRelease = os.clock() + 2 end
     memendBring = false
 end
 -- memory state on the host (set by the scene relay): memHostOn while the memory runs; memFollowAt = a host skip to follow;
@@ -715,6 +1174,16 @@ local function keepDying(rested)
     local sm = FindFirstOf("AppSessionManager")
     local isHost = valid(gs) and try(function() return gs.Role end) == 3
     local function alive(p) return valid(p) and not try(function() return helper:IsDeath(p) end) and not try(function() return helper:IsDying(p) end) end
+    if not iniHas("boss_keep=0") and valid(gs) and try(function() return gs.BossAreaState end) == 2 and valid(sm) and try(function() return sm:IsOnlineMultiplay(gs) end) then
+        local ps = {}
+        for _, p in ipairs(FindAllOf("BP_Player_C") or {}) do if valid(p) then ps[#ps + 1] = p end end
+        for _, p in ipairs(ps) do
+            local otherAlive = false
+            for _, q in ipairs(ps) do if q ~= p and name(q) ~= name(p) and alive(q) then otherAlive = true end end
+            local a = try(function() return p:GetAddress() end)
+            if a and otherAlive then list[#list + 1] = string.format("%X", a) end
+        end
+    end
     if iniHas("keep_dying=1") and valid(gs) and valid(sm) and try(function() return sm:IsOnlineMultiplay(gs) end)
         and valid(mine) and name(mine):find("BP_Player_C", 1, true) then
         local others = {}
@@ -977,7 +1446,7 @@ local function guestTeleportFade()
     local hostName = valid(host) and name(host) or nil
     if tpfOnAt then
         if mineName and mineName ~= tpfMine and not tpfMineAt then tpfMineAt = os.clock() end
-        local scene = tpfReady.host and tpfReady.guest
+        local scene = (tpfReady.host and tpfReady.guest) or (hbReady and os.clock() < hbUntil)
         local done = scene or (tpfMineAt and os.clock() - tpfMineAt > 1.5) or os.clock() - tpfOnAt > 25
         local ctx = valid(mine) and try(function() return mine:GetAddress() end)
         if not ctx and valid(pc) then ctx = try(function() return pc:GetAddress() end) end
@@ -1123,6 +1592,7 @@ end
 -- report of a finished scene starts the same follow.
 pcall(function()
     RegisterHook("/Script/Extensions.ScenarioPlayerComponent:MulticastSetReadyToFinish", function(ctx, b)
+        if try(function() return b:get() end) ~= true then return end   -- bHost: the guest's report must not count as the host's scene end
         if memHostOn then memFollowAt = os.clock() end
         if pendingTp and pendingTp.memend and not pendingTp.finishedAt then pendingTp.finishedAt = os.clock() end
     end)
@@ -1254,11 +1724,18 @@ WALL_CLASSES = {"BP_MistWall_C", "BP_MistWall_St07_C"}
 -- setters. Io (ActionNPC, the companion) is left alone.
 function visActors()
     local out = {}
+    -- 11-06 recording: everywhere else both PCs match by themselves. Left over: side-quest NPCs in Home Base, whose host-side value never reaches his
+    -- copy (no OnRep there), so his game showed both stages of the same woman. With vis_mirror=0 only those are mirrored.
+    if VIS_OFF then
+        local fm = FindFirstOf("AppFieldManager")
+        if not (valid(fm) and try(function() return fm:IsInHideout(fm) end) == true) then return out end
+    end
     for _, q in ipairs(FindAllOf("Character") or {}) do
         local n = valid(q) and name(q)
         -- (2026-11-03: Sophie is BP_SubQuestChara_08_002_SumikaDevil: side-quest characters are included too)
-        if n and (n:find("ScenarioChara", 1, true) or n:find("SubQuestChara", 1, true)) then out[#out + 1] = {q, "V"} end
+        if n and (n:find("SubQuestChara", 1, true) or (not VIS_OFF and n:find("ScenarioChara", 1, true))) then out[#out + 1] = {q, "V"} end
     end
+    if VIS_OFF then return out end
     for _, c in ipairs(WALL_CLASSES) do
         for _, q in ipairs(FindAllOf(c) or {}) do if valid(q) then out[#out + 1] = {q, "W"} end end
     end
@@ -1267,11 +1744,11 @@ end
 function visState(q, kind)
     if kind == "W" then return try(function() return q.bProcessEnable end) and "1" or "0" end
     local pv = try(function() return q.bProgressVisibility end)
-    local sv = try(function() return q.bShouldBeVisible end)
     local hidden = try(function() return q.bHidden end)
     if pv == nil then return hidden and "0" or "1" end   -- classes without progress visibility
     -- (2026-11-03: Cyllene was off by progress on the guest but could be shown again through bHidden; count both)
-    return (pv and sv ~= false and not hidden) and "1" or "0"
+    -- (11-06: bShouldBeVisible is left out: it belongs to the radar, set by distance)
+    return (pv and not hidden) and "1" or "0"
 end
 visSent, visAt, visGuests = {}, -1000, 0
 function visMirrorHost()
@@ -1286,11 +1763,14 @@ function visMirrorHost()
     if #guests == 0 then visGuests = 0; return end
     if #guests > visGuests then visSent = {} end   -- a new guest: send everything again
     visGuests = #guests
-    local changed = {}
+    local changed, cur = {}, {}
     for _, e in ipairs(visActors()) do
         local q, kind = e[1], e[2]
         local n = name(q)
         local s = kind .. visState(q, kind)
+        if cur[n] ~= kind .. "1" then cur[n] = s end   -- two actors can share a name: on wins
+    end
+    for n, s in pairs(cur) do
         if visSent[n] ~= s then visSent[n] = s; changed[#changed + 1] = n .. "=" .. s end
     end
     for i = 1, #changed, 15 do
@@ -1304,6 +1784,7 @@ pcall(function()
     RegisterHook("/Script/Engine.PlayerController:ClientMessage", function(ctx, s)
         local text = try(function() return s:get():ToString() end)
         if text and text:find("^CoopVis:") then visIn[#visIn + 1] = text:sub(9) end
+        if text and text:find("^CoopRec") then recIn[#recIn + 1] = text end
     end)
 end)
 -- the guest keeps the host's last state per name and re-applies it every 3 s (his own logic switched the wall back on before)
@@ -1336,7 +1817,6 @@ function visMirrorGuest()
                     else pcall(function() q:OnDeactivate(true) end); pcall(function() q:DestructEffect() end) end
                 else
                     pcall(function() q:SetProgressVisibility(on) end)
-                    pcall(function() q.bShouldBeVisible = on end)
                     pcall(function() q:SetActorHiddenInGame(not on) end)
                 end
                 applied[#applied + 1] = n .. (on and " on" or " off")
@@ -1345,7 +1825,158 @@ function visMirrorGuest()
     end
     if #applied > 0 then log("visibility mirror: " .. table.concat(applied, ", ")) end
 end
+-- Recording round (11-06, rec=1 in CoopNative.ini): one rich log on both PCs instead of many small tests. Log only, except that vis_mirror=0
+-- switches the visibility mirror off so that the game's own behaviour shows. recEvent runs on the host and tells every guest, so both
+-- take their snapshots at the same moment; the message carries the host's clock, which also lines up the two logs.
+-- "rec npc" lines here; "rec raw" lines with the fields Lua cannot read come from CoopNative for the same addresses.
+REC = iniHas("rec=1")
+VIS_OFF = iniHas("vis_mirror=0")
+REC_PLAN = { join = {3, 15, 30}, boss = {3, 20}, teleport = {15, 30}, hb = {6, 14, 22, 32, 40, 60, 90}, mark = {0}, force = {3, 10, 20} }
+REC_DUMP = { join = 20, boss = 25, teleport = 32, hb = 24, mark = 1 }
+recDue, recIn, recPeriodAt, recGuests, recGuestsAt = {}, {}, 0, 0, 0
+recBossDue, recTeleportDue, recForce, recLayouts = false, false, nil, nil
+function recCmd(s)
+    local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
+    if c then c:write(s .. "\n"); c:close() end
+end
+function recSchedule(why)
+    local now, last = os.clock(), 0
+    for _, s in ipairs(REC_PLAN[why] or {}) do
+        recDue[#recDue + 1] = { at = now + s, why = why .. "+" .. s }
+        if s > last then last = s end
+    end
+    if REC_DUMP[why] then recDue[#recDue + 1] = { at = now + REC_DUMP[why], why = why .. "+" .. REC_DUMP[why], dump = true } end
+    if why ~= "hb" then recCmd("recwin " .. (last + 15)) end
+end
+function recEvent(why)
+    if not REC then return end
+    log("rec event " .. why .. " at host clock " .. stamp())
+    recSchedule(why)
+    for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+        if valid(c) and not try(function() return c:IsLocalController() end) then
+            pcall(function() c:ClientMessage("CoopRecEvt:" .. why .. ":" .. stamp(), FName("None"), 0) end)
+        end
+    end
+end
+function recCensus(why)
+    local set, lines = {}, {}
+    for _, q in ipairs(FindAllOf("Character") or {}) do
+        local n = valid(q) and name(q)
+        if n and (n:find("ScenarioChara", 1, true) or n:find("SubQuestChara", 1, true) or n:find("BP_Player", 1, true) or n:find("NPC", 1, true)) then
+            local a = try(function() return q:GetAddress() end)
+            local full = try(function() return q:GetFullName() end) or ""
+            local m = try(function() return q.Mesh end)
+            local mesh = valid(m)
+            local loc = try(function() return q:K2_GetActorLocation() end)
+            if a then set[#set + 1] = string.format("%X", a) end
+            lines[#lines + 1] = string.format("%X %s lvl=%s role=%s pv=%s sv=%s hid=%s meshHid=%s meshVis=%s sq=%s at %s", a or 0, n,
+                full:match("/([%w_]+)%.[%w_]+:PersistentLevel") or "?", tostring(try(function() return q.Role end)),
+                tostring(try(function() return q.bProgressVisibility end)), tostring(try(function() return q.bShouldBeVisible end)),
+                tostring(try(function() return q.bHidden end)), tostring(mesh and try(function() return m.bHiddenInGame end)),
+                tostring(mesh and try(function() return m.bVisible end)), tostring(try(function() return q.SubQuestState end)),
+                loc and string.format("%d,%d,%d", math.floor(loc.X), math.floor(loc.Y), math.floor(loc.Z)) or "?")
+        end
+    end
+    table.sort(lines)
+    log("rec census (" .. why .. "): " .. #lines .. " characters")
+    for _, l in ipairs(lines) do log("rec npc " .. l) end
+    if not recLayouts or why == "hb+6" then
+        recLayouts = {}
+        for _, l in ipairs(FindAllOf("LevelStreamingKismet") or {}) do
+            local pkg = valid(l) and try(function() return l:GetWorldAssetPackageFName():ToString() end)
+            if type(pkg) == "string" and pkg:find("ScenarioLayout", 1, true) then recLayouts[#recLayouts + 1] = { l = l, n = pkg:match("([^/]+)$") or pkg } end
+        end
+        log("rec census: " .. #recLayouts .. " layout levels known")
+    end
+    local lv = {}
+    for _, e in ipairs(recLayouts) do
+        local il = valid(e.l) and try(function() return e.l:IsLevelLoaded() end)
+        local iv = valid(e.l) and try(function() return e.l:IsLevelVisible() end)
+        if il or iv then lv[#lv + 1] = e.n .. (iv and ":shown" or ":loaded") end
+    end
+    table.sort(lv)
+    log("rec layouts: " .. table.concat(lv, " "))
+    local ld = {}
+    for _, l in ipairs(FindAllOf("ScenarioProgressLoader") or {}) do
+        if valid(l) then
+            ld[#ld + 1] = name(l) .. "=" .. tostring(try(function() return l.ProgressName:ToString() end)) .. " skip=" .. tostring(try(function() return l.bSkipLoadProgress end))
+        end
+    end
+    log("rec loaders: " .. table.concat(ld, " | "))
+    local wl = {}
+    for _, c in ipairs(WALL_CLASSES) do
+        for _, w in ipairs(FindAllOf(c) or {}) do
+            if valid(w) and try(function() return w.bProcessEnable end) then wl[#wl + 1] = name(w) end
+        end
+    end
+    table.sort(wl)
+    log("rec walls on: " .. table.concat(wl, " "))
+    local f = io.open(WIN64 .. "\\plugins\\CoopNative.recset", "w")
+    if f then f:write(table.concat(set, " ")); f:close(); recCmd("reccensus") end
+end
+function recTick()
+    if not REC then return end
+    local gs = FindFirstOf("BP_AppGameState_C")
+    local host = valid(gs) and try(function() return gs.Role end) == 3
+    local now = os.clock()
+    if not host then
+        for _, m in ipairs(recIn) do
+            local why, at = m:match("^CoopRecEvt:([%w_]+):(.+)$")
+            if why then
+                log("rec event " .. why .. " from the host: host clock " .. at .. ", here " .. stamp())
+                recSchedule(why)
+            end
+            local nm = m:match("^CoopRecForce:(.+)$")
+            if nm then recForce = nm end
+        end
+    end
+    recIn = {}
+    if host and now - recGuestsAt > 2 then
+        recGuestsAt = now
+        local n = 0
+        for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+            if valid(c) and not try(function() return c:IsLocalController() end) then n = n + 1 end
+        end
+        if n > recGuests then recEvent("join") end
+        recGuests = n
+    end
+    if host and recBossDue then recBossDue = false; recEvent("boss") end
+    if host and recTeleportDue then recTeleportDue = false; recEvent("teleport") end
+    if recForce then
+        -- the design's layout correction, through the game's own slot: the loader takes ForcedProgressName instead of SelectMap
+        local nm = recForce
+        recForce = nil
+        for _, l in ipairs(FindAllOf("ScenarioProgressLoader") or {}) do
+            if valid(l) and name(l):find("Base0", 1, true) then
+                local was = try(function() return l.ProgressName:ToString() end)
+                local okS, eS = pcall(function() l.ForcedProgressName = FName(nm) end)
+                local got = try(function() return l.ForcedProgressName:ToString() end)
+                local okR, eR = pcall(function() l:ReloadProgress() end)
+                log("rec force: " .. name(l) .. " was " .. tostring(was) .. ", forced " .. tostring(got) .. " set " .. (okS and "ok" or tostring(eS):sub(1, 100)) ..
+                    ", reload " .. (okR and "ok" or tostring(eR):sub(1, 100)))
+            end
+        end
+    end
+    if now - recPeriodAt > 60 then recPeriodAt = now; recCensus("periodic"); return end
+    for i = #recDue, 1, -1 do
+        local e = recDue[i]
+        if now >= e.at then
+            table.remove(recDue, i)
+            if e.dump then
+                local f = io.open(WIN64 .. "\\plugins\\CoopProgress.dump", "w")
+                if f then f:write(e.why); f:close() end
+            else
+                recCensus(e.why)
+            end
+            return
+        end
+    end
+end
+-- (11-06: the recording's Lua hooks on LoadStreamLevel and ScenarioStarter:Start* are gone. UE4SS's hook dispatcher, UE4SS.dll +0x4A47A0, walks
+-- FFrame::OutParms of the calling Blueprint frame; called from some NPC scripts that list has a bad link: endless loop (host 14:00, guest 12:47) or
+-- access violation (host 14:13). So nothing Blueprints call on a conversation may be hooked from Lua.)
 function npcCensus(reason)
+    if REC then return end
     local list, other, others = {}, 0, nil
     for _, q in ipairs(FindAllOf("Character") or {}) do
         local n = valid(q) and name(q)
@@ -1908,7 +2539,7 @@ end
 -- Cutscene sync trace (2026-11-05, log only): CoopNative samples the scenario manager's ready flags, it only needs the address.
 sceneMgrAt, sceneMgrSent = -1000, nil
 function sceneMgrSend()
-    if os.clock() - sceneMgrAt < 5 then return end
+    if not iniHas("scene_trace=1") or os.clock() - sceneMgrAt < 5 then return end
     sceneMgrAt = os.clock()
     local m = FindFirstOf("ScenarioManager")
     local ad = valid(m) and try(function() return m:GetAddress() end)
@@ -1999,12 +2630,21 @@ local function probeCommands()
     if world then pcall(npcCensusTick) end
     if world then pcall(visMirrorHost) end
     if world then pcall(visMirrorGuest) end
+    if world then
+        local okr, er = pcall(recTick)
+        if not okr and not recErr then recErr = true; log("rec ERROR " .. tostring(er):sub(1, 160)) end
+    end
     if world then pcall(bossWallsOff) end
     pcall(autoTeleportToMark)
     if not world then pcall(titleVersion) else titleDone = false end
     if world then pcall(bloodCodeSyncHost) end
     if world then pcall(bloodCodeSyncGuest) end
     if world then pcall(chestSyncHost) end
+    pcall(bossKillRevive)   -- not "world": a dead host may have no character
+    pcall(bossForceTick)
+    pcall(hbWatch)
+    pcall(talkFnSend)
+    pcall(bossDeadMark)
     if world then pcall(chestSyncGuest) end
     if world then pcall(sceneMgrSend) end
     pcall(guestMemoryControl)
@@ -2060,6 +2700,21 @@ local function probeCommands()
         local out = {}
         for n in c:gmatch("(%d+)") do out[#out + 1] = n .. "=" .. tostring(try(function() return FName(tonumber(n)):ToString() end)) end
         log("fname: " .. table.concat(out, " "))
+    elseif c == "rec" then
+        recEvent("mark")
+    elseif c == "recforce" then
+        local nm
+        for _, l in ipairs(FindAllOf("ScenarioProgressLoader") or {}) do
+            local pn = valid(l) and try(function() return l.ProgressName:ToString() end)
+            if type(pn) == "string" and pn:find("Base0", 1, true) then nm = pn end
+        end
+        log("rec force: host layout " .. tostring(nm))
+        if nm then
+            for _, g in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+                if valid(g) and not try(function() return g:IsLocalController() end) then pcall(function() g:ClientMessage("CoopRecForce:" .. nm, FName("None"), 0) end) end
+            end
+            recEvent("force")
+        end
     elseif c == "tp" then
         -- 2026-11-03 (owner): the test start position near the boss, test_mark=X,Y,Z in CoopNative.ini (host test copy)
         local okt, et = pcall(teleportToMark, "command")
