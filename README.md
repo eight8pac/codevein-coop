@@ -47,7 +47,7 @@ Everything goes into `<game dir>\CodeVein\Binaries\Win64`.
    vestige_keep=1   host only, untested: the vestige restoration screen sees "no session", so a memory keeps the session
    group_teleport=1 host only: after the host's Mistle teleport the guest is spawned next to him (also into another stage)
    teleport_skip_fields=<id>,<id>  host: teleport destinations (FieldID, logged on every teleport) that keep vanilla
-                    behaviour; Home Base is a separate map and needs to be listed here (its ID is not known yet)
+                    behaviour; Home Base (FieldID 0) streams like a stage and goes together with the group when not listed here
    keep_outro=1     both PCs: a boss kill no longer sends the guest home; the outro's four "partner ready" checks are
                     answered for the host, and the memory's character-setup lock is reset so the host's memory starts
    guest_outro=1    guest: when the boss dies, his game starts the boss area's post-boss cutscene too (he watches it with
@@ -82,8 +82,11 @@ Home Base together (two PCs, session kept):
   report, which also held the host's arrival, so story NPCs take the solo setup during the trip.
 - UE4SS's hook dispatcher walks `FFrame::OutParms` of the calling Blueprint frame, and from some NPC scripts that list has a bad
   link: endless loop or access violation. So nothing Blueprints call on a conversation may be hooked from Lua.
-- Not tested yet: leaving Home Base together (the host arrived before the stage had loaded and both fell; a hold until the stage
-  is there is in the code) and hiding the guest's weapon and veil there.
+- Works: the guest's weapon and veil are hidden there, he sees the host sit, the jukeboxes are synced both ways.
+- Leaving Home Base together still fails: the game asks for no level of the stage while a guest is connected (cause unknown), so both
+  end up in empty space and fall. The next version asks for the levels itself; not run yet.
+- Not run yet: the guest sitting down, the getting-up animation and head on the other screen, hiding the face mask, and keeping the
+  jukebox menu off the other player's screen.
 
 Works (two PCs, experiments):
 - `rest_in_coop`: the host rests at a Mistle with a guest connected; the guest stays and the enemies respawn when the host gets
@@ -115,7 +118,7 @@ Works (two PCs, experiments):
   re-spawn) and the guest is spawned next to him with `RequestPlayerSpawn`. The guest gets the game's own teleport fade: the host
   sends `PlayerController:ClientMessage("CoopTeleportFade")` (a client RPC, used as a host -> guest channel) at the start, the
   guest's CoopNative calls `RequestTeleportFade(ctx, ctx, 48, 0)` like the vanilla teleport and unfades once he is next to the
-  host. Home Base (FieldID 0) is a separate map and keeps the vanilla behaviour (`teleport_skip_fields=0`).
+  host. Home Base (FieldID 0) is part of the same map; `teleport_skip_fields=0` would keep the vanilla behaviour for it.
 - Falls (`keep_dying`): a fall leads straight to spectating (no revive window, no partner revive in the pit); the guest comes
   back next to the host at the host's next rest.
 
