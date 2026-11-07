@@ -437,7 +437,18 @@ local function worldSettled()
     return os.clock() - wgGsAt > 5
 end
 
+-- 2026-11-04: with these mods polling during the load the first engine tick came after 80 s, without them after 22 s. Nothing here
+-- is needed before the first tick, so the loops wait for CoopNative's signal (or 120 s, should CoopNative be missing).
+local coopReadyFile = (debug.getinfo(1, "S").source:match("^@(.*)[/\\]ue4ss[/\\]Mods[/\\]") or ".") .. "\\plugins\\CoopNative.ticked"
+local coopReadyStart, coopReady = os.time(), false
+local function coopEngineReady()
+    if coopReady then return true end
+    local f = io.open(coopReadyFile, "r")
+    if f then f:close(); coopReady = true elseif os.time() - coopReadyStart > 120 then coopReady = true end
+    return coopReady
+end
 LoopAsync(1000, function()
+    if not coopEngineReady() then return false end
     ExecuteInGameThread(function()
         if not worldSettled() then return end
         local ok, err = pcall(tick)
