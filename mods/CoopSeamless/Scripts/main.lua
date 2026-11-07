@@ -7,6 +7,13 @@
 --   again after a disconnect (boss kill, death).
 -- Cancelling the signal or leaving through the menu turns auto mode off until you host or join again by hand.
 -- config.txt in the mod folder (read every second):  enabled=1  host=auto|always|off  guest=auto|always|off
+-- Proposal 2026-11-03, all off by default (solo offline test 2026-11-04: sessiondiag signatures and remember; the rest untested):
+--   sessiondiag=1   log only: signatures of the search/join functions, and after any search the info string of each found signal
+--   remember=1      keep the role and the host's name in state.txt, so auto mode is back after a crash or a restart
+-- (lockhost, "rejoin only this host", was dropped on 2026-11-05: the info string of a found signal is a lobby ID, which a
+-- re-host changes, and the session now stays alive through deaths and boss kills; #4)
+--   versioncheck=1  host sends his kit number (plugins\CoopKitVersion.txt) and a fingerprint of CoopSeamless/CoopProbe/
+--                   CoopProgress to a guest who joins; the guest logs what differs
 local TAG = "[CoopSeamless] "
 local SETTLE_S, HOST_RETRY_S, OPEN_RETRY_S, GUEST_RETRY_S = 8, 30, 10, 25
 local FIELD, BOSSAREA, CINEMATICS, ENEMYRESET = 1, 2, 4, 8   -- ESessionOpenness
@@ -17,7 +24,7 @@ local function log(s) print(TAG .. os.date("%H:%M:%S ") .. tostring(s) .. "\n") 
 local function valid(o) return o ~= nil and o:IsValid() end
 local function try(f, ...) local ok, v = pcall(f, ...); if ok then return v end return nil end
 
-local cfg = {enabled = "1", host = "auto", guest = "auto"}
+local cfg = {enabled = "1", host = "auto", guest = "auto", sessiondiag = "0", remember = "0", versioncheck = "0"}
 local function readConfig()
     local f = io.open(MOD_DIR .. "\\config.txt", "r")
     if not f then return end
@@ -35,6 +42,40 @@ local publicConnections = 3        -- what the vanilla field menu passes (BP_Fie
 local calmSince, lastCreate, lastOpen, lastSearch = nil, -1e9, -1e9, -1e9
 local lastLine, lastPawnName = "", ""
 local wasHosting, wasJoined = false, false   -- previous tick, for start-of-session detection
+local savedHost = nil              -- remember: the host's PlayerName (Steam name), written to state.txt and logged
+
+local function localName()         -- our own PlayerName (Steam name), nil while there is no local PlayerState
+    for _, pc in ipairs(FindAllOf("PlayerController") or {}) do
+        if try(function() return pc:IsLocalPlayerController() end) then
+            return try(function() return pc.PlayerState.PlayerName:ToString() end)
+        end
+    end
+end
+
+-- remember: role and host name survive a crash or restart (state.txt next to config.txt; names can hold spaces, so not in config).
+-- The file also holds our own name: a guest kit zipped from the host's game folder could carry the host's state.txt, and a
+-- state.txt written by another player is ignored.
+local STATE_PATH = MOD_DIR .. "\\state.txt"
+local function saveState(role, host)
+    local f = io.open(STATE_PATH, "w")
+    if not f then return end
+    f:write("role=" .. role .. "\n")
+    local me = localName()
+    if me then f:write("me=" .. me .. "\n") end
+    if host then f:write("host=" .. host .. "\n") end
+    f:close()
+end
+local function loadState()
+    local f = io.open(STATE_PATH, "r")
+    if not f then return nil end
+    local st = {}
+    for line in f:lines() do
+        local k, v = line:match("^(%w+)=(.*)$")
+        if k then st[k] = v end
+    end
+    f:close()
+    return st
+end
 
 local function snapshot()
     local sm = FindFirstOf("AppSessionManager")
@@ -113,12 +154,176 @@ local function callWithCaller(what, f)
     log(what .. (ok and " sent" or (" FAILED " .. tostring(err))))
 end
 
+-- Session diagnostics (proposal 2026-11-03). App_GameInstance has Event_SearchLobby(MaxResult, UseLAN, Caller) and
+-- Event_JoinSession(SearchResult: BlueprintSessionResult, Caller) next to Event_FindAndJoinSession. The game's session manager
+-- (AppSessionManager_0, an AppOnlineWrapper) has GetFoundOnlineSessionsCount() -> int, GetFoundOnlineSessionInfo(index) ->
+-- string and JoinOnlineSessionLatent(WorldContextObject, LatentInfo, index, ConnectOption). GetOnlineSessionResult() returns a
+-- bool, not a session (solo offline test 2026-11-04), so no BlueprintSessionResult can be read from Lua. On two PCs
+-- (2026-11-04) the info string of a found signal was an 18-digit number starting with 109775, most likely the Steam lobby ID.
+-- Parameter names and order are read from the UFunctions at run time: an unknown parameter stops the call.
+-- ShowInviteUI (Steam invite) is listed by sessiondiag, never called.
+local GI_PATH = "/Game/Modes/App_GameInstance.App_GameInstance_C:"
+local IF_OWNERS = {"/Script/Extensions.AppSessionManager:", "/Script/Extensions.AppOnlineWrapper:", "/Script/Extensions.AppOnlineWrapperIF:"}
+local function paramNames(path)
+    local fn = StaticFindObject(path)
+    if not valid(fn) then return nil end
+    local names = {}
+    fn:ForEachProperty(function(p) names[#names + 1] = p:GetFName():ToString() end)
+    return names
+end
+local function findFn(name)        -- first owner class that has this UFunction
+    for _, o in ipairs(IF_OWNERS) do
+        local n = paramNames(o .. name)
+        if n then return o .. name, n end
+    end
+end
+-- call obj:fname with arguments picked by parameter name from `values` (a value of false is passed as is; "nil" means nil)
+local function callByNames(obj, fname, names, values)
+    local args, n = {}, 0
+    for _, p in ipairs(names) do
+        if p ~= "ReturnValue" then
+            local v = values[p]
+            if v == nil then return false, "unknown parameter " .. p end
+            n = n + 1
+            if v ~= "nil" then args[n] = v end
+        end
+    end
+    return pcall(function() return obj[fname](obj, table.unpack(args, 1, n)) end)
+end
+
+local function logSignatures()
+    for _, e in ipairs({"Event_SearchLobby", "Event_JoinSession", "Event_FindAndJoinSession", "Event_CreateLobby"}) do
+        local n = paramNames(GI_PATH .. e)
+        log("diag: " .. e .. "(" .. (n and table.concat(n, ", ") or "NOT FOUND") .. ")")
+    end
+    for _, f in ipairs({"GetFoundOnlineSessionsCount", "GetOnlineSessionResult", "GetFoundOnlineSessionInfo", "FindOnlineSessionsLatent",
+                        "JoinOnlineSessionLatent", "ShowInviteUI", "CancelFindOnlineSessions"}) do
+        local path, n = findFn(f)
+        log("diag: " .. (path or f) .. "(" .. (n and table.concat(n, ", ") or "NOT FOUND") .. ")")
+    end
+    local n = paramNames("/Script/OnlineSubsystemUtils.FindSessionsCallbackProxy:GetServerName")
+    log("diag: FindSessionsCallbackProxy:GetServerName(" .. (n and table.concat(n, ", ") or "NOT FOUND") .. ")")
+end
+
+-- the found signals after a search: { {index = i, info = <GetFoundOnlineSessionInfo string>}, ... } or nil + reason
+local function foundSessions(s)
+    local cPath, cNames = findFn("GetFoundOnlineSessionsCount")
+    local iPath, iNames = findFn("GetFoundOnlineSessionInfo")
+    if not (cPath and iPath) then return nil, "count/info functions not found" end
+    local ok, count = callByNames(s.sm, "GetFoundOnlineSessionsCount", cNames, {WorldContextObject = s.gs})
+    if not ok or type(count) ~= "number" then return nil, "count: " .. tostring(count) end
+    local list = {}
+    for i = 0, count - 1 do
+        local okI, info = callByNames(s.sm, "GetFoundOnlineSessionInfo", iNames, {WorldContextObject = s.gs, InSearchResultsIndex = i})
+        if not okI then return nil, "info " .. i .. ": " .. tostring(info) end
+        info = type(info) == "string" and info or try(function() return info:ToString() end)
+        list[#list + 1] = {index = i, info = info}
+    end
+    return list
+end
+
+-- versioncheck: the kit number (plugins\CoopKitVersion.txt, read the way CoopProbe shows it on the title screen) and FNV-1a of
+-- each mod's main.lua; the host sends "CoopVersion:kit=<n>,<mod>=<hash>,..." with ClientMessage (a client RPC, already used by
+-- CoopProbe as a host -> guest channel); the guest compares with his own files. Like CoopProbe, the hook only queues the text;
+-- the files are read in tick.
+local MODS_DIR = MOD_DIR:match("^(.*)[/\\][^/\\]+$") or "."
+local WIN64 = debug.getinfo(1, "S").source:match("^@(.*)[/\\]ue4ss[/\\]Mods[/\\]") or "."
+local function kitVersion()
+    local vf = io.open(WIN64 .. "\\plugins\\CoopKitVersion.txt", "r")
+    if not vf then return "none" end
+    local ver = (vf:read("*l") or ""):gsub("CodeVein%-guest%-update%-", ""):gsub("%.zip", ""):gsub("[%s,=]", "")
+    vf:close()
+    return ver ~= "" and ver or "?"
+end
+local function fingerprint()
+    local parts = {"kit=" .. kitVersion()}
+    for _, m in ipairs({"CoopSeamless", "CoopProbe", "CoopProgress"}) do
+        local f = io.open(MODS_DIR .. "\\" .. m .. "\\Scripts\\main.lua", "rb")
+        local h = "absent"
+        if f then
+            local data = f:read("a"); f:close()
+            local x = 2166136261
+            for i = 1, #data do x = ((x ~ data:byte(i)) * 16777619) & 0xFFFFFFFF end
+            h = string.format("%08x", x)
+        end
+        parts[#parts + 1] = m .. "=" .. h
+    end
+    return table.concat(parts, ",")
+end
+local myPrint = nil
+local lastOthers = 0
+local function sendVersion()
+    myPrint = myPrint or fingerprint()
+    for _, c in ipairs(FindAllOf("PlayerController") or {}) do
+        if valid(c) and not try(function() return c:IsLocalPlayerController() end) then
+            pcall(function() c:ClientMessage("CoopVersion:" .. myPrint, FName("None"), 0) end)
+        end
+    end
+    log("versioncheck: sent " .. myPrint)
+end
+local versionIn = nil              -- the host's fingerprint, queued by the hook
+pcall(function()
+    RegisterHook("/Script/Engine.PlayerController:ClientMessage", function(ctx, msg)
+        local text = try(function() return msg:get():ToString() end)
+        local theirs = text and text:match("^CoopVersion:(.*)$")
+        if theirs then versionIn = theirs end
+    end)
+end)
+local function checkVersion(theirs)
+    myPrint = myPrint or fingerprint()
+    if theirs == myPrint then log("versioncheck: same kit and mods as the host (" .. theirs .. ")"); return end
+    local mine = {}
+    for m, h in myPrint:gmatch("([^,=]+)=([^,]*)") do mine[m] = h end
+    for m, h in theirs:gmatch("([^,=]+)=([^,]*)") do
+        if mine[m] ~= h then log("versioncheck: MISMATCH " .. m .. " host=" .. h .. " here=" .. tostring(mine[m])) end
+    end
+end
+
+local stateLoaded, sigLogged, wasSearching, versionAt = false, false, false, nil
 local function tick()
     readConfig()
     if cfg.enabled == "0" then allowSend = false; return end
     local s = snapshot()
     if not s then return end
     local now = os.time()
+
+    local me = (not stateLoaded and cfg.remember == "1") and localName() or nil
+    if not stateLoaded and (cfg.remember ~= "1" or me) then
+        stateLoaded = true
+        local st = cfg.remember == "1" and loadState() or nil
+        if st and st.role ~= "none" and st.me ~= me then
+            log("remember: state.txt is from " .. tostring(st.me) .. ", not " .. me .. " -> ignored"); st = nil
+        end
+        if st and st.role == "host" and cfg.host ~= "off" then
+            hostSticky = true; log("remember: host mode on from state.txt")
+        elseif st and st.role == "guest" and cfg.guest ~= "off" then
+            guestSticky = true; savedHost = st.host; log("remember: guest mode on from state.txt (host: " .. tostring(st.host) .. ")")
+        end
+    end
+    if cfg.sessiondiag == "1" and not sigLogged then sigLogged = true; logSignatures() end
+    if wasSearching and not s.searching and cfg.sessiondiag == "1" then
+        local list, why = foundSessions(s)
+        if list then
+            local infos = {}
+            for _, e in ipairs(list) do infos[#infos + 1] = e.index .. ": " .. tostring(e.info) end
+            log("diag: search over, " .. #list .. " signal(s): [" .. table.concat(infos, " | ") .. "]")
+        else
+            log("diag: search over, results not readable (" .. tostring(why) .. ")")
+        end
+    end
+    wasSearching = s.searching and true or false
+    if cfg.versioncheck == "1" and s.authority and s.created then
+        local others = s.others or 0
+        if others > lastOthers then versionAt = now + 5 end   -- a guest arrived: give his controller a moment
+        lastOthers = others
+        if versionAt and now >= versionAt then versionAt = nil; sendVersion() end
+    else
+        lastOthers = 0
+    end
+    if versionIn then
+        local theirs = versionIn; versionIn = nil
+        if cfg.versioncheck == "1" then checkVersion(theirs) end
+    end
 
     -- learn intent from what happens, only when a session or connection starts: right after a leave
     -- through the menu the game still reports the old connection for a moment (2-PC test 2026-10-26)
@@ -128,6 +333,7 @@ local function tick()
     wasHosting, wasJoined = hosting, joined
     if hostingStarted and not hostSticky and cfg.host ~= "off" then
         hostSticky = true; guestSticky = false; log("host mode on (session created here)")
+        if cfg.remember == "1" then saveState("host") end
     end
     if joinStarted and not guestSticky and cfg.guest ~= "off" then
         guestSticky = true; hostSticky = false
@@ -138,6 +344,14 @@ local function tick()
         end
         hostName = table.concat(names, " + ")   -- everyone in the session; logged only
         log("guest mode on (joined a host; players: " .. hostName .. ")")
+        if cfg.remember == "1" then
+            -- with one guest (vanilla cap) the one other name is the host
+            local me = localName()
+            local others = {}
+            for _, n in ipairs(names) do if n ~= me then others[#others + 1] = n end end
+            savedHost = #others == 1 and others[1] or nil
+            saveState("guest", savedHost)
+        end
     end
     local wantHost = s.authority and (cfg.host == "always" or (cfg.host == "auto" and hostSticky))
     local wantGuest = cfg.guest == "always" or (cfg.guest == "auto" and guestSticky)
@@ -198,6 +412,7 @@ local okDestroy, errDestroy = pcall(function()
         else
             log("DestroyOnlineSessionLatent seen (auto mode already off)")
         end
+        if cfg.remember == "1" then saveState("none") end
     end)
 end)
 log("DestroyOnlineSessionLatent hook " .. (okDestroy and "registered" or ("FAILED " .. tostring(errDestroy))))
