@@ -59,6 +59,13 @@ Everything goes into `<game dir>\CodeVein\Binaries\Win64`.
    ```
    CoopNative writes `plugins\CoopNative.log` on every launch.
 4. Everyone in the group uses the **same matchmaking password**; the automatic search joins the first matching signal.
+   Proposal, all off in `mods/CoopSeamless/config.txt`: `sessiondiag=1` (log the search/join signatures and the info
+   string of each signal found; on two PCs it was the lobby ID), `remember=1` (role and
+   host kept in `state.txt` across a crash or restart; a `state.txt` written by another player, e.g. inside a kit zipped from
+   the host's folder, is ignored), `versioncheck=1` (the host sends his kit number from `plugins\CoopKitVersion.txt` and a
+   fingerprint of the three Lua mods, the guest logs what differs). Solo offline test (2026-11-04): the signatures are
+   logged; `remember` restores host mode from a `state.txt` with our own name and ignores one written by another player.
+   Guests still join through the distress signal; no Steam invite is used.
 
 Uninstall: remove the two mod folders, `winmm.dll` and `plugins\`.
 
