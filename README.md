@@ -5,7 +5,7 @@ kills that end a vanilla session: a dead guest spectates and comes back at the h
 play the boss, its outro and the memory, and the guest's story progress, world state and blood codes follow the host's. Co-op also
 works in areas whose boss is dead. Automatic re-hosting and re-joining remain as a fallback when a session does break.
 **Not a release**: tested by hand on two PCs only, one guest (vanilla cap). Cutscenes are still rough, and opening chests and ground
-items for the guest are in progress (see Status). Home Base works together; leaving it together does not yet.
+items for the guest are in progress (see Status). Home Base works together, and leaving and returning together work most of the time (see Home Base below).
 
 Findings, teardown table and QA live in the Co-op Anything write-up:
 <https://github.com/cranebeaker/coop-anything/tree/main/games/code-vein>
@@ -89,11 +89,22 @@ Home Base together (two PCs, session kept):
   report, which also held the host's arrival, so story NPCs take the solo setup during the trip.
 - UE4SS's hook dispatcher walks `FFrame::OutParms` of the calling Blueprint frame, and from some NPC scripts that list has a bad
   link: endless loop or access violation. So nothing Blueprints call on a conversation may be hooked from Lua.
-- Works: the guest's weapon and veil are hidden there, he sees the host sit, the jukeboxes are synced both ways.
-- Leaving Home Base together still fails: the game asks for no level of the stage while a guest is connected (cause unknown), so both
-  end up in empty space and fall. The next version asks for the levels itself; not run yet.
-- Not run yet: the guest sitting down, the getting-up animation and head on the other screen, hiding the face mask, and keeping the
-  jukebox menu off the other player's screen.
+- Works (two PCs, 2026-11-07 to 11-09): the guest's weapon, veil and face mask are hidden there; both players sit (the guest's seats are
+  switched on for him: the host-only button check is hooked at run time), see each other sit, stand up and turn the head; a seat that
+  is taken is closed for the other player until its sitter is up; the jukeboxes are synced both ways and their menu stays on the
+  right screen; the piano plays both ways (CoopNative hooks the sound call, the other PC plays the notes after a short buffer, and
+  both hands follow: the game flips `IsPianoPlay` / `IsPianoPlay2` per press); the story bulletin board is switched on for the guest
+  (untested when this was written).
+- Leaving Home Base together works: the host brings the levels of the stage up itself (the game asks for none while a guest is
+  connected), both stay behind a black screen until every stage level is shown and `K2_FindFloor` finds a floor under each character,
+  the guest only after he has said so (the host's release is replicated and cannot wait for his PC). Returning has its own black
+  screen until all Home Base levels are shown and a floor is found. A character that falls 15 m below its hold is put back (fall
+  rescue). Levels being shown is not the same as collision being there: this caused several falls.
+- Co-op fog (surveyed, not opened yet): each area boundary has a `BP_BarrierWall` (`ForMultiplay` walls named `*_Multi`, mist and
+  collision only) that switches on when a player comes within roughly 70 to 90 m; the field table (`FieldMeta_Full`) gives every
+  story field `Reached_*` as its multiplayer flag and `Boss_*` as the flag that prohibits hosting.
+- Not done: the guest's seat camera (the camera never follows his mouse), the appearance editor for the guest (he gets a missing
+  character and a permanent loading screen), and syncing a changed appearance.
 
 Works (two PCs, experiments):
 - `rest_in_coop`: the host rests at a Mistle with a guest connected; the guest stays and the enemies respawn when the host gets

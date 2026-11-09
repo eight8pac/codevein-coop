@@ -199,6 +199,8 @@ static void run_levelup(void) {
 #define ADDR_SYNC_ALL 0x140465CA0ULL
 static volatile uintptr_t g_syncall_pawn;
 static volatile LONG g_syncall_pending;
+static volatile LONG g_seatcam_pending;
+static volatile uintptr_t g_seatcam_pc, g_seatcam_pawn;
 static volatile LONG g_vols_pending;
 static void run_volcheck(void);
 static void run_syncall(void) {
@@ -263,6 +265,12 @@ static volatile LONG g_memunfade_pending, g_memunfade_usage = 106;
 typedef void (*uitpfade_fn)(void *ctx, void *caller, uint8_t usage, uint8_t flag);
 static volatile LONG g_tpfade_pending = -1;
 static volatile uintptr_t g_tpfade_ctx;
+// Leaving Home Base (owner 11-07: a loading screen until the world is there, then fade out): the game lifts its teleport fade at arrival, with the stage not loaded yet. Between
+// "fadehold 1 0" and "fadehold 0 <pawn>" all unfades are kept back and made afterwards, on the game thread. At most 60 s.
+static volatile LONG g_fade_hold, g_fade_held_n, g_fade_release_pending;
+static volatile ULONGLONG g_fade_hold_at;
+static volatile uintptr_t g_fade_ctx, g_fade_release_ctx;
+static uint8_t g_fade_held[8], g_fade_held_flag[8];
 static volatile uintptr_t g_memory_actor;
 static volatile ULONGLONG g_memory_at;   // PlayMemoryResidue seen (v4 keeps the appear lock open for 3 minutes after it)   // ctx of the last WaitForMemoryResidueFinished (the scenario actor), for memunfade
 static int readable(uintptr_t a, size_t len);
@@ -640,6 +648,9 @@ static void scene_flags_sample(void) {
     logf_("scene flags: ready own %u partner %u | partner finished %u | finished %u %u | synced %u %u",
           last[0], last[1], last[2], last[3], last[4], last[5], last[6]);
 }
+static void pn_game_thread(void);
+static void pn_read(void);
+static void pn_in_append(int data);
 static void game_thread_work(void) {
     scene_flags_sample();
     if (g_unfade_pending && InterlockedExchange(&g_unfade_pending, 0)) run_unfade();
@@ -657,14 +668,31 @@ static void game_thread_work(void) {
         uintptr_t c = g_tpfade_ctx;
         if (tf >= 0 && c && readable(c, 8)) {
             if (tf) ((uitpfade_fn)ADDR_UI_REQUEST_TELEPORT_FADE)((void *)c, (void *)c, 48, 0);
-            else ((uiunfade_fn)ADDR_UI_REQUEST_UNFADE)((void *)c, (void *)c, 48, 0, 0.5f);
+            else ((uiunfade_fn)ADDR_UI_REQUEST_UNFADE)((void *)c, (void *)c, 48, 0, 1.0f);
             logf_("tpfade: %s (context 0x%llX)", tf ? "teleport fade requested" : "unfade requested", (unsigned long long)c);
         } else if (tf >= 0) logf_("tpfade: no valid context");
     }
+    if (g_fade_release_pending && InterlockedExchange(&g_fade_release_pending, 0)) {
+        InterlockedExchange(&g_fade_hold, 0);
+        uintptr_t c = g_fade_release_ctx ? g_fade_release_ctx : g_fade_ctx;
+        LONG n = g_fade_held_n;
+        if (c && readable(c, 8)) for (LONG i = 0; i < n && i < 8; i++) ((uiunfade_fn)ADDR_UI_REQUEST_UNFADE)((void *)c, (void *)c, g_fade_held[i], g_fade_held_flag[i], 0.5f);
+        logf_("fade hold: over, %ld unfade(s) made (context 0x%llX)", n, (unsigned long long)c);
+        g_fade_held_n = 0;
+    }
     if (g_levelup_pending && InterlockedExchange(&g_levelup_pending, 0)) run_levelup();
     if (g_syncall_pending && InterlockedExchange(&g_syncall_pending, 0)) run_syncall();
+    if (g_seatcam_pending && InterlockedExchange(&g_seatcam_pending, 0)) {
+        uintptr_t pc = g_seatcam_pc, pw = g_seatcam_pawn;
+        if (pc && pw && readable(pc, 8) && readable(pw, 8) && readable(*(uintptr_t *)pc + 0x8B8, 8)) {
+            void **vt = *(void ***)pc;
+            ((void (*)(void *, void *))vt[0x8B8 / 8])((void *)pc, (void *)pw);   // ClientRestart_Implementation
+            logf_("seats: local restart of 0x%llX with 0x%llX", (unsigned long long)pc, (unsigned long long)pw);
+        } else logf_("seats: local restart refused (0x%llX, 0x%llX)", (unsigned long long)pc, (unsigned long long)pw);
+    }
     if (g_vols_pending && InterlockedExchange(&g_vols_pending, 0)) run_volcheck();
     if (g_lvlinfo_pending && InterlockedExchange(&g_lvlinfo_pending, 0)) run_lvlinfo();
+    pn_game_thread();
 }
 // Scene relay (2026-10-30, after the Lies of P study, which plays cutscenes on every PC and relays only start/skip by name).
 // ScenarioFunctionLibrary:RequestEvent (thunk 0x140B4B6F0) -> impl 0x14090CA30(Actor, FString* Event); SkipEventUIComponent:
@@ -1520,6 +1548,7 @@ static int seat_in(const uintptr_t *list, LONG n, uintptr_t a) {
     return 0;
 }
 static int seat_log(void) { return InterlockedIncrement(&g_seat_logs) <= 40; }
+static void btn_dyn_check(void);
 static void seats_read(void) {
     static char sb[8192];
     if (!read_small_file("CoopNative.seats", sb, sizeof sb)) return;
@@ -1544,9 +1573,18 @@ static void seats_read(void) {
     }
     g_seat_me = me; g_seat_ncam = nc; g_seat_nbtn = nb;
     if (!me) g_seat_cam = 0;
+    if (nb > 0) btn_dyn_check();
     logf_("seats: our character 0x%llX, %ld seat cameras, %ld triggers open for us", (unsigned long long)me, nc, nb);
 }
+// Taken seats (owner 11-07: "i'm able to sit on the same chair as him while he is already sitting on it"): CoopProbe names the seat trigger the other player
+// sits on ("taken <trigger> ..."); its button check answers no on this PC (greyed out, as his seats were before kit 169) until he is up again.
+static volatile uintptr_t g_seat_taken[4];
 static char btn_answer(char r, void *self) {
+    for (int i = 0; i < 4; i++) if (g_seat_taken[i] && g_seat_taken[i] == (uintptr_t)self) {
+        static uintptr_t lastt;
+        if (lastt != (uintptr_t)self) { lastt = (uintptr_t)self; logf_("seats: 0x%llX is taken by the other player: its button is off here", (unsigned long long)(uintptr_t)self); }
+        return 0;
+    }
     if (!r && g_seats_on && seat_in(g_seat_btns, g_seat_nbtn, (uintptr_t)self)) {
         static uintptr_t last;
         if (last != (uintptr_t)self) { last = (uintptr_t)self; if (seat_log()) logf_("seats: button of 0x%llX turned on for the guest", (unsigned long long)(uintptr_t)self); }
@@ -1556,6 +1594,46 @@ static char btn_answer(char r, void *self) {
 }
 static char detour_btn_base(void *self, void *inputter) { return btn_answer(g_orig_btn_base(self, inputter), self); }
 static char detour_btn_item(void *self, void *inputter) { return btn_answer(g_orig_btn_item(self, inputter), self); }
+// 11-07 12:17: his seat prompt finally came, greyed out: the menu asks Trigger:IsActionButtonActive (exec thunk 0x140AD3E40 -> vtable +0x660 of the object), and
+// neither hook above ever ran for a seat, so the seats' class answers through another function. The seats list gives the real objects: their vtable slot +0x660
+// is read at run time and that function is hooked too (once, if it is neither of the two above).
+static btn_fn g_orig_btn_dyn;
+static volatile uintptr_t g_btn_dyn_at;
+static char detour_btn_dyn(void *self, void *inputter) { return btn_answer(g_orig_btn_dyn(self, inputter), self); }
+static void btn_dyn_one(uintptr_t a) {
+    if (!a || !readable(a, 8)) return;
+    uintptr_t vt = *(uintptr_t *)a;
+    if (!vt || !readable(vt + 0x660, 8)) return;
+    uintptr_t fn = *(uintptr_t *)(vt + 0x660);
+    static uintptr_t seen[8]; static int nseen;
+    int known = 0;
+    for (int k = 0; k < nseen; k++) if (seen[k] == vt) known = 1;
+    if (!known && nseen < 8) { seen[nseen++] = vt; logf_("seats: trigger 0x%llX: vtable 0x%llX, button check 0x%llX", (unsigned long long)a, (unsigned long long)vt, (unsigned long long)fn); }
+    if (fn == ADDR_BTN_BASE || fn == ADDR_BTN_ITEM || fn == g_btn_dyn_at || g_btn_dyn_at) return;
+    if (!readable(fn, 16) || *(uint8_t *)fn != 0xE9) { logf_("seats: button check 0x%llX not a jump stub, left alone", (unsigned long long)fn); return; }
+    MH_STATUS c = MH_CreateHook((void *)fn, (void *)detour_btn_dyn, (void **)&g_orig_btn_dyn);
+    MH_STATUS e = c == MH_OK ? MH_EnableHook((void *)fn) : c;
+    g_btn_dyn_at = fn;
+    logf_("seats: button check 0x%llX hooked for the seats -> %s / %s", (unsigned long long)fn, MH_StatusToString(c), MH_StatusToString(e));
+}
+static void btn_dyn_check(void) {
+    for (LONG i = 0; i < g_seat_nbtn && i < 64; i++) btn_dyn_one(g_seat_btns[i]);
+}
+// "taken <hex> ..." (up to 4; "taken 0" opens them all again). On the host no seats list names the triggers, so the check is hooked from here too.
+static void seats_taken(const char *args) {
+    uintptr_t v[4] = {0, 0, 0, 0};
+    int n = 0;
+    const char *q = args;
+    while (n < 4 && q && *q) {
+        char *end; unsigned long long x = strtoull(q, &end, 16);
+        if (end == q) break;
+        if (x) v[n++] = (uintptr_t)x;
+        q = end;
+    }
+    for (int i = 0; i < n; i++) if (g_seats_on) btn_dyn_one(v[i]);
+    for (int i = 0; i < 4; i++) g_seat_taken[i] = v[i];
+    logf_("seats: %d seat(s) taken by others (0x%llX)", n, (unsigned long long)v[0]);
+}
 static void detour_exec_possess(void *ctx, void *stack, void *result) {
     uintptr_t s = (uintptr_t)stack;
     // Blueprint calls only (Code set), on a guest only; the rest of this function is the game's thunk with the one choice added
@@ -1601,11 +1679,15 @@ static void head_read(void) {
     if (!read_small_file("CoopNative.head", hb, sizeof hb)) return;
     unsigned long long a = 0; float p = 0, y = 0;
     if (sscanf(hb, "%llx %f %f", &a, &p, &y) != 3) return;
+    static LONG logs;
+    if ((uintptr_t)a != g_head_anim || logs < 6) { if (InterlockedIncrement(&logs) <= 12) logf_("seats: head for 0x%llX: pitch %.0f yaw %.0f", a, p, y); }
     g_head_pitch = p; g_head_yaw = y; g_head_anim = (uintptr_t)a;
 }
 static void detour_exec_camrot(void *ctx, void *stack, void *result) {
     uintptr_t s = (uintptr_t)stack, a = g_head_anim;
     if (a && s && result && *(uintptr_t *)(s + 0x18) == a) {
+        static LONG hits;
+        if (InterlockedIncrement(&hits) == 1) logf_("seats: head: the animation of 0x%llX reads our numbers", (unsigned long long)a);
         uintptr_t code = *(uintptr_t *)(s + 0x20);
         if (code) *(uintptr_t *)(s + 0x20) = code + 1;
         float *r = (float *)result;
@@ -1641,6 +1723,21 @@ static void run_volcheck(void) {
     fprintf(f, "done\n");
     fclose(f);
     logf_("vols: %d of %d volumes around %.0f %.0f %.0f", hit, n, pt[0], pt[1], pt[2]);
+}
+// Getting up (11-07: the other screen played it after the player was already walking): the seat's camera calls Mesh:SetAnimInstanceClass the moment the player leaves the seat
+// (a no-op there, same class), then sets isSittingEnd for a few frames, then waits 3 s (bed 8 s). The exec thunk sees the caller (FFrame+0x18) is a seat camera: CoopNative.stand.
+#define ADDR_EXEC_ANIM_CLASS 0x1423F37C0ULL
+static exec_fn g_orig_exec_animclass;
+static void detour_exec_animclass(void *ctx, void *stack, void *result) {
+    uintptr_t s = (uintptr_t)stack;
+    if (g_seat_ncam > 0 && s && seat_in(g_seat_cams, g_seat_ncam, *(uintptr_t *)(s + 0x18))) {
+        char sp[MAX_PATH + 32];
+        snprintf(sp, sizeof sp, "%sCoopNative.stand", g_dir);
+        FILE *sf = fopen(sp, "w");
+        if (sf) { fputs("1\n", sf); fclose(sf); }
+        if (seat_log()) logf_("seats: the seat's camera 0x%llX sets the animation", (unsigned long long)*(uintptr_t *)(s + 0x18));
+    }
+    g_orig_exec_animclass(ctx, stack, result);
 }
 static void detour_get_all(void *ctx, void *cls, rec_ptrs *out) {
     g_orig_get_all(ctx, cls, out);
@@ -1864,6 +1961,19 @@ static void run_command(char *buf) {
         if (g_rec) rec_census();
     } else if (strncmp(buf, "seats", 5) == 0) {
         seats_read();
+    } else if (strncmp(buf, "piano", 5) == 0) {
+        pn_read();
+    } else if (strncmp(buf, "taken ", 6) == 0) {
+        seats_taken(buf + 6);
+    } else if (strncmp(buf, "fadehold ", 9) == 0) {
+        int on = 0; unsigned long long c = 0;
+        if (sscanf(buf + 9, "%d %llx", &on, &c) == 2) {
+            if (on) { g_fade_held_n = 0; g_fade_hold_at = GetTickCount64(); InterlockedExchange(&g_fade_hold, 1); logf_("fade hold: on"); }
+            else { g_fade_release_ctx = (uintptr_t)c; InterlockedExchange(&g_fade_release_pending, 1); }
+        }
+    } else if (strncmp(buf, "seatcam ", 8) == 0) {
+        unsigned long long p1 = 0, p2 = 0;
+        if (sscanf(buf + 8, "%llx %llx", &p1, &p2) == 2) { g_seatcam_pc = (uintptr_t)p1; g_seatcam_pawn = (uintptr_t)p2; InterlockedExchange(&g_seatcam_pending, 1); }
     } else if (strncmp(buf, "vols", 4) == 0) {
         InterlockedExchange(&g_vols_pending, 1);
     } else if (strncmp(buf, "hbstart", 7) == 0) {
@@ -1948,6 +2058,354 @@ static void read_settings(void) {
 // during the startup set the hooks are only created, then enabled together with MH_EnableHook(MH_ALL_HOOKS).
 static int g_hook_batch;
 static int g_diag_hooks;
+
+// ---- Piano (2026-11-07) ----
+// BP_SittingPianoChair_Camera: 13 keys, D4..B5 (actions Trigger_L2, Trigger_L1, Direction_Left, Direction_Up, Direction_Right, FaceButton_Left, FaceButton_Top,
+// Decide, Trigger_R1, Trigger_R2, Direction_Down, Trigger_L3, Trigger_R3). A press sets Is<key>Down; the camera's tick runs PlayingPianoFunc, which for the key
+// (or two keys) pressed sets PoseChise (1..91, the hand pose: a BlendListByInt in ABP_ScenarioChara_SittingPianoChair) on the pianist's animation and posts
+// SE_PIANO_KEY_<note>_Play on the camera's AkComponent ("Ak"). All of it on one PC only.
+// Relay: UAkComponent::PostAkEvent (impl stub 0x14298F1E0; the exec thunk 0x14299BA40 calls it with this, event, FString*) is hooked. While we sit at the
+// piano ("rec 1") the notes of one engine frame are one press: CoopNative.pianoout ("id ms mask"), sent by CoopProbe. Incoming presses (CoopNative.pianoin,
+// "p <ms/4 mod 2048> <mask>"; from the guest straight from Server_AddExp kind 12) are played with their spacing kept, 150 ms behind, on our own piano camera's
+// AkComponent, and PoseChise is set on our copy of the pianist. The guest's camera never gets his input (no possession), so for him ("keys 1") the keys of the
+// 13 actions are read here (keyboard, mouse, XInput pads; only while the game window has focus), played on our side the same way and sent.
+#define ADDR_AK_POST_IMPL 0x14298F1E0ULL
+#define PN_BUFFER_MS 350   // presses leave every 200 ms (CoopProbe probe loop) plus the network
+typedef int32_t (*akpost_fn)(void *comp, void *event, void *name);
+static akpost_fn g_orig_akpost;
+static const uint8_t g_pn_pose[13][13] = {
+    {1,14,15,16,17,18,19,20,21,22,23,24,25},
+    {14,2,26,27,28,29,30,31,32,33,34,35,36},
+    {15,26,3,37,38,39,40,41,42,43,44,45,46},
+    {16,27,37,4,47,48,49,50,51,52,53,54,55},
+    {17,28,38,47,5,56,57,58,59,60,61,62,63},
+    {18,29,39,48,56,6,64,65,66,67,68,69,70},
+    {19,30,40,49,57,64,7,71,72,73,74,75,76},
+    {20,31,41,50,58,65,71,8,77,78,79,80,81},
+    {21,32,42,51,59,66,72,77,9,82,83,84,85},
+    {22,33,43,52,60,67,73,78,82,10,86,87,88},
+    {23,34,44,53,61,68,74,79,83,86,11,89,90},
+    {24,35,45,54,62,69,75,80,84,87,89,12,91},
+    {25,36,46,55,63,70,76,81,85,88,90,91,13}
+};
+static const char *g_pn_note[13] = {"D4", "E4", "F4", "G4", "A4", "B4", "C5", "D5", "E5", "F5", "G5", "A5", "B5"};
+static volatile uintptr_t g_pn_ak, g_pn_ak_vt, g_pn_ev[13], g_pn_cls, g_pn_ranim, g_pn_ranim_vt, g_pn_manim, g_pn_manim_vt;
+static volatile LONG g_pn_off, g_pn_rec, g_pn_keys, g_pn_have, g_pn_cs_ok, g_pn_logs;
+static CRITICAL_SECTION g_pn_cs;
+// keys per action: type << 16 | value. 1 = virtual key, 2 = XInput button bits, 3 = left trigger, 4 = right trigger
+static volatile uint32_t g_pn_key[13][6];
+static volatile LONG g_pn_nkey[13];
+typedef struct { LONG id; uint32_t ms; uint16_t mask; LONG64 tick; } pn_rec_t;
+static pn_rec_t g_pn_out[64];
+static LONG g_pn_out_n;
+static volatile LONG g_pn_out_dirty;
+typedef struct { ULONGLONG due; uint16_t mask; uint8_t local; ULONGLONG arrived; } pn_due_t;
+static pn_due_t g_pn_q[64];
+static volatile LONG g_pn_qn;
+static ULONGLONG g_pn_in_last;
+static LONG64 g_pn_in_T, g_pn_in_off;
+static int g_pn_in_have;
+static uint8_t g_pn_empty[16];
+static int pn_log(void) { LONG n = InterlockedIncrement(&g_pn_logs); return n <= 80 || n % 50 == 0; }
+// 11-07 20:52: our own notes (80 lines) used up the counter and the other player's never showed: each kind counts on its own
+static volatile LONG g_pn_logs_play;
+static int pn_log_play(void) { LONG n = InterlockedIncrement(&g_pn_logs_play); return n <= 80 || n % 50 == 0; }
+static void pn_notes(uint16_t mask, char *out, size_t n) {
+    size_t k = 0; out[0] = 0;
+    for (int i = 0; i < 13 && k + 4 < n; i++) if (mask & (1 << i)) k += snprintf(out + k, n - k, "%s%s", k ? "+" : "", g_pn_note[i]);
+}
+static int pn_pose_of(uint16_t mask) {
+    int a = -1, b = -1;
+    for (int i = 0; i < 13; i++) if (mask & (1 << i)) { if (a < 0) a = i; else if (b < 0) b = i; }
+    if (a < 0) return 0;
+    return g_pn_pose[a][b < 0 ? a : b];
+}
+// a press of ours, to send. From the hook: the notes of one engine frame are one press (it is complete once the frame is over).
+static void pn_record(uint16_t mask, int from_hook) {
+    if (!g_pn_cs_ok) return;
+    EnterCriticalSection(&g_pn_cs);
+    LONG64 t = g_engine_ticks;
+    pn_rec_t *last = g_pn_out_n > 0 ? &g_pn_out[(g_pn_out_n - 1) & 63] : NULL;
+    if (from_hook && last && last->tick == t) last->mask |= mask;
+    else {
+        pn_rec_t *r = &g_pn_out[g_pn_out_n & 63];
+        r->id = g_pn_out_n + 1; r->ms = (uint32_t)GetTickCount64(); r->mask = mask; r->tick = from_hook ? t : -1;
+        g_pn_out_n++;
+    }
+    InterlockedExchange(&g_pn_out_dirty, 1);
+    LeaveCriticalSection(&g_pn_cs);
+}
+static int32_t detour_akpost(void *comp, void *event, void *name) {
+    if (g_pn_rec && !g_pn_keys && g_pn_have && event) {
+        for (int i = 0; i < 13; i++) if (g_pn_ev[i] == (uintptr_t)event) {
+            pn_record((uint16_t)(1 << i), 1);
+            if (pn_log()) logf_("piano: our camera plays %s (component 0x%llX)", g_pn_note[i], (unsigned long long)(uintptr_t)comp);
+            break;
+        }
+    }
+    return g_orig_akpost(comp, event, name);
+}
+static void pn_schedule(ULONGLONG due, uint16_t mask, int local, ULONGLONG arrived) {
+    if (!g_pn_cs_ok) return;
+    EnterCriticalSection(&g_pn_cs);
+    if (g_pn_qn < 64) { pn_due_t *q = &g_pn_q[g_pn_qn]; q->due = due; q->mask = mask; q->local = (uint8_t)local; q->arrived = arrived; g_pn_qn++; }
+    LeaveCriticalSection(&g_pn_cs);
+}
+// game thread
+static void pn_play(const pn_due_t *q) {
+    uintptr_t ak = g_pn_ak;
+    int ok = g_pn_have && ak && readable(ak, 8) && *(uintptr_t *)ak == g_pn_ak_vt, n = 0;
+    akpost_fn post = g_orig_akpost ? g_orig_akpost : (akpost_fn)ADDR_AK_POST_IMPL;
+    if (ok) for (int i = 0; i < 13; i++) if (q->mask & (1 << i)) {
+        uintptr_t ev = g_pn_ev[i];
+        if (ev && readable(ev, 0x28)) { post((void *)ak, (void *)ev, g_pn_empty); n++; }
+    }
+    uintptr_t a = q->local ? g_pn_manim : g_pn_ranim, vt = q->local ? g_pn_manim_vt : g_pn_ranim_vt;
+    LONG off = g_pn_off;
+    int pose = pn_pose_of(q->mask), posed = 0;
+    if (a && off > 0x28 && off < 0x40000 && readable(a, (size_t)off + 4) && *(uintptr_t *)a == vt && *(uintptr_t *)(a + 0x10) == g_pn_cls) {
+        *(int32_t *)(a + off) = pose; posed = 1;
+    }
+    if (pn_log_play()) {
+        char nb[64]; pn_notes(q->mask, nb, sizeof nb);
+        logf_("piano: %s %s (%d note%s), pose %d %s", q->local ? "our key" : "the other player:", nb, n, n == 1 ? "" : "s", pose,
+              posed ? "set" : (a ? "NOT set (animation gone or no offset)" : "(no animation)"));
+        if (!q->local && q->arrived) logf_("piano: ... %llu ms after it came in", (unsigned long long)(GetTickCount64() - q->arrived));
+    }
+    if (!ok) { static LONG warned; if (InterlockedIncrement(&warned) <= 5) logf_("piano: no piano component to play on (have %ld, 0x%llX)", g_pn_have, (unsigned long long)ak); }
+    // 11-09: "his hands do not move" with the pose set: the camera also flips IsPianoPlay / IsPianoPlay2 (they are bit fields in the animation, so Lua sets them):
+    // CoopNative.pianofx "r <mask>" = the other player's press, "l <mask>" = ours (guest)
+    {
+        char fp[MAX_PATH + 32];
+        snprintf(fp, sizeof fp, "%sCoopNative.pianofx", g_dir);
+        FILE *ff = fopen(fp, "a");
+        if (ff) { fprintf(ff, "%c %u\n", q->local ? 'l' : 'r', (unsigned)q->mask); fclose(ff); }
+    }
+}
+static void pn_game_thread(void) {
+    if (!g_pn_cs_ok || !g_pn_qn) return;
+    ULONGLONG now = GetTickCount64();
+    pn_due_t run[16]; int nr = 0;
+    EnterCriticalSection(&g_pn_cs);
+    int k = 0;
+    for (int i = 0; i < g_pn_qn; i++) {
+        if (g_pn_q[i].due <= now && nr < 16) run[nr++] = g_pn_q[i];
+        else g_pn_q[k++] = g_pn_q[i];
+    }
+    g_pn_qn = k;
+    LeaveCriticalSection(&g_pn_cs);
+    for (int i = 0; i < nr; i++) pn_play(&run[i]);
+}
+// incoming press (piano thread): keep the sender's spacing, PN_BUFFER_MS behind; a pause of 4 s starts over
+static void pn_incoming(int t4, uint16_t mask) {
+    ULONGLONG now = GetTickCount64();
+    LONG64 T;
+    if (!g_pn_in_have || now - g_pn_in_last > 4000) {
+        T = t4; g_pn_in_off = (LONG64)now + PN_BUFFER_MS - T * 4; g_pn_in_have = 1;
+    } else {
+        int d = (t4 - (int)(g_pn_in_T & 2047) + 2048) & 2047;
+        if (d > 1800) d = 0;
+        T = g_pn_in_T + d;
+    }
+    g_pn_in_T = T; g_pn_in_last = now;
+    LONG64 due = T * 4 + g_pn_in_off;
+    if (due < (LONG64)now) { g_pn_in_off += (LONG64)now - due; due = (LONG64)now; }
+    pn_schedule((ULONGLONG)due, mask, 0, now);
+}
+// host: from the guest's Server_AddExp (game thread)
+static void pn_in_append(int data) {
+    char p[MAX_PATH + 32];
+    snprintf(p, sizeof p, "%sCoopNative.pianoin", g_dir);
+    FILE *f = fopen(p, "a");
+    if (f) { fprintf(f, "p %d %d\n", (data / 8192) & 2047, data & 8191); fclose(f); }
+}
+static void pn_take_in(void) {
+    char p[MAX_PATH + 32], q[MAX_PATH + 40];
+    snprintf(p, sizeof p, "%sCoopNative.pianoin", g_dir);
+    if (GetFileAttributesA(p) == INVALID_FILE_ATTRIBUTES) return;
+    snprintf(q, sizeof q, "%sCoopNative.pianoin.take", g_dir);
+    DeleteFileA(q);
+    if (!MoveFileA(p, q)) return;   // still open by its writer: next time
+    FILE *f = fopen(q, "r");
+    if (!f) return;
+    char line[64]; int t4, m, n = 0;
+    while (fgets(line, sizeof line, f)) if (sscanf(line, "p %d %d", &t4, &m) == 2) { pn_incoming(t4 & 2047, (uint16_t)(m & 0x1FFF)); n++; }
+    fclose(f); DeleteFileA(q);
+    static LONG logs;
+    if (n && InterlockedIncrement(&logs) <= 10) logf_("piano: %d press(es) came in", n);
+}
+static void pn_write_out(void) {
+    if (!g_pn_out_dirty || !g_pn_cs_ok) return;
+    char buf[32 * 40]; size_t len = 0; int pending = 0;
+    EnterCriticalSection(&g_pn_cs);
+    LONG64 t = g_engine_ticks;
+    LONG n = g_pn_out_n;
+    for (LONG id = n > 32 ? n - 31 : 1; id <= n; id++) {
+        pn_rec_t *r = &g_pn_out[(id - 1) & 63];
+        if (r->tick >= 0 && r->tick == t) { pending = 1; break; }
+        len += (size_t)snprintf(buf + len, sizeof buf - len, "%ld %lu %u\n", r->id, (unsigned long)r->ms, (unsigned)r->mask);
+    }
+    if (!pending) InterlockedExchange(&g_pn_out_dirty, 0);
+    LeaveCriticalSection(&g_pn_cs);
+    char p[MAX_PATH + 32], tmp[MAX_PATH + 40];
+    snprintf(p, sizeof p, "%sCoopNative.pianoout", g_dir);
+    snprintf(tmp, sizeof tmp, "%sCoopNative.pianoout.tmp", g_dir);
+    FILE *f = fopen(tmp, "w");
+    if (!f) { InterlockedExchange(&g_pn_out_dirty, 1); return; }
+    fwrite(buf, 1, len, f); fclose(f);
+    if (!MoveFileExA(tmp, p, MOVEFILE_REPLACE_EXISTING)) InterlockedExchange(&g_pn_out_dirty, 1);   // being read: next time
+}
+typedef struct { DWORD packet; WORD buttons; BYTE lt, rt; SHORT lx, ly, rx, ry; } pn_xstate;
+typedef DWORD (WINAPI *pn_xget_fn)(DWORD, pn_xstate *);
+static pn_xget_fn g_pn_xget;
+static int g_pn_kactive;   // piano thread only: the key poll runs (its first round only takes what is already held)
+static uint32_t pn_keycode(const char *k) {
+    static const struct { const char *n; uint32_t c; } T[] = {
+        {"Up", 0x10000 | VK_UP}, {"Down", 0x10000 | VK_DOWN}, {"Left", 0x10000 | VK_LEFT}, {"Right", 0x10000 | VK_RIGHT},
+        {"Enter", 0x10000 | VK_RETURN}, {"SpaceBar", 0x10000 | VK_SPACE}, {"BackSpace", 0x10000 | VK_BACK}, {"Tab", 0x10000 | VK_TAB},
+        {"Escape", 0x10000 | VK_ESCAPE}, {"LeftShift", 0x10000 | VK_LSHIFT}, {"RightShift", 0x10000 | VK_RSHIFT},
+        {"LeftControl", 0x10000 | VK_LCONTROL}, {"RightControl", 0x10000 | VK_RCONTROL}, {"LeftAlt", 0x10000 | VK_LMENU}, {"RightAlt", 0x10000 | VK_RMENU},
+        {"CapsLock", 0x10000 | VK_CAPITAL}, {"Insert", 0x10000 | VK_INSERT}, {"Delete", 0x10000 | VK_DELETE}, {"Home", 0x10000 | VK_HOME},
+        {"End", 0x10000 | VK_END}, {"PageUp", 0x10000 | VK_PRIOR}, {"PageDown", 0x10000 | VK_NEXT},
+        {"Zero", 0x10000 | '0'}, {"One", 0x10000 | '1'}, {"Two", 0x10000 | '2'}, {"Three", 0x10000 | '3'}, {"Four", 0x10000 | '4'},
+        {"Five", 0x10000 | '5'}, {"Six", 0x10000 | '6'}, {"Seven", 0x10000 | '7'}, {"Eight", 0x10000 | '8'}, {"Nine", 0x10000 | '9'},
+        {"NumPadZero", 0x10000 | VK_NUMPAD0}, {"NumPadOne", 0x10000 | VK_NUMPAD1}, {"NumPadTwo", 0x10000 | VK_NUMPAD2}, {"NumPadThree", 0x10000 | VK_NUMPAD3},
+        {"NumPadFour", 0x10000 | VK_NUMPAD4}, {"NumPadFive", 0x10000 | VK_NUMPAD5}, {"NumPadSix", 0x10000 | VK_NUMPAD6}, {"NumPadSeven", 0x10000 | VK_NUMPAD7},
+        {"NumPadEight", 0x10000 | VK_NUMPAD8}, {"NumPadNine", 0x10000 | VK_NUMPAD9}, {"Multiply", 0x10000 | VK_MULTIPLY}, {"Add", 0x10000 | VK_ADD},
+        {"Subtract", 0x10000 | VK_SUBTRACT}, {"Decimal", 0x10000 | VK_DECIMAL}, {"Divide", 0x10000 | VK_DIVIDE},
+        {"Semicolon", 0x10000 | VK_OEM_1}, {"Equals", 0x10000 | VK_OEM_PLUS}, {"Comma", 0x10000 | VK_OEM_COMMA}, {"Hyphen", 0x10000 | VK_OEM_MINUS},
+        {"Underscore", 0x10000 | VK_OEM_MINUS}, {"Period", 0x10000 | VK_OEM_PERIOD}, {"Slash", 0x10000 | VK_OEM_2}, {"Tilde", 0x10000 | VK_OEM_3},
+        {"LeftBracket", 0x10000 | VK_OEM_4}, {"Backslash", 0x10000 | VK_OEM_5}, {"RightBracket", 0x10000 | VK_OEM_6}, {"Apostrophe", 0x10000 | VK_OEM_7},
+        {"LeftMouseButton", 0x10000 | VK_LBUTTON}, {"RightMouseButton", 0x10000 | VK_RBUTTON}, {"MiddleMouseButton", 0x10000 | VK_MBUTTON},
+        {"ThumbMouseButton", 0x10000 | VK_XBUTTON1}, {"ThumbMouseButton2", 0x10000 | VK_XBUTTON2},
+        {"Gamepad_DPad_Up", 0x20000 | 0x0001}, {"Gamepad_DPad_Down", 0x20000 | 0x0002}, {"Gamepad_DPad_Left", 0x20000 | 0x0004},
+        {"Gamepad_DPad_Right", 0x20000 | 0x0008}, {"Gamepad_Special_Right", 0x20000 | 0x0010}, {"Gamepad_Special_Left", 0x20000 | 0x0020},
+        {"Gamepad_LeftThumbstick", 0x20000 | 0x0040}, {"Gamepad_RightThumbstick", 0x20000 | 0x0080}, {"Gamepad_LeftShoulder", 0x20000 | 0x0100},
+        {"Gamepad_RightShoulder", 0x20000 | 0x0200}, {"Gamepad_FaceButton_Bottom", 0x20000 | 0x1000}, {"Gamepad_FaceButton_Right", 0x20000 | 0x2000},
+        {"Gamepad_FaceButton_Left", 0x20000 | 0x4000}, {"Gamepad_FaceButton_Top", 0x20000 | 0x8000},
+        {"Gamepad_LeftTrigger", 0x30000}, {"Gamepad_RightTrigger", 0x40000},
+    };
+    if (k[0] >= 'A' && k[0] <= 'Z' && k[1] == 0) return 0x10000 | (uint32_t)k[0];
+    if (k[0] == 'F' && k[1] >= '1' && k[1] <= '9' && (k[2] == 0 || (k[2] >= '0' && k[2] <= '2' && k[3] == 0))) {
+        int n = atoi(k + 1);
+        if (n >= 1 && n <= 12) return 0x10000 | (uint32_t)(VK_F1 + n - 1);
+    }
+    for (size_t i = 0; i < sizeof T / sizeof T[0]; i++) if (strcmp(T[i].n, k) == 0) return T[i].c;
+    return 0;
+}
+static void pn_keys_poll(void) {
+    static uint16_t was, pend; static ULONGLONG pend_at, scan_at; static int pads[4];
+    ULONGLONG now = GetTickCount64();
+    HWND fg = GetForegroundWindow(); DWORD pid = 0;
+    if (fg) GetWindowThreadProcessId(fg, &pid);
+    int focus = pid == GetCurrentProcessId();
+    WORD btn = 0; BYTE lt = 0, rt = 0;
+    if (focus && g_pn_xget) {
+        if (!g_pn_kactive || now - scan_at > 3000) {
+            scan_at = now;
+            for (int i = 0; i < 4; i++) { pn_xstate s; pads[i] = g_pn_xget((DWORD)i, &s) == 0; }
+        }
+        for (int i = 0; i < 4; i++) if (pads[i]) {
+            pn_xstate s;
+            if (g_pn_xget((DWORD)i, &s) == 0) { btn |= s.buttons; if (s.lt > lt) lt = s.lt; if (s.rt > rt) rt = s.rt; } else pads[i] = 0;
+        }
+    }
+    uint16_t down = 0;
+    if (focus) for (int a = 0; a < 13; a++) {
+        LONG nk = g_pn_nkey[a];
+        for (LONG k = 0; k < nk && k < 6; k++) {
+            uint32_t c = g_pn_key[a][k], v = c & 0xFFFF; int d = 0;
+            switch (c >> 16) {
+            case 1: d = (GetAsyncKeyState((int)v) & 0x8000) != 0; break;
+            case 2: d = (btn & v) != 0; break;
+            case 3: d = lt > 60; break;
+            case 4: d = rt > 60; break;
+            }
+            if (d) { down |= (uint16_t)(1 << a); break; }
+        }
+    }
+    if (!g_pn_kactive) { g_pn_kactive = 1; was = down; pend = 0; logf_("piano: reading our keys (%s, XInput %s)", focus ? "window has focus" : "window not in front", g_pn_xget ? "there" : "missing"); return; }
+    uint16_t edge = down & (uint16_t)~was; was = down;
+    if (edge) { if (!pend) pend_at = now; pend |= edge; }
+    int bits = 0;
+    for (int i = 0; i < 13; i++) if (pend & (1 << i)) bits++;
+    // two keys within 25 ms are one chord, like two in one frame for the camera
+    if (pend && (bits >= 2 || now - pend_at >= 25)) {
+        while (pend) {
+            uint16_t m = 0; int got = 0;
+            for (int i = 0; i < 13 && got < 2; i++) if (pend & (1 << i)) { m |= (uint16_t)(1 << i); got++; }
+            pend &= (uint16_t)~m;
+            pn_schedule(now, m, 1, 0);
+            pn_record(m, 0);
+        }
+    }
+}
+static DWORD WINAPI pn_thread(LPVOID unused) {
+    (void)unused;
+    // 11-09 20:33: pianoout from the last run kept ids up to 60; this run's presses 1..60 were taken for "already sent" (about 15 s of playing never left the PC)
+    {
+        static const char *stale[] = { "CoopNative.pianoout", "CoopNative.pianoin", "CoopNative.pianofx", "CoopNative.piano" };
+        for (int i = 0; i < 4; i++) {
+            char sp[MAX_PATH + 40];
+            snprintf(sp, sizeof sp, "%s%s", g_dir, stale[i]);
+            DeleteFileA(sp);
+        }
+    }
+    HMODULE x = LoadLibraryA("xinput1_4.dll");
+    if (!x) x = LoadLibraryA("xinput9_1_0.dll");
+    if (x) g_pn_xget = (pn_xget_fn)GetProcAddress(x, "XInputGetState");
+    logf_("piano: thread up (XInput %s)", g_pn_xget ? "found" : "missing");
+    ULONGLONG last_in = 0, last_out = 0;
+    for (;;) {
+        ULONGLONG now = GetTickCount64();
+        int busy = g_pn_keys || g_pn_rec || g_pn_qn || (g_pn_in_have && now - g_pn_in_last < 15000);
+        Sleep(busy ? 4 : 50);
+        now = GetTickCount64();
+        if (g_pn_keys) pn_keys_poll();
+        else g_pn_kactive = 0;
+        if (now - last_in >= (ULONGLONG)(busy ? 8 : 50)) { last_in = now; pn_take_in(); }
+        if (now - last_out >= 15) { last_out = now; pn_write_out(); }
+    }
+    return 0;
+}
+static void pn_read(void) {
+    char b[6144];
+    if (!read_small_file("CoopNative.piano", b, sizeof b)) return;
+    unsigned long long ak = 0, ev[13] = {0}, cls = 0, ranim = 0, manim = 0, v = 0;
+    int off = 0, rec = 0, keys = 0, i = 0, nev = 0;
+    uint32_t key[13][6]; LONG nkey[13]; int unknown = 0, nk = 0;
+    memset(key, 0, sizeof key); memset(nkey, 0, sizeof nkey);
+    char kn[64];
+    for (char *line = strtok(b, "\r\n"); line; line = strtok(NULL, "\r\n")) {
+        if (sscanf(line, "ak %llx", &v) == 1) ak = v;
+        else if (sscanf(line, "ev %d %llx", &i, &v) == 2) { if (i >= 0 && i < 13) { ev[i] = v; nev++; } }
+        else if (sscanf(line, "cls %llx", &v) == 1) cls = v;
+        else if (sscanf(line, "off %d", &i) == 1) off = i;
+        else if (sscanf(line, "rec %d", &i) == 1) rec = i;
+        else if (sscanf(line, "keys %d", &i) == 1) keys = i;
+        else if (sscanf(line, "ranim %llx", &v) == 1) ranim = v;
+        else if (sscanf(line, "manim %llx", &v) == 1) manim = v;
+        else if (sscanf(line, "key %d %63s", &i, kn) == 2 && i >= 0 && i < 13) {
+            uint32_t c = pn_keycode(kn);
+            if (!c) unknown++;
+            else if (nkey[i] < 6) { key[i][nkey[i]++] = c; nk++; }
+        }
+    }
+    int have = ak && nev == 13 && readable((uintptr_t)ak, 8);
+    for (int k = 0; k < 13; k++) if (!ev[k]) have = 0;
+    InterlockedExchange(&g_pn_keys, 0);
+    for (int a = 0; a < 13; a++) { for (int k = 0; k < 6; k++) g_pn_key[a][k] = key[a][k]; g_pn_nkey[a] = nkey[a]; }
+    g_pn_ak_vt = have ? *(uintptr_t *)(uintptr_t)ak : 0;
+    for (int k = 0; k < 13; k++) g_pn_ev[k] = (uintptr_t)ev[k];
+    g_pn_ak = (uintptr_t)ak; g_pn_cls = (uintptr_t)cls; g_pn_off = off;
+    g_pn_ranim_vt = ranim && readable((uintptr_t)ranim, 8) ? *(uintptr_t *)(uintptr_t)ranim : 0; g_pn_ranim = (uintptr_t)ranim;
+    g_pn_manim_vt = manim && readable((uintptr_t)manim, 8) ? *(uintptr_t *)(uintptr_t)manim : 0; g_pn_manim = (uintptr_t)manim;
+    InterlockedExchange(&g_pn_have, have);
+    InterlockedExchange(&g_pn_rec, rec);
+    InterlockedExchange(&g_pn_keys, keys && have);
+    logf_("piano: %s, component 0x%llX, pose offset 0x%X, record %d, our keys %d (%d keys read, %d unknown names), other pianist 0x%llX, us 0x%llX",
+          have ? "ready" : "not ready", ak, off, rec, keys, nk, unknown, ranim, manim);
+}
 static int install(const char *name, uint64_t addr, const char *expect16, void *detour, void **orig) {
     const uint8_t *p = (const uint8_t *)(uintptr_t)addr;
     MEMORY_BASIC_INFORMATION mbi;
@@ -2229,6 +2687,7 @@ static void detour_server_addexp(void *ctx, void *stack, void *result) {
     }
     // Home Base flavor sync (2026-11-06): the guest's only way to the host is a number. Values from -3000000 down are not exp: handed to CoopProbe, swallowed.
     if (value <= -3000000) {
+        if ((-value - 3000000) / 16777216 == 12) { pn_in_append((-value - 3000000) % 16777216); return; }
         char fp_[MAX_PATH + 32];
         snprintf(fp_, sizeof fp_, "%sCoopNative.flavorin", g_dir);
         FILE *ff = fopen(fp_, "a");
@@ -2535,8 +2994,19 @@ static void note_cover(int i, void *ctx, void *usage) {
     if (strcmp(g_fade_name[i], "RequestSolidFade") == 0 && ((uintptr_t)usage & 0xFF) == 104)
         g_cover_ctx[InterlockedIncrement(&g_cover_n) & 3] = (uintptr_t)ctx;
 }
+static int fade_hold_take(void *ctx, uintptr_t usage, uintptr_t flag) {
+    if (!g_fade_hold) return 0;
+    uint8_t u = (uint8_t)usage;   // 11-07 09:13: the teleport from Home Base lifts with usage 101, not 48
+    LONG n = g_fade_held_n, i;
+    for (i = 0; i < n && i < 8; i++) if (g_fade_held[i] == u) break;
+    if (i == n && n < 8) { g_fade_held[n] = u; g_fade_held_flag[n] = (uint8_t)flag; g_fade_held_n = n + 1; }
+    g_fade_ctx = (uintptr_t)ctx;
+    logf_("fade hold: unfade with usage %u kept back", u);
+    return 1;
+}
 #define FADE_DETOUR(i) static uint64_t fade_det_##i(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) { \
     uintptr_t ret = (uintptr_t)__builtin_return_address(0); \
+    if (i == 1 && fade_hold_take(a, (uintptr_t)c, (uintptr_t)d)) return 0; \
     note_cover(i, a, c); \
     uint64_t r = g_fade_orig[i](a, b, c, d, e, f, g, h); \
     if (InterlockedIncrement(&g_fade_count[i]) <= 300) \
@@ -2641,8 +3111,12 @@ static DWORD WINAPI worker(LPVOID unused) {
             install("SeatButtonItem", ADDR_BTN_ITEM, "\xE9\x2B\xF1\x3E\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_btn_item, (void **)&g_orig_btn_item);
             install("SeatPossess", ADDR_EXEC_POSSESS, "\xE9\x4B\x49\x1C\x0E\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_exec_possess, (void **)&g_orig_exec_possess);
             install("SeatAcknowledge", ADDR_EXEC_ACK_POSSESSION, "\xE9\xDB\xA7\xED\x0E\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_exec_ack, (void **)&g_orig_exec_ack);
+            install("SeatStand", ADDR_EXEC_ANIM_CLASS, "\xE9\x9B\xED\x08\x0F\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_exec_animclass, (void **)&g_orig_exec_animclass);
             install("SeatHead", ADDR_EXEC_CAM_ROT, "\xE9\x9B\x19\xED\x0E\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_exec_camrot, (void **)&g_orig_exec_camrot);
             install("SeatGetAllActors", ADDR_GET_ALL_ACTORS, "\xE9\xAB\x44\xE3\x0C\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_get_all, (void **)&g_orig_get_all);
+            install("PianoNotes", ADDR_AK_POST_IMPL, "\xE9\xBB\xAA\x24\x12\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_akpost, (void **)&g_orig_akpost);
+            InitializeCriticalSection(&g_pn_cs); InterlockedExchange(&g_pn_cs_ok, 1);
+            CreateThread(NULL, 0, pn_thread, NULL, 0, NULL);
         }
         if (read_small_file("CoopNative.ini", ini, sizeof ini) && strstr(ini, "rec=1")) {
             g_rec = 1;
@@ -2701,7 +3175,7 @@ static DWORD WINAPI worker(LPVOID unused) {
         g_diag_hooks = read_small_file("CoopNative.ini", ini, sizeof ini) && strstr(ini, "diag_hooks=1");
         logf_("diag_hooks = %d", g_diag_hooks);
     }
-    if (g_diag_hooks) for (int i = 0; i < FADE_N; i++) install(g_fade_name[i], g_fade_addr[i], g_fade_expect[i], g_fade_det[i], (void **)&g_fade_orig[i]);
+    if (g_diag_hooks || g_seats_on) for (int i = 0; i < FADE_N; i++) if (g_diag_hooks || i == 1) install(g_fade_name[i], g_fade_addr[i], g_fade_expect[i], g_fade_det[i], (void **)&g_fade_orig[i]);
     for (int i = 0; i < SYNC_N; i++) install(g_sync_name[i], g_sync_addr[i], g_sync_expect[i], g_sync_det[i], (void **)&g_sync_orig[i]);
     install("InCharge", ADDR_IN_CHARGE,
             "\xE9\xDB\xEE\x94\x05\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_in_charge, (void **)&g_orig_in_charge);
@@ -2784,6 +3258,7 @@ static DWORD WINAPI worker(LPVOID unused) {
         read_settings();
         run_commands();
         if (g_seats_on) head_read();
+        if (g_fade_hold && GetTickCount64() - g_fade_hold_at > 60000) { g_fade_release_ctx = 0; InterlockedExchange(&g_fade_release_pending, 1); g_fade_hold_at = GetTickCount64(); }
         guest_memory_watch();
         {
             static int gm_open;
