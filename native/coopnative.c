@@ -80,6 +80,7 @@ static volatile LONG g_levelup_relay;   // set from the ini in read_settings
 static volatile LONG g_vestige_keep;    // vestige_keep=1: the restoration screen sees no session (R4 stage 2, session 9)
 static volatile uintptr_t g_restore_class;  // BP_BCRestorationUIComponent_C class, sent by CoopProbe ("restclass <hex>")
 static volatile LONG g_keep_outro;        // keep_outro=1: keep the guest through a boss kill (outro/memory work, sessions 8-10)
+static volatile LONG g_fog_free;          // fog_free=1: the area-entry end of co-op is skipped for every field change (walking through the opened co-op fog), not only in a teleport window
 static volatile LONG g_guest_outro;       // guest_outro=1 (guest): play the outro along, block his own copy of the memory
 static volatile LONG g_guest_mem_block;   // guest_memory_block=1: block the guest's own memory copy (step a); off = both run it (step 2)
 static volatile LONG g_partner_override = 1;
@@ -203,6 +204,8 @@ static volatile LONG g_seatcam_pending;
 static volatile uintptr_t g_seatcam_pc, g_seatcam_pawn;
 static volatile LONG g_vols_pending;
 static void run_volcheck(void);
+static volatile LONG g_lsvon_n;
+static void run_lsvon(void);
 static void run_syncall(void) {
     uintptr_t pawn = g_syncall_pawn;
     if (!pawn) return;
@@ -265,6 +268,11 @@ static volatile LONG g_memunfade_pending, g_memunfade_usage = 106;
 typedef void (*uitpfade_fn)(void *ctx, void *caller, uint8_t usage, uint8_t flag);
 static volatile LONG g_tpfade_pending = -1;
 static volatile uintptr_t g_tpfade_ctx;
+#define ADDR_UI_REQUEST_LOADING_FADE 0x1409CBDB0ULL
+static volatile LONG g_tp_loading, g_tpfade_req_usage, g_tpfade_usage_on = 48;
+static volatile LONG g_tpf_step;            // 1: loading screen due (black fade made), 2: black fade lift due (loading screen lifted)
+static volatile ULONGLONG g_tpf_step_at;
+static volatile uintptr_t g_tpf_step_ctx;
 // Leaving Home Base (owner 11-07: a loading screen until the world is there, then fade out): the game lifts its teleport fade at arrival, with the stage not loaded yet. Between
 // "fadehold 1 0" and "fadehold 0 <pawn>" all unfades are kept back and made afterwards, on the game thread. At most 60 s.
 static volatile LONG g_fade_hold, g_fade_held_n, g_fade_release_pending;
@@ -667,10 +675,35 @@ static void game_thread_work(void) {
         LONG tf = InterlockedExchange(&g_tpfade_pending, -1);
         uintptr_t c = g_tpfade_ctx;
         if (tf >= 0 && c && readable(c, 8)) {
-            if (tf) ((uitpfade_fn)ADDR_UI_REQUEST_TELEPORT_FADE)((void *)c, (void *)c, 48, 0);
-            else ((uiunfade_fn)ADDR_UI_REQUEST_UNFADE)((void *)c, (void *)c, 48, 0, 1.0f);
-            logf_("tpfade: %s (context 0x%llX)", tf ? "teleport fade requested" : "unfade requested", (unsigned long long)c);
+            uint8_t u;
+            if (tf) {
+                LONG req = g_tpfade_req_usage;
+                u = (uint8_t)(req ? req : (g_tp_loading ? 64 : 48));
+                InterlockedExchange(&g_tpfade_usage_on, u);
+                ((uitpfade_fn)ADDR_UI_REQUEST_TELEPORT_FADE)((void *)c, (void *)c, 48, 0);   // black first in both modes
+                if (u == 64) { g_tpf_step_ctx = c; g_tpf_step_at = GetTickCount64() + 800; InterlockedExchange(&g_tpf_step, 1); }
+            } else {
+                u = (uint8_t)g_tpfade_usage_on;
+                if (u == 64 && g_tpf_step == 1) {              // the loading screen was not shown yet: only the black to lift
+                    InterlockedExchange(&g_tpf_step, 0);
+                    ((uiunfade_fn)ADDR_UI_REQUEST_UNFADE)((void *)c, (void *)c, 48, 0, 1.0f);
+                } else if (u == 64) {
+                    ((uiunfade_fn)ADDR_UI_REQUEST_UNFADE)((void *)c, (void *)c, 64, 0, 0.3f);
+                    g_tpf_step_ctx = c; g_tpf_step_at = GetTickCount64() + 600; InterlockedExchange(&g_tpf_step, 2);
+                } else ((uiunfade_fn)ADDR_UI_REQUEST_UNFADE)((void *)c, (void *)c, u, 0, 1.0f);
+            }
+            logf_("tpfade: %s, usage %u (context 0x%llX)", tf ? (u == 64 ? "loading screen requested" : "teleport fade requested") : "unfade requested", u,
+                  (unsigned long long)c);
         } else if (tf >= 0) logf_("tpfade: no valid context");
+    }
+    if (g_tpf_step && GetTickCount64() >= g_tpf_step_at) {
+        LONG st = InterlockedExchange(&g_tpf_step, 0);
+        uintptr_t c = g_tpf_step_ctx;
+        if (st && c && readable(c, 8)) {
+            if (st == 1) ((uitpfade_fn)ADDR_UI_REQUEST_LOADING_FADE)((void *)c, (void *)c, 64, 0);
+            else ((uiunfade_fn)ADDR_UI_REQUEST_UNFADE)((void *)c, (void *)c, 48, 0, 1.0f);
+            logf_("tpfade: %s (context 0x%llX)", st == 1 ? "black -> loading screen" : "loading screen gone -> fading in from black", (unsigned long long)c);
+        } else if (st) logf_("tpfade: step %ld dropped (no valid context)", st);
     }
     if (g_fade_release_pending && InterlockedExchange(&g_fade_release_pending, 0)) {
         InterlockedExchange(&g_fade_hold, 0);
@@ -691,6 +724,7 @@ static void game_thread_work(void) {
         } else logf_("seats: local restart refused (0x%llX, 0x%llX)", (unsigned long long)pc, (unsigned long long)pw);
     }
     if (g_vols_pending && InterlockedExchange(&g_vols_pending, 0)) run_volcheck();
+    if (g_lsvon_n) run_lsvon();
     if (g_lvlinfo_pending && InterlockedExchange(&g_lvlinfo_pending, 0)) run_lvlinfo();
     pn_game_thread();
 }
@@ -1010,6 +1044,42 @@ static uint64_t detour_spawn_impl(void *self, int64_t field, int64_t point, void
 // Second far-teleport test: with that veto the same area-entry code went on to 0x1409F1BA0 (called from 0x146D62972, result
 // unused), which showed "multiplayer is not possible in this area" and ended co-op through a Blueprint path (state 0x1F from
 // 0x146E85B35). That call is skipped in the same 60 s window.
+// Fog (11-12 research): AAppLevelStreamingVolume state: +0x3C8 bit 1 = bDisabled, +0x3E0 = bAutoEnableFromFirstSpawnToQuitGame, +0x3F8 = native
+// "enabled" byte, +0x3F9 = native force-disable byte; the game recomputes bDisabled = (+0x3E0 && !+0x3F8) || +0x3F9 || IsAllForceDisabled.
+// SetForceDisableAll(WorldContext, bool) native impl 0x14068AE50 (relocated 0x146919E60): called with true from 0x146FD1333 (a method that acts in
+// its state 4) and with false at world start / from MainGame's level script; every call is logged with its caller. IsAllForceDisabled 0x14067FE50.
+#define ADDR_SET_FORCE_DISABLE_ALL 0x14068AE50ULL
+#define ADDR_IS_ALL_FORCE_DISABLED 0x14067FE50ULL
+typedef void (*sfda_fn)(void *ctx, uint8_t on);
+static sfda_fn g_orig_sfda;
+static volatile LONG g_sfda_logs, g_volraw_logs, g_vols_logs;
+static void detour_sfda(void *ctx, uint8_t on) {
+    uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+    g_orig_sfda(ctx, on);
+    if (InterlockedIncrement(&g_sfda_logs) <= 100)
+        logf_("SetForceDisableAll(ctx 0x%llX, %u) from 0x%llX", (unsigned long long)(uintptr_t)ctx, (unsigned)on, (unsigned long long)ra);
+}
+// "lsvon <volume>" (host, fog streaming): the game's own switches of that volume back on: enabled byte 1, force byte 0, bDisabled cleared
+// (kept set if the game-wide "force disable all" is on, which is logged). Queued, run on the game thread.
+static volatile uintptr_t g_lsvon_q[16];
+static volatile LONG g_lsvon_n;
+static uint8_t is_all_force_disabled(uintptr_t v) { return ((uint8_t (*)(void *))ADDR_IS_ALL_FORCE_DISABLED)((void *)v); }
+static void run_lsvon_one(uintptr_t a) {
+    if (!a || !readable(a, 0x410)) { logf_("lsvon: 0x%llX not readable", (unsigned long long)a); return; }
+    uint8_t *v = (uint8_t *)a;
+    uint8_t e0 = v[0x3E0], f8 = v[0x3F8], f9 = v[0x3F9];
+    unsigned before = (unsigned)((*(volatile uint32_t *)(v + 0x3C8) >> 1) & 1);
+    uint8_t all = is_all_force_disabled(a);
+    v[0x3F8] = 1;
+    v[0x3F9] = 0;
+    if (all) *(volatile uint32_t *)(v + 0x3C8) |= 2u; else *(volatile uint32_t *)(v + 0x3C8) &= ~2u;
+    logf_("lsvon: 0x%llX was auto %u enabled %u force %u disabled %u, all-off %u -> disabled %u", (unsigned long long)a, e0, f8, f9, before, all,
+          (unsigned)((*(volatile uint32_t *)(v + 0x3C8) >> 1) & 1));
+}
+static void run_lsvon(void) {
+    LONG n = InterlockedExchange(&g_lsvon_n, 0);
+    for (LONG i = 0; i < n && i < 16; i++) run_lsvon_one(g_lsvon_q[i]);
+}
 #define ADDR_AREA_NOTIFY 0x1409F1BA0ULL
 #define CALLER_AREA_NOTIFY 0x146D62977ULL
 typedef uint64_t (*areanotify_fn)(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h, void *i, void *j, void *k, void *l);
@@ -1017,7 +1087,7 @@ static areanotify_fn g_orig_area_notify;
 static int in_teleport_window(void);
 static uint64_t detour_area_notify(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h, void *i, void *j, void *k, void *l) {
     if ((uintptr_t)__builtin_return_address(0) == CALLER_AREA_NOTIFY) {
-        if ((g_group_teleport || g_keep_outro) && in_teleport_window()) {
+        if ((g_group_teleport || g_keep_outro || g_fog_free) && in_teleport_window()) {
             logf_("teleport: area-entry \"no multiplayer here\" step skipped (group_teleport)");
             return 0;
         }
@@ -1043,7 +1113,7 @@ static uint64_t detour_show_msg(void *a, void *b, void *c, void *d, void *e, voi
 static volatile ULONGLONG g_outro_at, g_bosskill_at;   // bosskill: any MulticastFinishBossBattle (also solo)
 static int in_teleport_window(void) {
     ULONGLONG now = GetTickCount64();
-    return (g_tp_started_at && now - g_tp_started_at < 60000) || (g_keep_outro && g_outro_at && now - g_outro_at < 600000);
+    return (g_tp_started_at && now - g_tp_started_at < 60000) || (g_keep_outro && g_outro_at && now - g_outro_at < 600000) || g_fog_free;
 }
 static void detour_switch_end_coop(void *sm) {
     uintptr_t caller = (uintptr_t)__builtin_return_address(0);
@@ -1052,7 +1122,7 @@ static void detour_switch_end_coop(void *sm) {
         g_tp_started_at = GetTickCount64();
         return;
     }
-    if ((g_group_teleport || g_keep_outro) && caller == CALLER_AREA_END_COOP && in_teleport_window()) {
+    if ((g_group_teleport || g_keep_outro || g_fog_free) && caller == CALLER_AREA_END_COOP && in_teleport_window()) {
         LONG n = InterlockedIncrement(&g_area_vetoes);
         ULONGLONG now = GetTickCount64();
         if (now - g_last_area_veto_log > 1000) {
@@ -1716,13 +1786,21 @@ static void run_volcheck(void) {
         unsigned long long a = strtoull(line, NULL, 16);
         if (a && readable((uintptr_t)a, 0x410)) {
             n++;
-            if (((encompass_fn)ADDR_ENCOMPASSES)((void *)(uintptr_t)a, pt, 0.0f, NULL)) { fprintf(f, "%llX\n", a); hit++; }
+            if (((encompass_fn)ADDR_ENCOMPASSES)((void *)(uintptr_t)a, pt, 0.0f, NULL)) {
+                fprintf(f, "%llX\n", a); hit++;
+                if (InterlockedIncrement(&g_volraw_logs) <= 600) {
+                    const uint8_t *vb2 = (const uint8_t *)(uintptr_t)a;
+                    logf_("vols: 0x%llX auto %u enabled %u force %u disabled %u, all-off %u", a, vb2[0x3E0], vb2[0x3F8], vb2[0x3F9],
+                          (unsigned)((*(const uint32_t *)(vb2 + 0x3C8) >> 1) & 1), is_all_force_disabled((uintptr_t)a));
+                }
+            }
         }
         line = strchr(line, '\n');
     }
     fprintf(f, "done\n");
     fclose(f);
-    logf_("vols: %d of %d volumes around %.0f %.0f %.0f", hit, n, pt[0], pt[1], pt[2]);
+    LONG vl = InterlockedIncrement(&g_vols_logs);
+    if (vl <= 200 || vl % 50 == 0) logf_("vols: %d of %d volumes around %.0f %.0f %.0f (#%ld)", hit, n, pt[0], pt[1], pt[2], vl);
 }
 // Getting up (11-07: the other screen played it after the player was already walking): the seat's camera calls Mesh:SetAnimInstanceClass the moment the player leaves the seat
 // (a no-op there, same class), then sets isSittingEnd for a few frames, then waits 3 s (bed 8 s). The exec thunk sees the caller (FFrame+0x18) is a seat camera: CoopNative.stand.
@@ -1953,8 +2031,13 @@ static void run_command(char *buf) {
     } else if (strncmp(buf, "tpunlock", 8) == 0) {
         tp_tokens(2);
     } else if (strncmp(buf, "tpfade ", 7) == 0) {
-        unsigned long long ctx = 0; int on = 0;
-        if (sscanf(buf + 7, "%llx %d", &ctx, &on) == 2) { g_tpfade_ctx = (uintptr_t)ctx; InterlockedExchange(&g_tpfade_pending, on ? 1 : 0); }
+        unsigned long long ctx = 0; int on = 0, usage = 0;
+        int n = sscanf(buf + 7, "%llx %d %d", &ctx, &on, &usage);
+        if (n >= 2) {
+            g_tpfade_ctx = (uintptr_t)ctx;
+            InterlockedExchange(&g_tpfade_req_usage, (n >= 3 && (usage == 48 || usage == 64)) ? usage : 0);
+            InterlockedExchange(&g_tpfade_pending, on ? 1 : 0);
+        }
     } else if (strncmp(buf, "recwin ", 7) == 0) {
         rec_window(atoi(buf + 7), "event");
     } else if (strncmp(buf, "reccensus", 9) == 0) {
@@ -1974,6 +2057,9 @@ static void run_command(char *buf) {
     } else if (strncmp(buf, "seatcam ", 8) == 0) {
         unsigned long long p1 = 0, p2 = 0;
         if (sscanf(buf + 8, "%llx %llx", &p1, &p2) == 2) { g_seatcam_pc = (uintptr_t)p1; g_seatcam_pawn = (uintptr_t)p2; InterlockedExchange(&g_seatcam_pending, 1); }
+    } else if (strncmp(buf, "lsvon ", 6) == 0) {
+        unsigned long long la = strtoull(buf + 6, NULL, 16);
+        if (la) { LONG li = InterlockedIncrement(&g_lsvon_n) - 1; if (li < 16) g_lsvon_q[li] = (uintptr_t)la; }
     } else if (strncmp(buf, "vols", 4) == 0) {
         InterlockedExchange(&g_vols_pending, 1);
     } else if (strncmp(buf, "hbstart", 7) == 0) {
@@ -2043,6 +2129,10 @@ static void read_settings(void) {
     g_layout_random = have_ini && strstr(buf, "layout_fixed=0") != NULL;
     LONG kout = have_ini && strstr(buf, "keep_outro=1") != NULL;
     if (InterlockedExchange(&g_keep_outro, kout) != kout) logf_("setting keep_outro = %ld", kout);
+    LONG tpl = have_ini && strstr(buf, "tp_loading=1") != NULL;
+    if (InterlockedExchange(&g_tp_loading, tpl) != tpl) logf_("setting tp_loading = %ld", tpl);
+    LONG ffree = have_ini && strstr(buf, "fog_free=1") != NULL;
+    if (InterlockedExchange(&g_fog_free, ffree) != ffree) logf_("setting fog_free = %ld", ffree);
     LONG grest = have_ini && strstr(buf, "guest_rest=1") != NULL;
     if (InterlockedExchange(&g_guest_rest, grest) != grest) logf_("setting guest_rest = %ld", grest);
     LONG rest = have_ini && strstr(buf, "rest_in_coop=1") != NULL;
@@ -3214,6 +3304,8 @@ static DWORD WINAPI worker(LPVOID unused) {
             "\xE9\xFB\x70\xCB\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_is_create_session, (void **)&g_orig_is_create_session);
     install("SpawnToCheckPointImpl", ADDR_SPAWN_TO_CHECKPOINT_IMPL,
             "\xE9\xAB\x73\x91\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_spawn_impl, (void **)&g_orig_spawn_impl);
+    install("SetForceDisableAll", ADDR_SET_FORCE_DISABLE_ALL,
+            "\xE9\x0B\xF0\x28\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_sfda, (void **)&g_orig_sfda);
     install("AreaNotify", ADDR_AREA_NOTIFY,
             "\xE9\x0B\xF3\xB6\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_area_notify, (void **)&g_orig_area_notify);
     install("ShowSessionMessage", ADDR_SHOW_SESSION_MESSAGE,

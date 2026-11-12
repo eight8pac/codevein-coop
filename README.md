@@ -6,6 +6,8 @@ play the boss, its outro and the memory, and the guest's story progress, world s
 works in areas whose boss is dead. Automatic re-hosting and re-joining remain as a fallback when a session does break.
 **Not a release**: tested by hand on two PCs only, one guest (vanilla cap). Cutscenes are still rough, and opening chests and ground
 items for the guest are in progress (see Status). Home Base works together, and leaving and returning together work most of the time (see Home Base below).
+During a group teleport the guest sees the game's own join loading screen and arrives next to the host; crossing the co-op fog into the next
+stage works, but the next stage does not stream in for the guest yet (see Co-op fog below).
 
 Findings, teardown table and QA live in the Co-op Anything write-up:
 <https://github.com/cranebeaker/coop-anything/tree/main/games/code-vein>
@@ -93,16 +95,29 @@ Home Base together (two PCs, session kept):
   switched on for him: the host-only button check is hooked at run time), see each other sit, stand up and turn the head; a seat that
   is taken is closed for the other player until its sitter is up; the jukeboxes are synced both ways and their menu stays on the
   right screen; the piano plays both ways (CoopNative hooks the sound call, the other PC plays the notes after a short buffer, and
-  both hands follow: the game flips `IsPianoPlay` / `IsPianoPlay2` per press); the story bulletin board is switched on for the guest
-  (untested when this was written).
+  both hands follow: the game flips `IsPianoPlay` / `IsPianoPlay2` per press); the story bulletin board is switched on for the guest.
 - Leaving Home Base together works: the host brings the levels of the stage up itself (the game asks for none while a guest is
   connected), both stay behind a black screen until every stage level is shown and `K2_FindFloor` finds a floor under each character,
   the guest only after he has said so (the host's release is replicated and cannot wait for his PC). Returning has its own black
-  screen until all Home Base levels are shown and a floor is found. A character that falls 15 m below its hold is put back (fall
-  rescue). Levels being shown is not the same as collision being there: this caused several falls.
-- Co-op fog (surveyed, not opened yet): each area boundary has a `BP_BarrierWall` (`ForMultiplay` walls named `*_Multi`, mist and
-  collision only) that switches on when a player comes within roughly 70 to 90 m; the field table (`FieldMeta_Full`) gives every
-  story field `Reached_*` as its multiplayer flag and `Boss_*` as the flag that prohibits hosting.
+  screen until all Home Base levels are shown and a floor is found. A character that really falls (falling mode, faster than 15 m/s)
+  15 m below its hold within 20 s of the release is put back (fall rescue; ladders use the same movement mode as the hold, so mode
+  alone triggered it on a ladder). Levels being shown is not the same as collision being there: this caused several falls.
+  The holds start 1.2 s after the fade begins, and the guest's screen stays covered until the host tells him it let go
+  (`ClientMessage("CoopHBFree")`): his own release came a moment earlier and showed him floating (2026-11-12, untested).
+- Co-op fog: each area boundary has a `BP_BarrierWall` (`ForMultiplay` walls named `*_Multi`, mist and collision only) that
+  switches on when a player comes within roughly 70 to 90 m; the field table (`FieldMeta_Full`) gives every story field `Reached_*`
+  as its multiplayer flag and `Boss_*` as the flag that prohibits hosting. `fog_open` switches the walls off on both PCs and
+  `fog_free` skips the area-entry end of co-op, so both players can walk into the next stage (works). That stage does not stream
+  in for the guest (he sees nothing behind the tunnel), and on 2026-11-10 not for the host either.
+  Why (2026-11-12): `WorldSettings.bUseClientSideLevelStreamingVolumes` is false, so in Unreal only the server evaluates level
+  streaming volumes, for every player's view, and tells each client what to load (`ClientUpdateLevelStreamingStatus`); a guest's
+  own volumes do nothing. In co-op the volumes beyond the walls are switched off. An `AAppLevelStreamingVolume` is disabled
+  (bit 1 at +0x3C8) when `(+0x3E0 bAutoEnableFromFirstSpawnToQuitGame && !+0x3F8 enabled) || +0x3F9 force-disable ||
+  IsAllForceDisabled()` (`SetForceDisableAll`, impl 0x14068AE50; called with true from 0x146FD1333, with false at world start and
+  from MainGame's level script). `fog_stream` (host only, untested) has CoopNative switch the volumes under every player back on
+  (`lsvon`) and logs the raw flags and every `SetForceDisableAll` call, so the engine streams for both players and tells the guest.
+  Forcing `LevelStreaming` flags directly (tried 2026-11-10) hung rests and teleports and never reached the guest: direct flag
+  writes skip the server's notification of the clients.
 - Not done: the guest's seat camera (the camera never follows his mouse), the appearance editor for the guest (he gets a missing
   character and a permanent loading screen), and syncing a changed appearance.
 
@@ -128,6 +143,9 @@ Works (two PCs, experiments):
   from his player data). He then sends `Server_AddExp(0)` once per level; the host sets the level of its copy with the setter
   (base+0x88) under the same force and recomputes the stats, so his max HP updates. Gifts work (vanilla), once he switches to
   the blood code the gift belongs to.
+  The force needs his pawn first on `CoopNative.protect`; with `keep_dying=0` that list was empty outside boss fights and the
+  level-up silently failed (2026-11-06 to 11-11). His pawn now goes first while his Mistle menu is open, and he tells the host
+  (guest -> host message kind 15), whose list then holds his pawn too, so the host's copy levels up at once (works, 2026-11-12).
 - `group_teleport` (works, also into a completely different stage): a Mistle teleport is not a move but
   `CheckPointUIComponent:RequestPlayerSpawnToCheckPoint`, a fresh spawn at the target (the world is one map with streamed stages).
   It ends co-op twice: `SwitchToEndCoop` from 0x146678D02 (with an "ending co-op / distress signal" message shown by
@@ -137,6 +155,12 @@ Works (two PCs, experiments):
   sends `PlayerController:ClientMessage("CoopTeleportFade")` (a client RPC, used as a host -> guest channel) at the start, the
   guest's CoopNative calls `RequestTeleportFade(ctx, ctx, 48, 0)` like the vanilla teleport and unfades once he is next to the
   host. Home Base (FieldID 0) is part of the same map; `teleport_skip_fields=0` would keep the vanilla behaviour for it.
+  With `tp_loading` the guest gets black, then the game's join loading screen (`UIHelper::RequestLoadingFade`, usage 64
+  LongLoading, the screen he sees when answering a distress call), then black again and the normal fade-in once he is next to
+  the host (works, 2026-11-12). The host decides and tells him (`ClientMessage("CoopFadeMode:64")`). With `tp_anim` he plays the
+  host's Mistle-teleport montages too (`AM_TStdUnisex_TCmn_TriggerAc_Checkpoint_Start` / `_End`) instead of the appear effect
+  (untested). A variant that sent the guest through a new join after each teleport ("soft follow", `ClientTravel` to the host)
+  was tried and dropped: he stayed on a black screen; the guest now always stays in the session.
 - Falls (`keep_dying`): a fall leads straight to spectating (no revive window, no partner revive in the pit); the guest comes
   back next to the host at the host's next rest.
 
@@ -193,7 +217,10 @@ world, and rejoins), Home Base mode for the guest (`CharacterHelper.SetRestricte
 Diagnostics: CoopNative logs a freeze watchdog report when the game thread stops for 8 s; `tools/threadstacks.c` samples a running
 process's thread stacks (hangs that are not freezes), `tools/memread.c` / `tools/memwrite.c` read and write a running test copy's
 memory, `tools/minidump.py` reads crash dumps, `tools/findwrites64.py` finds code that writes a global, `tools/scanflags.py` finds
-`IsOnlineMultiplay` checks followed by flag compares. A `bosshp1` CoopProbe command sets a running boss fight to 1 health (tests).
+`IsOnlineMultiplay` checks followed by flag compares, `tools/natreg.py` finds a native function's exec thunk from its registration
+entry, `tools/scanoff.py` finds code that writes a member offset, `tools/vtfind.py` finds the vtables holding a function.
+CoopProbe commands: `bosshp1` sets a running boss fight to 1 health (tests), `lsvinfo` logs the streaming settings and volume
+states, `montagewatch` logs the montages our character plays, `loadtest` shows and lifts the join loading screen.
 Guest progression and shared boss rewards: see issue #1 (CoopProgress).
 
 ## Contributing
