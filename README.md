@@ -85,8 +85,9 @@ Home Base together (two PCs, session kept):
   an NPC on his own side. Tested with identical saves.
 - How NPCs work: each area's `ScenarioProgressLoader` picks a layout from the story flags on each PC (only Home Base rolls at random;
   the pick is fixed here so both PCs load the same one). In a normal area the host's result reaches the guest by the game's own
-  replication; a recording with our visibility mirror off showed both PCs matching at join and after a boss. The mirror now only
-  covers side-quest NPCs in Home Base, whose replicated value does not reach the guest there (reason unknown).
+  replication; a recording with our visibility mirror off showed both PCs matching at join and after a boss. Side-quest NPCs are the
+  exception: they decide their visibility on each PC, so the guest saw other stages of a quest as extra, unusable NPCs (Home Base
+  first, later also in stages). The mirror covers side-quest NPCs in Home Base, and with `subquest_mirror=1` everywhere.
 - Online, the host holds every character in setup until each guest has reported it (`0x145DA0600`). Home Base NPCs never got that
   report, which also held the host's arrival, so story NPCs take the solo setup during the trip.
 - UE4SS's hook dispatcher walks `FFrame::OutParms` of the calling Blueprint frame, and from some NPC scripts that list has a bad
@@ -214,13 +215,39 @@ In progress: vestige restoration (the entry checks in the restoration code are a
 guest's rest resetting enemies, the memory for the guest (plan: he leaves for the memory, plays it solo with control in his own
 world, and rejoins), Home Base mode for the guest (`CharacterHelper.SetRestrictedActionInBaseInfo`), 3+ players, a teleport vote.
 
+Walking from one area to the next together (the "airlock", switches `airlock=1`, `airlock_overlap=1`, `wall_settle=1`,
+`gwall_mirror=1`, `airlock_resettle=1`): in co-op the game skips its own area streaming entirely. CoopNative answers "not
+multiplayer" to exactly that caller (`fieldstream 1`) while every player stands in the tunnel zone that reaches into the next area,
+so the game loads and unloads areas and opens its own loading walls as in single player, and closes it again once everyone is in one
+area and the streaming has settled. Each PC switches the co-op walls only after its own level streaming has settled, the host's
+own loading walls are mirrored to the guests, and chest loot is shared only on a real opening (`Server_SetChestState(Opening)`).
+Mistle group teleports hold the guest's old character in the air until his new one arrives (`tp_hold=1`), and a jammed setup lock
+after the arrival is reset (`lock_reset_tp=1`). Tested on 11-13 and 11-17: area 2 to area 1 and back several times, area 1 to area 3.
+Open: the guest's fog is not visible yet (`fog_visual=1` is the next try), a player left behind when the other runs ahead, and the
+engine assert "BitArrayIndex < NumBitArrayIndex" (Actor.cpp): an actor's component index table runs out of its 63 shared slots
+while a guest streams in a new area's gameplay level; `assert_watch=1` names the actor and the objects around it when it happens.
+
+Testing on one PC: a second Steam client runs in a Sandboxie-Plus box, logged in with a second Steam account that owns or borrows
+the game, and starts a second, hard-linked test copy as the guest (`tools/start-guest-box.ps1`). Each copy has its own Steam account
+and license; no Steam emulator, no `-nosteam`, no patched executable. The box keeps both the Steam client's and the game's
+single-instance checks apart. The guest copy needs its own ports (`-port=7787 -QueryPort=27025`): the game also starts a Steam game
+server, and with the host copy running the guest's Steam start failed and fell back to offline mode. Start it with its own folder as
+the working directory, or Steam restarts the game from the library install.
+
 Diagnostics: CoopNative logs a freeze watchdog report when the game thread stops for 8 s; `tools/threadstacks.c` samples a running
 process's thread stacks (hangs that are not freezes), `tools/memread.c` / `tools/memwrite.c` read and write a running test copy's
 memory, `tools/minidump.py` reads crash dumps, `tools/findwrites64.py` finds code that writes a global, `tools/scanflags.py` finds
 `IsOnlineMultiplay` checks followed by flag compares, `tools/natreg.py` finds a native function's exec thunk from its registration
-entry, `tools/scanoff.py` finds code that writes a member offset, `tools/vtfind.py` finds the vtables holding a function.
+entry, `tools/scanoff.py` finds code that writes a member offset, `tools/vtfind.py` finds the vtables holding a function,
+`tools/findlea.py` finds the code that uses a string or a global (RIP-relative LEA/MOV), `tools/minidump.py --deep` reads a crash
+dump's whole stack (UE4's assert puts the failing site about 14 KB deep), `tools/mergelogs.py` merges host and guest logs into one
+timeline on the host's clock, `tools/npccompare.py` compares the NPC census of both PCs. With `live_logs=1` the guest's CoopNative
+mirrors his logs to the LAN share every 5 s while he plays, and the host sends its clock to the guests every 30 s.
 CoopProbe commands: `bosshp1` sets a running boss fight to 1 health (tests), `lsvinfo` logs the streaming settings and volume
-states, `montagewatch` logs the montages our character plays, `loadtest` shows and lifts the join loading screen.
+states, `montagewatch` logs the montages our character plays, `loadtest` shows and lifts the join loading screen, `wallsnear`
+lists every barrier and fog wall within 80 m, `bring` moves the guests next to the host, `rec` takes an NPC census, and
+`guest <command>` runs a command on every guest's PC (`guest native <command>` for CoopNative). The command file takes one
+command per line.
 Guest progression and shared boss rewards: see issue #1 (CoopProgress).
 
 ## Contributing

@@ -688,7 +688,7 @@ static void game_thread_work(void) {
                     InterlockedExchange(&g_tpf_step, 0);
                     ((uiunfade_fn)ADDR_UI_REQUEST_UNFADE)((void *)c, (void *)c, 48, 0, 1.0f);
                 } else if (u == 64) {
-                    ((uiunfade_fn)ADDR_UI_REQUEST_UNFADE)((void *)c, (void *)c, 64, 0, 0.3f);
+                    ((uiunfade_fn)ADDR_UI_REQUEST_UNFADE)((void *)c, (void *)c, 64, 0, 0.3f);   // (a 0 s unfade does nothing: 11-13 07:28 stuck)
                     g_tpf_step_ctx = c; g_tpf_step_at = GetTickCount64() + 600; InterlockedExchange(&g_tpf_step, 2);
                 } else ((uiunfade_fn)ADDR_UI_REQUEST_UNFADE)((void *)c, (void *)c, u, 0, 1.0f);
             }
@@ -1023,6 +1023,8 @@ typedef uint64_t (*spawnimpl_fn)(void *self, int64_t field, int64_t point, void 
 static spawnimpl_fn g_orig_spawn_impl;
 static volatile LONG g_tp_skip;            // 1 while the current teleport goes to a skipped destination
 static volatile ULONGLONG g_hb_at;         // Home Base teleport with the session kept: start
+static volatile ULONGLONG g_tp_arrived_at; // Mistle group teleport: the host's characters re-spawned (v7 lock reset)
+static int g_lock_reset_tp;                // lock_reset_tp=1
 static void rec_window(int seconds, const char *why);
 static int g_skip_fields[16], g_skip_n;
 static uint64_t detour_spawn_impl(void *self, int64_t field, int64_t point, void *d, void *e, void *f, void *g, void *h, void *i, void *j, void *k, void *l) {
@@ -1149,6 +1151,7 @@ static void detour_switch_end_coop(void *sm) {
 #define MISTLE_PROMPT_END   0x1469782E0ULL               // past the last return seen in the decompile
 typedef uint8_t (*multiplay_fn)(void *ctx);
 static multiplay_fn g_orig_multiplay;
+static volatile LONG g_field_stream, g_field_stream_n;
 static volatile LONG g_rest_in_coop, g_rest_overrides;
 
 // The rest action: the Mistle's ProcessInputButtonEvent (vtable +0x618 -> stub 0x1406BB510 -> body 0x146A1CB70) starts with
@@ -1490,6 +1493,11 @@ static uint8_t detour_multiplay(void *ctx) {
     uint8_t r = g_orig_multiplay(ctx);
     uintptr_t caller = (uintptr_t)__builtin_return_address(0);
     note_rest_caller(0, caller, r);
+    if (r && caller == 0x146D36F21ULL && g_field_stream) {
+        LONG fn = InterlockedIncrement(&g_field_stream_n);
+        if (fn == 1 || fn % 600 == 0) logf_("fieldstream: zone streaming runs in co-op (IsOnlineMultiplay from 0x146D36F21 answered false, %ld times)", fn);
+        return 0;
+    }
     // Character setup 0x145DA0600 (recording 11-06): online, the host keeps a character in setup until every guest has reported it (+0xB9C >= players - 1,
     // retried every tick; solo it just finishes). The Home Base NPCs (22: layout + ForFastLoad) are not relevant to a guest who is still far away, so
     // no report came, the appear lock stayed shut and the host's own arrival hung with it, until the session ended: IsOnlineMultiplay false, all finished
@@ -2057,6 +2065,13 @@ static void run_command(char *buf) {
     } else if (strncmp(buf, "seatcam ", 8) == 0) {
         unsigned long long p1 = 0, p2 = 0;
         if (sscanf(buf + 8, "%llx %llx", &p1, &p2) == 2) { g_seatcam_pc = (uintptr_t)p1; g_seatcam_pawn = (uintptr_t)p2; InterlockedExchange(&g_seatcam_pending, 1); }
+    } else if (strncmp(buf, "fieldstream ", 12) == 0) {
+        LONG fs = atoi(buf + 12) ? 1 : 0;
+        InterlockedExchange(&g_field_stream, fs);
+        InterlockedExchange(&g_field_stream_n, 0);
+        logf_("fieldstream: %s", fs ? "ON (zone streaming answers 'not multiplayer')" : "off (the game's co-op behaviour)");
+    } else if (strncmp(buf, "mpwatch", 7) == 0) {
+        start_rest_log("mpwatch command (fog: a player is near a co-op wall)");
     } else if (strncmp(buf, "lsvon ", 6) == 0) {
         unsigned long long la = strtoull(buf + 6, NULL, 16);
         if (la) { LONG li = InterlockedIncrement(&g_lsvon_n) - 1; if (li < 16) g_lsvon_q[li] = (uintptr_t)la; }
@@ -2903,7 +2918,7 @@ static void sync_backtrace(int i) {
     logf_("SYNC   backtrace:%s", bt);
 }
 #define SYNC_DETOUR(i) static void sync_det_##i(void *c, void *st, void *r) { \
-    if (i == 1 && g_tp_pending && InterlockedExchange(&g_tp_pending, 0)) { logf_("teleport: characters re-spawned (arrived)"); write_teleport_marker("arrived"); } \
+    if (i == 1 && g_tp_pending && InterlockedExchange(&g_tp_pending, 0)) { logf_("teleport: characters re-spawned (arrived)"); write_teleport_marker("arrived"); g_tp_arrived_at = GetTickCount64(); } \
     if (InterlockedIncrement(&g_sync_count[i]) <= 400) { logf_("SYNC %s on 0x%llX", g_sync_name[i], (unsigned long long)(uintptr_t)c); sync_backtrace(i); } \
     g_sync_orig[i](c, st, r); }
 SYNC_DETOUR(0)
@@ -3184,6 +3199,171 @@ static void start_exit_package(void) {
         logf_("log package: waiting for the game to end (zip to CoopLogs%s%s)", share[0] ? ", copy to " : "", share[0] ? share : "");
     } else logf_("log package: could not start the watcher (%lu)", GetLastError());
 }
+// Live log mirror (11-13, live_logs=1 in the guest kit): every 5 s the new part of ue4ss\UE4SS.log and CoopNative.log is appended to
+// <log_share>\live\guest-UE4SS.log / guest-CoopNative.log, on this thread only, so a stuck share can never stall the game. The first copy
+// of a run (or a log that got shorter) starts the remote file over; at most 512 KB per round.
+// Assert watch (11-13, assert_watch=1, log only). The recurring "0 <= BitArrayIndex && BitArrayIndex < NumBitArrayIndex" (Actor.cpp:88) is
+// an actor's component index table running out of room: ComponentIndexTable[TraitIndex] holds 0 (none), 1..0xC0 (one component) or
+// 0xC1+ (one of at most 63 bit arrays of 192 bits), so an actor may have at most 63 component traits shared by two or more components.
+// Both guest crashes on 11-13 (kit 216 at St05, kit 217 at St06) had the same stack: site 0x14DF772C7 <- 0x14DF412A2 <- 0x14DF7D563, while the
+// new field's GameBP level streamed in. FDebug::LogAssertFailedMessage (stub 0x140C48CF0) is hooked through a stub that keeps the caller's
+// callee-saved registers (the table is in RSI at that site), and the objects around it are named before the game goes down as before.
+uint64_t g_ac_regs[10];   // rbx rsi rdi rbp r12 r13 r14 r15, rsp at entry, return address
+void *g_orig_logassert;
+void coop_assert_stub(void);
+void detour_logassert(uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8);
+__asm__(
+    ".text\n"
+    ".globl coop_assert_stub\n"
+    "coop_assert_stub:\n"
+    "    movq %rbx, g_ac_regs+0(%rip)\n"
+    "    movq %rsi, g_ac_regs+8(%rip)\n"
+    "    movq %rdi, g_ac_regs+16(%rip)\n"
+    "    movq %rbp, g_ac_regs+24(%rip)\n"
+    "    movq %r12, g_ac_regs+32(%rip)\n"
+    "    movq %r13, g_ac_regs+40(%rip)\n"
+    "    movq %r14, g_ac_regs+48(%rip)\n"
+    "    movq %r15, g_ac_regs+56(%rip)\n"
+    "    movq %rsp, g_ac_regs+64(%rip)\n"
+    "    movq (%rsp), %rax\n"
+    "    movq %rax, g_ac_regs+72(%rip)\n"
+    "    jmp detour_logassert\n");
+typedef void (*ac_fname_tostring_t)(const void *fname, void *out);
+struct ac_fstr { uint16_t *data; int32_t num; int32_t max; };
+static int ac_in_image(uintptr_t a) { return a >= 0x140000000ULL && a < 0x170000000ULL; }
+static int ac_is_obj(uintptr_t p) {
+    if (!p || (p & 7) || !readable(p, 0x30)) return 0;
+    uintptr_t vt = *(uintptr_t *)p, cls = *(uintptr_t *)(p + 0x10);
+    if (!ac_in_image(vt) || !readable(vt, 8) || !ac_in_image(*(uintptr_t *)vt)) return 0;
+    int idx = *(int32_t *)(p + 0xC), ni = *(int32_t *)(p + 0x18);
+    if (idx < 0 || idx > 4000000 || ni < 0 || ni > 4000000) return 0;
+    if (!cls || (cls & 7) || !readable(cls, 0x30) || !ac_in_image(*(uintptr_t *)cls)) return 0;
+    int cni = *(int32_t *)(cls + 0x18);
+    return cni >= 0 && cni <= 4000000;
+}
+static void ac_name(uintptr_t p, char *out, size_t n) {
+    struct ac_fstr s = { 0, 0, 0 };
+    out[0] = '?'; out[1] = 0;
+    ((ac_fname_tostring_t)0x140CC92D0ULL)((const void *)(p + 0x18), &s);
+    if (s.data && s.num > 0 && readable((uintptr_t)s.data, (size_t)s.num * 2)) {
+        size_t k = 0;
+        for (; k + 1 < n && k < (size_t)s.num && s.data[k]; k++) out[k] = (char)(s.data[k] < 128 ? s.data[k] : '?');
+        out[k] = 0;
+    }
+}
+static void ac_describe(const char *tag, uintptr_t p) {
+    char nm[96], cl[96], o1[96] = "-", o2[96] = "-";
+    ac_name(p, nm, sizeof nm);
+    ac_name(*(uintptr_t *)(p + 0x10), cl, sizeof cl);
+    uintptr_t ou = *(uintptr_t *)(p + 0x20);
+    if (ac_is_obj(ou)) {
+        ac_name(ou, o1, sizeof o1);
+        uintptr_t ou2 = *(uintptr_t *)(ou + 0x20);
+        if (ac_is_obj(ou2)) ac_name(ou2, o2, sizeof o2);
+    }
+    logf_("ASSERT ctx %s: 0x%llX %s (%s) in %s / %s", tag, (unsigned long long)p, nm, cl, o1, o2);
+}
+static void ac_copy(uintptr_t s, char *out, size_t n) {
+    size_t k = 0;
+    while (k + 1 < n && readable(s + k, 1) && ((const char *)s)[k]) { out[k] = ((const char *)s)[k]; k++; }
+    out[k] = 0;
+}
+static void ac_context(uintptr_t expr, uintptr_t file, int line) {
+    static const char *rn[8] = { "rbx", "rsi", "rdi", "rbp", "r12", "r13", "r14", "r15" };
+    char e[200], f[220];
+    ac_copy(expr, e, sizeof e); ac_copy(file, f, sizeof f);
+    logf_("ASSERT seen: %s [%s:%d], caller 0x%llX", e, f, line, (unsigned long long)g_ac_regs[9]);
+    logf_("ASSERT regs: rbx %llX rsi %llX rdi %llX rbp %llX r12 %llX r13 %llX r14 %llX r15 %llX rsp %llX",
+          (unsigned long long)g_ac_regs[0], (unsigned long long)g_ac_regs[1], (unsigned long long)g_ac_regs[2], (unsigned long long)g_ac_regs[3],
+          (unsigned long long)g_ac_regs[4], (unsigned long long)g_ac_regs[5], (unsigned long long)g_ac_regs[6], (unsigned long long)g_ac_regs[7],
+          (unsigned long long)g_ac_regs[8]);
+    uintptr_t tb = g_ac_regs[1];
+    if (readable(tb, 0x20))
+        logf_("ASSERT table at rsi: map 0x%llX (%d keys), bit arrays 0x%llX (%d of %d)", (unsigned long long)*(uintptr_t *)tb, *(int32_t *)(tb + 8),
+              (unsigned long long)*(uintptr_t *)(tb + 0x10), *(int32_t *)(tb + 0x18), *(int32_t *)(tb + 0x1C));
+    for (int r = 0; r < 8; r++) {
+        uintptr_t v = g_ac_regs[r];
+        if (ac_is_obj(v)) { ac_describe(rn[r], v); continue; }
+        if (r <= 2 && readable(v, 8)) {   // a pointer into an object (the table inside its actor): the first object at or below it
+            for (uintptr_t off = 8; off <= 0x2000 && off < v; off += 8) {
+                if (ac_is_obj(v - off)) {
+                    char tag[40]; snprintf(tag, sizeof tag, "%s-0x%llX", rn[r], (unsigned long long)off);
+                    ac_describe(tag, v - off);
+                    break;
+                }
+            }
+        }
+    }
+    uintptr_t sp = g_ac_regs[8], seen[48];
+    int ns = 0;
+    for (size_t i = 0; i < 0x8000 && ns < 40; i += 8) {
+        if (!readable(sp + i, 8)) break;
+        uintptr_t v = *(uintptr_t *)(sp + i);
+        if (!ac_is_obj(v)) continue;
+        int dup = 0;
+        for (int k = 0; k < ns; k++) if (seen[k] == v) dup = 1;
+        if (dup) continue;
+        seen[ns++] = v;
+        char tag[32]; snprintf(tag, sizeof tag, "stack+0x%llX", (unsigned long long)i);
+        ac_describe(tag, v);
+    }
+    logf_("ASSERT ctx: done (%d objects on the stack)", ns);
+}
+void detour_logassert(uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8) {
+    static volatile LONG once;
+    if (InterlockedExchange(&once, 1) == 0) ac_context(a1, a2, (int)a3);
+    ((void (*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t))g_orig_logassert)(a1, a2, a3, a4, a5, a6, a7, a8);
+}
+static void live_copy(const char *local, const char *remote, long long *off, int *started) {
+    FILE *in = _fsopen(local, "rb", _SH_DENYNO);
+    if (!in) return;
+    _fseeki64(in, 0, SEEK_END);
+    long long size = _ftelli64(in);
+    int restart = !*started || size < *off;
+    if (size < *off) *off = 0;
+    if (!restart && size == *off) { fclose(in); return; }
+    long long n = size - *off;
+    if (n > 512 * 1024) { *off = size - 512 * 1024; n = 512 * 1024; }
+    char *buf = (char *)malloc((size_t)(n > 0 ? n : 1));
+    if (!buf) { fclose(in); return; }
+    _fseeki64(in, *off, SEEK_SET);
+    size_t got = n > 0 ? fread(buf, 1, (size_t)n, in) : 0;
+    fclose(in);
+    FILE *out = _fsopen(remote, restart ? "wb" : "ab", _SH_DENYNO);
+    if (out) {
+        if (got) fwrite(buf, 1, got, out);
+        fclose(out);
+        *off += (long long)got;
+        *started = 1;
+    }
+    free(buf);
+}
+static DWORD WINAPI live_thread(LPVOID unused) {
+    (void)unused;
+    static char ini[4096];
+    char share[600], dir[700], a[MAX_PATH], b[800], c[MAX_PATH], d[800];
+    long long o1 = 0, o2 = 0;
+    int s1 = 0, s2 = 0, said = 0;
+    for (;;) {
+        Sleep(5000);
+        if (!read_small_file("CoopNative.ini", ini, sizeof ini) || !strstr(ini, "live_logs=1")) continue;
+        const char *q = strstr(ini, "log_share=");
+        if (!q) continue;
+        q += 10;
+        size_t k = 0;
+        while (q[k] && q[k] != '\r' && q[k] != '\n' && k < sizeof share - 1) { share[k] = q[k]; k++; }
+        share[k] = 0;
+        if (!share[0]) continue;
+        snprintf(dir, sizeof dir, "%s\\live", share);
+        CreateDirectoryA(dir, NULL);
+        snprintf(a, sizeof a, "%s..\\ue4ss\\UE4SS.log", g_dir); snprintf(b, sizeof b, "%s\\guest-UE4SS.log", dir);
+        snprintf(c, sizeof c, "%sCoopNative.log", g_dir); snprintf(d, sizeof d, "%s\\guest-CoopNative.log", dir);
+        live_copy(a, b, &o1, &s1);
+        live_copy(c, d, &o2, &s2);
+        if (!said && s1) { said = 1; logf_("live logs: mirrored to %s every 5 s", dir); }
+    }
+    return 0;
+}
 static DWORD WINAPI worker(LPVOID unused) {
     (void)unused;
     Sleep(2000);   // let the engine finish its own startup first
@@ -3222,6 +3402,13 @@ static DWORD WINAPI worker(LPVOID unused) {
             CreateThread(NULL, 0, rec_thread, NULL, 0, NULL);
             rec_window(60, "game start");
         }
+    }
+    {
+        char lini[4096] = "";
+        if (read_small_file("CoopNative.ini", lini, sizeof lini) && strstr(lini, "live_logs=1")) CreateThread(NULL, 0, live_thread, NULL, 0, NULL);
+        if (strstr(lini, "lock_reset_tp=1")) { g_lock_reset_tp = 1; logf_("lock_reset_tp: stuck appear lock after a Mistle teleport is reset (v7)"); }
+        if (strstr(lini, "assert_watch=1"))
+            install("AssertWatch", 0x140C48CF0ULL, "\xE9\x3B\x77\x8C\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)coop_assert_stub, &g_orig_logassert);
     }
     install("LayoutChoice", ADDR_LAYOUT_CHOICE,
             "\xE9\xAB\x98\x76\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_layout_choice, (void **)&g_orig_layout_choice);
@@ -3390,6 +3577,24 @@ static DWORD WINAPI worker(LPVOID unused) {
                       (unsigned long long)hp, *(volatile uint8_t *)(hp + 0xB83), *(volatile int *)0x14413C404ULL, *(volatile int *)0x14413C40CULL);
                 *(volatile uint8_t *)(hp + 0xB83) = 0;
                 *(volatile int *)0x14413C404ULL = 0; clear_player_lock_flags();
+                *(volatile int *)0x14413C40CULL = 0;
+                *(volatile uint64_t *)0x14413C410ULL = *(volatile uint64_t *)0x144194140ULL;
+            }
+        }
+        // v7 (11-13): the same stuck lock after a Mistle group teleport, from 10 s after the host's arrival (lock_reset_tp=1)
+        {
+            static ULONGLONG v7_last, v7_for; static int v7_n;
+            ULONGLONG now7 = GetTickCount64(), ta = g_tp_arrived_at;
+            if (v7_for != ta) { v7_for = ta; v7_n = 0; }
+            if (g_lock_reset_tp && ta && now7 - ta > 10000 && now7 - ta < 75000 && now7 - v7_last > 2000 && v7_n < 8 &&
+                *(volatile uint64_t *)0x14413C410ULL == ~0ULL && *(volatile int *)0x14413C404ULL > 0) {
+                v7_last = now7; v7_n++;
+                logf_("appear lock v7: stuck after the Mistle teleport (count %d, +0xB85 holders %d, +0xB84 holders %d, %d so far) -> lock reset",
+                      *(volatile int *)0x14413C404ULL, *(volatile int *)0x14413C408ULL, *(volatile int *)0x14413C40CULL, v7_n);
+                int held = clear_holder_flags();
+                logf_("appear lock v7: %d characters freed", held);
+                *(volatile int *)0x14413C404ULL = 0; clear_player_lock_flags();
+                *(volatile int *)0x14413C408ULL = 0;
                 *(volatile int *)0x14413C40CULL = 0;
                 *(volatile uint64_t *)0x14413C410ULL = *(volatile uint64_t *)0x144194140ULL;
             }

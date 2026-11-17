@@ -49,12 +49,17 @@ for size, rva in streams.get(6, []):            # ExceptionStream
     rip, = struct.unpack_from('<Q', d, ctx_rva + 0xF8)
     rsp, = struct.unpack_from('<Q', d, ctx_rva + 0x98)
     print('context RIP 0x%X (%s) RSP 0x%X' % (rip, where(rip), rsp))
-    stack = read(rsp, 0x2000) or b''
+    deep = '--deep' in sys.argv        # 11-13: UE4's assert formats into large stack buffers; the failing site sits deeper than 8 KB
+    stack = b''
+    for start, size, mrva in mem:
+        if start <= rsp < start + size:
+            n = min(start + size - rsp, 0x40000 if deep else 0x2000)
+            stack = d[mrva + rsp - start: mrva + rsp - start + n]
     out = []
     for i in range(0, len(stack) - 7, 8):
         v = struct.unpack_from('<Q', stack, i)[0]
         w = where(v)
-        if w and not w.startswith('ntdll') : out.append(w)
-        if len(out) >= 40: break
+        if w and not w.startswith('ntdll') : out.append(('+0x%05X ' % i if deep else '') + w)
+        if len(out) >= (400 if deep else 40): break
     print('stack (%d bytes read):' % len(stack))
     for w in out: print('  ' + w)
