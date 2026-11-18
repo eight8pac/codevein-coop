@@ -4,10 +4,11 @@ Mods that turn Code Vein (2019) co-op into one continuous session. The guest sta
 kills that end a vanilla session: a dead guest spectates and comes back at the host's rest, the group teleports together, both
 play the boss, its outro and the memory, and the guest's story progress, world state and blood codes follow the host's. Co-op also
 works in areas whose boss is dead. Automatic re-hosting and re-joining remain as a fallback when a session does break.
-**Not a release**: tested by hand on two PCs only, one guest (vanilla cap). Cutscenes are still rough, and opening chests and ground
-items for the guest are in progress (see Status). Home Base works together, and leaving and returning together work most of the time (see Home Base below).
-During a group teleport the guest sees the game's own join loading screen and arrives next to the host; crossing the co-op fog into the next
-stage works, but the next stage does not stream in for the guest yet (see Co-op fog below).
+**Not a release**: tested by hand on two PCs (and on one PC, see below), one guest (vanilla cap). Cutscenes are still rough, and
+chests opened by the guest and ground items for the guest are in progress (see Status). Home Base works together, and leaving and
+returning together work most of the time (see Home Base below). Mistle teleports are voted on by everyone (Elden Ring style) and keep
+the loading screen up until the destination is really loaded; walking between stages streams the next one in for everyone (see Co-op
+fog and Teleport vote below). Known crash: the engine assert "BitArrayIndex" while an area loads (see Open).
 
 Findings, teardown table and QA live in the Co-op Anything write-up:
 <https://github.com/cranebeaker/coop-anything/tree/main/games/code-vein>
@@ -223,9 +224,40 @@ area and the streaming has settled. Each PC switches the co-op walls only after 
 own loading walls are mirrored to the guests, and chest loot is shared only on a real opening (`Server_SetChestState(Opening)`).
 Mistle group teleports hold the guest's old character in the air until his new one arrives (`tp_hold=1`), and a jammed setup lock
 after the arrival is reset (`lock_reset_tp=1`). Tested on 11-13 and 11-17: area 2 to area 1 and back several times, area 1 to area 3.
-Open: the guest's fog is not visible yet (`fog_visual=1` is the next try), a player left behind when the other runs ahead, and the
-engine assert "BitArrayIndex < NumBitArrayIndex" (Actor.cpp): an actor's component index table runs out of its 63 shared slots
-while a guest streams in a new area's gameplay level; `assert_watch=1` names the actor and the objects around it when it happens.
+Since 11-18 the guest sees the fog in front of him (`fog_visual=1`) and it fades out slowly as in single player (`fog_fade=1`).
+Open: a player left behind when the other runs ahead (parked), and the engine assert "BitArrayIndex < NumBitArrayIndex" (see Open below).
+
+Teleport vote and teleport gate (11-18, `teleport_vote=1`, `tp_gate=1`):
+- Whoever picks a Mistle in the menu proposes the teleport; CoopNative holds it (`RequestPlayerSpawnToCheckPoint`'s implementation
+  returns early) and everyone else gets the game's own yes/no dialog (`UIHelper:OpenGeneralYesNoDialog`, `WDT_YesNoDialog_C`) with
+  "<name> wants to travel to <Mistle> (<area>)." from the game's checkpoint list. The choice is read natively at
+  `DialogBase:DecideSimpleOption` (UE4SS hooks on menu functions crash the game). All accept: the host teleports and the group
+  follows; a decline or 30 s without an answer cancels it, with a popup naming who declined. The guest's Teleport entry is enabled.
+- Cause of "landing in nothing" after returning to an area: in co-op the game switches its level-streaming volumes off; the airlock
+  closed them for every teleport, so levels that were still loaded but hidden were never shown again. Now the game's loading screen is
+  kept (its unfades are held back) from the teleport start, the guests' held characters are moved (hidden) to the host, the zone
+  streaming runs, and the loading screen lifts only when every level of every streaming volume under the host is loaded and shown and
+  nothing streams any more. The guest's own loading screen waits for the levels under his new character in the same way. No timers
+  decide this; a 110 s cap is only a last resort.
+- Also: the guests are hidden while held at the teleport start, the health bonus is refilled after a teleport, a fast arrival into an
+  area that is still unloading is caught, and the "distress signal canceled ... disperse" notice (`MultiplayText_0580`, shown through
+  0x1409D10B0) is skipped during a group teleport.
+
+Items (11-18): chest loot is shared when the host opens a chest, without the earlier stall; enemy drops reach the guest (the game's
+own `DropItemComponent` RPCs). The guest's own `Server_SetChestState` is dropped by his engine ("No owning connection"); CoopNative
+now catches that log line (FMsg::Logf_Internal through a stub that only looks at the format pointer) and the guest relays the chest
+to the host (`guest_chest=1`, untested). Ground items (`AFieldTriggerItemBase`) keep a per-player hold state and visibility; the
+guest does not see the host's ones yet (`item_census=1` logs both sides).
+
+Open: the engine assert "BitArrayIndex < NumBitArrayIndex" (Actor.cpp:88), on host and guest, while an area loads. Findings: every
+actor has a lazily built component index table cached at `AActor+0x2B0` (one byte per trait, 160 traits, at most 63 traits shared by
+two or more components); once loaded, enemies use at most 19 shared slots, the same alone and in co-op, but in every crash an enemy's
+table reached 64 while it was still being deserialized (`FAsyncPackage::EventDrivenSerializeExport`, the enemy's `KetsugiComponent`
+lookup builds the table). `-NoAsyncLoadingThread` did not help. `comp_census=1` logs every character's table fill and the
+assert watch dumps the half-built table (components and shared slots) when it happens.
+Enemy respawn at a rest works on the first rest but not on a second one (`rest_census=1` logs enemies and enemy levels around
+each rest). The fall-death scream (`UDeathComponent.FallDeathVoice`) is played only on the falling player's PC; `fall_voice=1`
+plays it on the other PCs too.
 
 Testing on one PC: a second Steam client runs in a Sandboxie-Plus box, logged in with a second Steam account that owns or borrows
 the game, and starts a second, hard-linked test copy as the guest (`tools/start-guest-box.ps1`). Each copy has its own Steam account
