@@ -10,7 +10,9 @@ by everyone (Elden Ring style) and keep the loading screen up until the destinat
 the next one in for everyone (see Co-op fog and Teleport vote below). Resting resets the enemies as in single player, ground items
 are per player (each player sees what his own save has not picked up), the map shows the host's icons, and vestige memories are
 being made to play together (see Rest reset, Items per player and Vestige memories below). The loading crash "BitArrayIndex" is
-fixed (load guard).
+fixed (load guard). A first packaged prototype (v0.258, 2026-11-25) was played from a New Game to the first boss with a friend; the
+report and its fixes are under Playthrough fixes below. Players set the mod up in one file, `seamless_coop_settings.ini` (see Player
+settings below).
 
 Findings, teardown table and QA live in the Co-op Anything write-up:
 <https://github.com/cranebeaker/coop-anything/tree/main/games/code-vein>
@@ -53,6 +55,13 @@ Everything goes into `<game dir>\CodeVein\Binaries\Win64`.
                     "no session", so a memory keeps the session
    vestige_relay=1  both PCs: a restoration memory plays together (see Vestige memories)
    memory_vote=1    both PCs: everyone is asked before a restoration memory starts (the teleport vote's dialog)
+   guest_vestige=1  guest: his own "Restore vestiges" is allowed in co-op (off: the game's own notice; his memory does not
+                    play together yet)
+   warp_coop=1      host: the purple Mistles (BP_WarpPortal) work with guests; the group teleport starts at the dialog's Yes
+   guest_rest_full=0  switches off the full guest rest (Ichor, Regen, status effects, items; see Playthrough fixes)
+   weapon_reshow=0  switches off showing the other player's weapon again after a cutscene
+   test_commands=1  test copies: CoopProbe reads plugins\CoopProbe.cmd and the CoopCmd relay (off in a release kit)
+   diag_trace=1     log only: callers of LIBDeferredTeleportManager:BeginDeferredTeleport
    rest_reload=1    host: a rest at a Mistle resets the enemies as in single player (every guest within 40 m)
    item_own=1       both PCs: ground items per player (the guest spawns his own copies; the host sends its story-gated items)
    map_mirror=1     both PCs: the guest's map shows the icons shown on the host's map
@@ -73,7 +82,8 @@ Everything goes into `<game dir>\CodeVein\Binaries\Win64`.
    group_rest=1     host only, untested: heal every living player when the host rests (CoopProbe)
    ```
    CoopNative writes `plugins\CoopNative.log` on every launch.
-4. Everyone in the group uses the **same matchmaking password**; the automatic search joins the first matching signal.
+4. Everyone in the group uses the **same matchmaking password** (the game's option, or `cooperative_password` in the settings
+   file below); the automatic search joins the first matching signal.
    Proposal, all off in `mods/CoopSeamless/config.txt`: `sessiondiag=1` (log the search/join signatures and the info
    string of each signal found; on two PCs it was the lobby ID), `remember=1` (role and
    host kept in `state.txt` across a crash or restart; a `state.txt` written by another player, e.g. inside a kit zipped from
@@ -82,7 +92,13 @@ Everything goes into `<game dir>\CodeVein\Binaries\Win64`.
    logged; `remember` restores host mode from a `state.txt` with our own name and ignores one written by another player.
    Guests still join through the distress signal; no Steam invite is used.
 
-Uninstall: remove the two mod folders, `winmm.dll` and `plugins\`.
+5. **Player settings** (optional): copy `seamless_coop_settings.ini.example` into `Win64` as `seamless_coop_settings.ini`. It is
+   the one file players edit: password, automatic host and join, votes, rewards and difficulty, each line explained in the
+   file. At every start CoopNative writes its on/off choices into `plugins\CoopNative.ini` and the two `config.txt` files
+   before anything reads them (only the lines a setting owns; each change is logged); the password and the difficulty are read
+   by CoopSeamless and CoopProbe from the file itself. An unedited file changes nothing.
+
+Uninstall: remove the two mod folders, `winmm.dll`, `plugins\` and `seamless_coop_settings.ini`.
 
 ## Build CoopNative
 
@@ -308,10 +324,48 @@ Vestige memories (11-24, in progress, `vestige_menu`, `vestige_keep`, `vestige_r
   at the end (first test).
 - The host's game now treats its restoration teleport like the post-boss memory: the memory state for the guests (they follow on
   skips, finished scenes and when the game moves the host more than 15 m at once; a guest who dies there respawns next to the host),
-  and on the way in and out the guests are held in the air and brought next to the host's new character. With `memory_vote=1` the
-  host's teleport waits behind its loading screen (the driver's own pause token, `DeferredTeleportDriver:BPKeep`) while the others
-  answer the teleport vote's dialog; no or no answer skips the memory (`MuseumUtilityManager:SkipCurrentMuseum`). Untested.
-- A guest's own restoration is logged only for now (its teleport destination); his memory has to be played by the host as well.
+  and on the way in and out the guests are held in the air and brought next to the host's new character.
+- The vote (`memory_vote=1`, 11-25) comes before anything starts: in co-op "Restore vestiges" first keeps the game's own answer (its
+  notice; the menu stays open) and everyone gets the teleport vote's dialog; once everyone agreed (valid for 2 minutes) choosing it
+  again opens the screen. Two earlier ways failed: the restoration teleport's own pause token (`DeferredTeleportDriver:BPKeep`)
+  did not hold it, and holding the confirm's decision froze the game (never swallow a dialog decision). The memory state is armed at
+  the restoration's own session check, before its teleport, so the guests' loading screen comes with the host's. Tested 11-25 on two
+  PCs: the host's restoration memory together, the vote both ways.
+- A guest's own restoration is a museum on his PC only (`MuseumUtilityManager`: `SetPlaceToGoBack`, `FinishCurrentMuseum`,
+  `SkipCurrentMuseum`) and hangs on his loading screen; until the host plays it as well, `guest_vestige` (off) keeps the game's own
+  notice for a guest.
+
+Purple Mistles (`warp_coop=1`, 11-25, tested on two PCs): `BP_WarpPortal` asks three co-op checks (`IsOnlineMultiplay`,
+`MultiPlayersCheck` twice) at its prompt, its press, the "move to the corresponding point" dialog's Yes and the step after it; they
+answer "not multiplayer" for the host there, and the group teleport starts at the dialog's Yes. If the host has not moved 8 s later,
+the guests get `CoopTeleportCancel` and their screens come back. The Depths worked with `depths_block` off (11-25).
+
+Prototype v0.258 (11-25): one zip with UE4SS, the ASI loader, CoopNative and the three Lua mods, and one `CoopNative.ini` for both
+players: host-only and guest-only switches turn themselves off by the role in the session (CoopProbe writes `CoopNative.role`).
+Test switches and the command file are left out (`test_commands`).
+
+Playthrough fixes (11-25; the first New Game run with a friend, to the first boss):
+- The prologue's injured walk was gone: CoopProbe's special-mode reset (meant for the memory mode a guest's character keeps after a
+  memory) also cleared the game's own modes on a solo character. It now clears only the memory mode, and only in a session.
+- A guest's rest restored health only. It now also sets Ichor to its maximum, gives the Regen charges back, clears status effects and
+  tops items up from storage (`CharacterHelper` `SetIchor`, `ResetRegenerationUsageCount`, `ClearAllCondition`,
+  `ItemComponent:ReplenishItemsFromStorage`), and keeps health and Ichor full while his Mistle menu is open, so a level-up there
+  ends at full health.
+- The other player's weapon stayed invisible after cutscenes: 2 s after the last level sequence stopped, every other player's
+  character gets the game's weapon-visibility call again (`CharacterHelper:OnAnimNotifyStateChangeVisibilityOfWeapon`).
+- A guest who said yes to Louis's follower offer was left on a black screen: two shared talk/menu checks were answered "not
+  multiplayer" by the vestige override at any time. They are answered only while a restoration runs now; other talks get the game's
+  own co-op answer.
+- Open: doors and inactive Mistles are greyed out for a guest; the vestige after the first boss waits on the guest's PC for the
+  host's side (`WaitForOnlineMultiplaySynced`).
+
+Player settings (11-25, first version): `seamless_coop_settings.ini` in `Win64`, sections `[Session]` (`cooperative_password`, set as
+the game's own matchmaking password through `ConfigurationManager`; `auto_host` / `auto_join` = auto, always or off;
+`remember_session`), `[Votes]` (`teleport_vote`, `memory_vote`), `[Rewards]` (`shared_boss_rewards`, `guest_story_progress`) and
+`[Difficulty]` (enemy and boss health and damage, percent added per extra player; host only: health through
+`CharacterHelper:SetDefaultMaxHealth` with the share of health kept, damage through the enemy's `AttackScale`, the game's values
+back when the guests leave). The file reader is tested offline on copies of the kit files; the password and the difficulty are
+not tested in the game yet. A player cap above 2 is not in it: the cap sits in the obfuscated session code.
 
 Testing on one PC: a second Steam client runs in a Sandboxie-Plus box, logged in with a second Steam account that owns or borrows
 the game, and starts a second, hard-linked test copy as the guest (`tools/start-guest-box.ps1`). Each copy has its own Steam account

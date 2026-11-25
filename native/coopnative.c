@@ -90,6 +90,29 @@ static volatile LONG g_guest_outro;       // guest_outro=1 (guest): play the out
 static volatile ULONGLONG g_restore_seen_at;
 static int g_vest_relay;
 static int g_mem_vote;                        // memory_vote=1
+// (kit 253) the restoration list is open with other players around (CoopProbe: "restui 1 host" / "restui 1 guest" every second,
+// "restui 0" when closed): the confirm's Yes waits for the memory vote, the scenario hooks go in early, and on the host the
+// restoration's session check arms the memory start (before its teleport: 11-25 the arming came after the host's new character)
+static volatile LONG g_restui_on, g_restui_host;
+static volatile ULONGLONG g_restui_at;
+static int restui_fresh(void) { return g_restui_on && GetTickCount64() - g_restui_at < 3000; }
+static volatile LONG g_coop_on;
+static volatile LONG g_coop_host;
+static volatile ULONGLONG g_coop_at, g_vest_menu_at;
+static int coop_fresh(void) { return g_coop_on && GetTickCount64() - g_coop_at < 6000; }
+static char g_dir[MAX_PATH];   // tentative definition (also further down)
+static int memvote_pass_fresh(int consume) {
+    char pp[MAX_PATH + 32];
+    snprintf(pp, sizeof pp, "%sCoopNative.memvotepass", g_dir);
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!GetFileAttributesExA(pp, GetFileExInfoStandard, &fa)) return 0;
+    FILETIME now; GetSystemTimeAsFileTime(&now);
+    ULONGLONG ft = ((ULONGLONG)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
+    ULONGLONG nt = ((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime;
+    int fresh = nt >= ft && nt - ft < 120ULL * 10000000ULL;
+    if (consume || !fresh) DeleteFileA(pp);
+    return fresh;
+}
 static char g_dir[MAX_PATH];   // tentative definition (also further down)
 static void note_restore_seen(void) {
     static ULONGLONG last;
@@ -1265,6 +1288,46 @@ static volatile LONG g_rest_in_coop, g_rest_overrides;
 // "if ((state != Opened || !MultiPlayersCheck()) && pressed) { rest }" (Ghidra 2026-10-26); the call is near the start.
 #define MISTLE_INPUT_BEGIN 0x146A1CB70ULL
 #define MISTLE_INPUT_END   0x146A1CC00ULL
+// Purple Mistles (warp portals, kit 255, warp_coop=1, host; owner 11-25: "i activated the purple mistle, but the teleport prompt is
+// greyed out"). BP_WarpPortal_C (AWarpPortalBase) vtable 0x142D2E7D0: IsActionButtonActive +0x660 -> stub 0x140724420 -> body
+// 0x146B56920 (co-op checks: 0x140828AC0 at +0x10, IsOnlineMultiplay at +0x3D, MultiPlayersCheck at +0xB5), ProcessInputButtonEvent
+// +0x618 -> stub 0x140731460 -> body 0x146B71370. Like the Mistle prompt: the three checks answer "single player" for calls from
+// inside these two functions while we host with guests. A check from the input function = the host pressed the portal: the group
+// teleport starts ("start warp": guests held, brought next to the host once it arrived; dropped if the portal did not teleport).
+#define WARP_PROMPT_BEGIN 0x146B56920ULL
+#define WARP_PROMPT_END   0x146B56A80ULL
+#define WARP_INPUT_BEGIN  0x146B71370ULL
+#define WARP_INPUT_END    0x146B71B70ULL
+// (kit 257) the "move to the corresponding point" dialog's Yes: MultiPlayersCheck from 0x146B72C2C refused it (11-25 17:37:56); the
+// group teleport now starts there, not at the press (the press only opens the dialog)
+#define WARP_DECIDE_BEGIN 0x146B72B00ULL
+#define WARP_DECIDE_END   0x146B72D00ULL
+#define WARP_STEP_BEGIN   0x146B7CC00ULL
+#define WARP_STEP_END     0x146B7CD00ULL
+static int g_warp_coop;   // warp_coop=1
+static int g_guest_vestige;   // guest_vestige=1: a guest may restore vestiges (his memory does not play together yet)
+static volatile LONG g_warp_overrides;
+static int coop_fresh(void);
+static volatile LONG g_coop_host;
+static int from_warp(uintptr_t caller) {
+    if (!g_warp_coop || !g_coop_host || !coop_fresh()) return 0;
+    int prompt = caller >= WARP_PROMPT_BEGIN && caller < WARP_PROMPT_END, input = caller >= WARP_INPUT_BEGIN && caller < WARP_INPUT_END;
+    // (kit 256) the teleport step after the press: MultiPlayersCheck from 0x146B7CC49 refused it (11-25 17:32:23)
+    int step = caller >= WARP_STEP_BEGIN && caller < WARP_STEP_END;
+    int decide = caller >= WARP_DECIDE_BEGIN && caller < WARP_DECIDE_END;
+    if (!prompt && !input && !step && !decide) return 0;
+    if (InterlockedIncrement(&g_warp_overrides) <= 12 || decide) logf_("warp portal: co-op check from 0x%llX (%s) answered \"single player\"", (unsigned long long)caller, prompt ? "prompt" : input ? "input" : decide ? "dialog Yes" : "teleport step");
+    if (decide) {
+        static ULONGLONG last;
+        if (GetTickCount64() - last > 15000) {
+            last = GetTickCount64();
+            write_teleport_marker("start warp");
+            InterlockedExchange(&g_tp_pending, 1);
+            logf_("warp portal: the host uses a purple Mistle -> guests follow like a group teleport");
+        }
+    }
+    return 1;
+}
 static int from_mistle_prompt(uintptr_t caller) {
     return (caller >= MISTLE_PROMPT_BEGIN && caller < MISTLE_PROMPT_END) ||
            (caller >= MISTLE_INPUT_BEGIN && caller < MISTLE_INPUT_END);
@@ -1431,10 +1494,32 @@ static void detour_exec_multiplay(void *ctx, void *stack, void *result) {
         int hit = 0;
         for (LONG i = 0; cls && i < n && !hit; i++) if (g_vest_menu_cls[i] == cls) hit = 1;
         for (LONG i = 0; cls && i < nn && !hit; i++) if (class_name_is(cls, g_vest_menu_names[i])) hit = 1;
-        if (hit) {
-            *(uint8_t *)result = 0;
-            if (InterlockedIncrement(&g_vest_menu_answers) <= 40)
-                logf_("vestige: a companion's talk menu asked IsOnlineMultiplay -> false (object 0x%llX, class 0x%llX): Restore vestiges allowed", (unsigned long long)obj, (unsigned long long)cls);
+        if (hit && coop_fresh() && !g_coop_host && !g_guest_vestige) {
+            // Prototype (2026-11-25): a guest's own restoration memory runs only on his PC (stuck on its loading screen), so in a
+            // session his "Restore vestiges" keeps the game's own answer (its "unavailable in multiplayer" notice) unless guest_vestige=1
+            static ULONGLONG lastlog;
+            if (GetTickCount64() - lastlog > 10000) { lastlog = GetTickCount64(); logf_("vestige: Restore vestiges as a guest is not available yet (guest_vestige off)"); }
+        } else if (hit) {
+            g_vest_menu_at = GetTickCount64();
+            // Memory vote (kit 254; owner 11-25: "it should call the function to start the memory only after a decision has been made"):
+            // in co-op "Restore vestiges" first keeps the real answer (the menu shows its own notice and stays open) and CoopProbe asks
+            // everyone (CoopNative.memvotereq); after everyone agreed (CoopNative.memvotepass, 2 minutes) the next choice opens it.
+            if (g_mem_vote && coop_fresh() && !memvote_pass_fresh(1)) {
+                static ULONGLONG lastreq;
+                if (GetTickCount64() - lastreq > 3000) {
+                    lastreq = GetTickCount64();
+                    char rq[MAX_PATH + 32];
+                    snprintf(rq, sizeof rq, "%sCoopNative.memvotereq", g_dir);
+                    FILE *rf = fopen(rq, "w");
+                    if (rf) { fputs("menu\n", rf); fclose(rf); }
+                }
+                logf_("memory vote: Restore vestiges chosen in co-op -> everyone is asked first (the menu keeps its own answer for now)");
+            } else {
+                *(uint8_t *)result = 0;
+                if (InterlockedIncrement(&g_vest_menu_answers) <= 40)
+                    logf_("vestige: a companion's talk menu asked IsOnlineMultiplay -> false (object 0x%llX, class 0x%llX): Restore vestiges allowed%s", (unsigned long long)obj, (unsigned long long)cls,
+                          g_mem_vote && coop_fresh() ? " (everyone agreed)" : "");
+            }
         }
     }
 }
@@ -1684,6 +1769,17 @@ static uint8_t detour_multiplay(void *ctx) {
     // IsOnlineMultiplay caller at that moment was 0x14713D46D. With vestige_keep it is answered "not multiplayer"
     // 21:22: the next one (0x147143D7B, 0.9 s later) blocked the screen from opening; both sit in the restoration code, so the whole
     // stretch 0x14713D000..0x147145000 is answered (each new caller logged once)
+    // 2026-11-25 playthrough: the same two callers ran when the guest talked to Louis ("Stranger"), and this answer let his talk take
+    // the solo way: he said yes to Louis joining as a follower, the host's world made Louis a follower and the guest's screen stayed
+    // black. The callers are shared talk/menu code, not restoration-only, so they are answered only while a restoration is on (the
+    // companion menu's "Restore vestiges" was allowed in the last 15 s, or the restoration screen is open); every other talk gets the
+    // game's own co-op answer.
+    if (r && g_vestige_keep && caller >= 0x14713D000ULL && caller < 0x147145000ULL &&
+        !((g_vest_menu_at && GetTickCount64() - g_vest_menu_at < 15000) || restui_fresh())) {
+        static ULONGLONG lastskip;
+        if (GetTickCount64() - lastskip > 5000) { lastskip = GetTickCount64(); logf_("vestige: check at 0x%llX outside a restoration -> the game's own answer (multiplayer)", (unsigned long long)caller); }
+        return r;
+    }
     if (r && g_vestige_keep && caller >= 0x14713D000ULL && caller < 0x147145000ULL) {
         static uintptr_t seen_v[16];
         int known = 0;
@@ -1692,6 +1788,7 @@ static uint8_t detour_multiplay(void *ctx) {
             logf_("vestige: check at 0x%llX answered \"not multiplayer\" (vestige_keep)", (unsigned long long)caller); }
         return 0;
     }
+    if (r && from_warp(caller)) return 0;
     if (r && g_rest_in_coop) {
         if (from_mistle_prompt(caller)) { InterlockedIncrement(&g_rest_overrides); return 0; }
         if (caller == 0x1466075B5ULL && in_rest_window()) {
@@ -1740,6 +1837,7 @@ static uint8_t detour_multi_players(void *a) {
     uint8_t r = g_orig_multi_players(a);
     uintptr_t caller = (uintptr_t)__builtin_return_address(0);
     note_rest_caller(1, caller, r);
+    if (r && from_warp(caller)) return 0;
     if (r && g_rest_in_coop) {
         if (from_mistle_prompt(caller)) { InterlockedIncrement(&g_rest_overrides); return 0; }
         note_caller(1, caller);
@@ -1750,6 +1848,7 @@ static uint8_t detour_multi_players(void *a) {
 static uint8_t detour_prompt_block1(void *a) {
     uint8_t r = g_orig_prompt_block1(a);
     uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    if (r && from_warp(caller)) return 0;
     if (r && g_rest_in_coop) {
         if (from_mistle_prompt(caller)) { InterlockedIncrement(&g_rest_overrides); return 0; }
         note_caller(2, caller);
@@ -2356,6 +2455,14 @@ static void run_command(char *buf) {
         if (!have && a > 0 && n < VEST_MENU_N) { g_vest_menu_names[n] = (LONG)a; InterlockedIncrement(&g_vest_menu_names_n); logf_("vestige: companion talk menu class name index %llu registered", a); }
     } else if (sscanf(buf, "restname %llu", &a) == 1) {
         if (a > 0 && g_restore_name != (LONG)a) { g_restore_name = (LONG)a; logf_("vestige_keep: restoration screen class name index %llu", a); }
+    } else if (strncmp(buf, "coop ", 5) == 0) {
+        LONG on = buf[5] == '1', host = strstr(buf, "host") != NULL;
+        if (on != g_coop_on || host != g_coop_host) logf_("co-op flag: %s", on ? (host ? "we host, guests here" : "we are a guest") : "alone");
+        g_coop_on = on; g_coop_host = host; g_coop_at = GetTickCount64();
+    } else if (strncmp(buf, "restui ", 7) == 0) {
+        LONG on = buf[7] == '1', host = strstr(buf, "host") != NULL;
+        if (on != g_restui_on || host != g_restui_host) logf_("restoration list %s%s", on ? "open" : "closed", on ? (host ? " (we host, guests here)" : " (we are a guest)") : "");
+        g_restui_on = on; g_restui_host = host; g_restui_at = GetTickCount64();
     } else if (strncmp(buf, "vmem ", 5) == 0) {
         // Restoration memory (2026-11-24 test): the memory is a deferred teleport of the host into its own area (and one back), with new
         // host characters; the guest stayed, fell and died both times. CoopProbe sees the host's driver start and sends this: the same
@@ -2425,15 +2532,18 @@ static void run_command(char *buf) {
 }
 
 static void read_settings(void) {
-    char buf[2048];   // the ini outgrew 256 bytes on 2026-10-30
+    char buf[4096];   // the ini outgrew 256 bytes on 2026-10-30 (and 2048 would be close for the prototype's one ini)
     int have_ini = read_small_file("CoopNative.ini", buf, sizeof buf);
+    // Prototype (2026-11-25): ONE ini for both players. The host-only switches act only while we are not a guest in a session, the
+    // guest-only ones only while we are (CoopNative.role, written by CoopProbe) - the same as the two tested inis.
+    int as_guest = in_session_as_guest();
     LONG veto = have_ini && strstr(buf, "veto_endcoop=1") != NULL;
     if (InterlockedExchange(&g_veto_enabled, veto) != veto) logf_("setting veto_endcoop = %ld", veto);
     LONG vest = have_ini && (strstr(buf, "vestige_menu=1") != NULL || strstr(buf, "teleport_vote=1") != NULL);   // the vote: the guest's Teleport entry too
     if (InterlockedExchange(&g_vestige_enabled, vest) != vest) logf_("setting vestige_menu = %ld", vest);
-    LONG relay = have_ini && strstr(buf, "levelup_relay=1") != NULL;
+    LONG relay = have_ini && !as_guest && strstr(buf, "levelup_relay=1") != NULL;
     if (InterlockedExchange(&g_levelup_relay, relay) != relay) logf_("setting levelup_relay = %ld", relay);
-    LONG gtp = have_ini && strstr(buf, "group_teleport=1") != NULL;
+    LONG gtp = have_ini && !as_guest && strstr(buf, "group_teleport=1") != NULL;
     {
         int n = 0;
         const char *p = have_ini ? strstr(buf, "teleport_skip_fields=") : NULL;
@@ -2463,7 +2573,7 @@ static void read_settings(void) {
     if (InterlockedExchange(&g_partner_override, pov) != pov) logf_("setting outro_partner_override = %ld", pov);
     LONG swt = !(have_ini && strstr(buf, "scene_start_wait=0") != NULL);
     if (InterlockedExchange(&g_scene_wait, swt) != swt) logf_("setting scene_start_wait = %ld", swt);
-    LONG gout = have_ini && strstr(buf, "guest_outro=1") != NULL;
+    LONG gout = have_ini && as_guest && strstr(buf, "guest_outro=1") != NULL;
     if (InterlockedExchange(&g_guest_outro, gout) != gout) logf_("setting guest_outro = %ld", gout);
     g_layout_random = have_ini && strstr(buf, "layout_fixed=0") != NULL;
     LONG kout = have_ini && strstr(buf, "keep_outro=1") != NULL;
@@ -2472,7 +2582,7 @@ static void read_settings(void) {
     if (InterlockedExchange(&g_tp_loading, tpl) != tpl) logf_("setting tp_loading = %ld", tpl);
     LONG ffree = have_ini && strstr(buf, "fog_free=1") != NULL;
     if (InterlockedExchange(&g_fog_free, ffree) != ffree) logf_("setting fog_free = %ld", ffree);
-    LONG grest = have_ini && strstr(buf, "guest_rest=1") != NULL;
+    LONG grest = have_ini && as_guest && strstr(buf, "guest_rest=1") != NULL;
     if (InterlockedExchange(&g_guest_rest, grest) != grest) logf_("setting guest_rest = %ld", grest);
     LONG rest = have_ini && strstr(buf, "rest_in_coop=1") != NULL;
     if (InterlockedExchange(&g_rest_in_coop, rest) != rest) logf_("setting rest_in_coop = %ld", rest);
@@ -3031,6 +3141,20 @@ static int from_restore(void *stack) {
     uintptr_t oc = *(uintptr_t *)(obj + 0x10);
     return (cls && oc == cls) || class_name_is(oc, g_restore_name);
 }
+static void vmem_arm(void) {
+    static ULONGLONG last;
+    ULONGLONG now = GetTickCount64();
+    if (!g_vest_relay || !coop_fresh() || !g_coop_host || now - last < 30000) return;
+    last = now;
+    relay_append("memstart");
+    write_teleport_marker("start quiet");
+    InterlockedExchange(&g_tp_pending, 1);
+    char p[MAX_PATH + 32];
+    snprintf(p, sizeof p, "%sCoopNative.restseen", g_dir);
+    FILE *f = fopen(p, "w");
+    if (f) { fputs("armed\n", f); fclose(f); }
+    logf_("vestige memory: our restoration starts its memory -> memory state on, guests follow like a group teleport (armed before the teleport)");
+}
 static exec_fn g_orig_other_player_num, g_orig_is_create_session;
 static void detour_other_player_num(void *ctx, void *stack, void *result) {
     g_orig_other_player_num(ctx, stack, result);
@@ -3044,6 +3168,7 @@ static void detour_is_create_session(void *ctx, void *stack, void *result) {
     g_orig_is_create_session(ctx, stack, result);
     if (!result || !from_restore(stack)) return;
     note_restore_seen();
+    vmem_arm();
     int real = *(unsigned char *)result;
     if (g_vestige_keep) *(unsigned char *)result = 0;
     logf_("restoration screen: IsCreateSession = %d%s", real, g_vestige_keep ? " -> 0 (vestige_keep)" : "");
@@ -3054,6 +3179,26 @@ static void detour_is_create_session(void *ctx, void *stack, void *result) {
 // CoopNative.teleport so CoopProbe (group_teleport=1, host) spawns the guests next to the host once the host has arrived.
 // Arrival (second solo run, cross-area): the new characters appear ~8 s later with AppCharacter:MulticastInitialDataSync; the
 // first one after the teleport writes "arrived" to the same file (the pawn address alone changed too early, during the loading).
+// (kit 253) who starts a deferred teleport (the restoration memory's start is not known yet): the calling object, its class and the
+// calling script function go to CoopNative.names as FName indices; CoopProbe logs them as text. At most 200 calls.
+#define ADDR_EXEC_BEGIN_DEFERRED_TP 0x140AA28F0ULL   // LIBDeferredTeleportManager::BeginDeferredTeleport exec thunk
+static exec_fn g_orig_begin_dtp;
+static volatile LONG g_begin_dtp_n;
+static void detour_begin_dtp(void *ctx, void *stack, void *result) {
+    uintptr_t s = (uintptr_t)stack, obj = 0, node = 0;
+    if (s && readable(s + 0x10, 0x10)) { node = *(uintptr_t *)(s + 0x10); obj = *(uintptr_t *)(s + 0x18); }
+    int oi = 0, on = 0, ci = 0, fi = 0;
+    if (obj && readable(obj + 0x10, 0x10)) { oi = *(int *)(obj + 0x18); on = *(int *)(obj + 0x1C); uintptr_t c = *(uintptr_t *)(obj + 0x10); if (c && readable(c + 0x18, 4)) ci = *(int *)(c + 0x18); }
+    if (node && readable(node + 0x18, 4)) fi = *(int *)(node + 0x18);
+    if (InterlockedIncrement(&g_begin_dtp_n) <= 200) {
+        logf_("deferred teleport: BeginDeferredTeleport called by object 0x%llX (names %d_%d, class %d, function %d)", (unsigned long long)obj, oi, on, ci, fi);
+        char p[MAX_PATH + 32];
+        snprintf(p, sizeof p, "%sCoopNative.names", g_dir);
+        FILE *f = fopen(p, "a");
+        if (f) { fprintf(f, "BeginDeferredTeleport %d %d %d %d\n", oi, on, ci, fi); fclose(f); }
+    }
+    g_orig_begin_dtp(ctx, stack, result);
+}
 static exec_fn g_orig_spawn_to_checkpoint;
 #define ADDR_EXEC_DECIDE_SIMPLE 0x140AA9D40ULL   // DialogBase::DecideSimpleOption exec thunk
 static exec_fn g_orig_decide_simple;
@@ -3070,6 +3215,8 @@ static void detour_decide_simple(void *ctx, void *stack, void *result) {
     FILE *f = fopen(p, "a");
     if (f) { fprintf(f, "%llX %d\n", (unsigned long long)(uintptr_t)ctx, opt); fclose(f); }
     logf_("dialog: DecideSimpleOption(%d) on 0x%llX", opt, (unsigned long long)(uintptr_t)ctx);
+    // (kit 253 held the restoration's Yes here: the game thread then spun in Blueprint code for good, 11-25 16:56:42 -> removed;
+    //  the memory vote now runs at the companion menu's "Restore vestiges", see detour_exec_multiplay)
     g_orig_decide_simple(ctx, stack, result);
 }
 static volatile LONG g_tp_pending;
@@ -4277,10 +4424,15 @@ static DWORD WINAPI worker(LPVOID unused) {
             g_vote_on = 1;
             if (strstr(lini, "vote_home_base=1")) { g_vote_hb = 1; logf_("teleport vote: the Home Base too (vote_home_base)"); }
             logf_("teleport vote: Mistle teleports wait until everyone agrees");
+            if (strstr(lini, "diag_trace=1"))   // (research trace, off in the prototype)
+                install("LIBDeferredTeleportManager:BeginDeferredTeleport", ADDR_EXEC_BEGIN_DEFERRED_TP,
+                        "\xE9\x5B\x2D\x64\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_begin_dtp, (void **)&g_orig_begin_dtp);
             install("DialogBase:DecideSimpleOption", ADDR_EXEC_DECIDE_SIMPLE,
                     "\xE9\x7B\x77\x68\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_decide_simple, (void **)&g_orig_decide_simple);
         }
         if (strstr(lini, "boot_trace=1")) trace_install();
+        if (strstr(lini, "guest_vestige=1")) { g_guest_vestige = 1; logf_("vestige: guests may restore vestiges (guest_vestige; their memory is not shared yet)"); }
+        if (strstr(lini, "warp_coop=1")) { g_warp_coop = 1; logf_("warp portal: purple Mistles usable by the host in co-op, guests follow (warp_coop)"); }
         if (strstr(lini, "memory_vote=1")) { g_mem_vote = 1; logf_("memory vote: a memory from our restoration waits until everyone agreed"); }
         if (strstr(lini, "vestige_relay=1")) { g_vest_relay = 1; logf_("vestige relay: a memory from our restoration screen is played by the host for everyone"); }
         if (strstr(lini, "rest_reload=1")) { g_rest_reload = 1; logf_("rest reload: on (a co-op rest reloads the enemy levels like a single-player rest)"); }
@@ -4649,8 +4801,8 @@ static DWORD WINAPI worker(LPVOID unused) {
         // session 10: after any boss kill (solo too), for a solo baseline of the memory
         // (the late hooks also find the museum actor and the memory end: always installed; only the IsPlayerPlayable logger is diag)
         // item 10 (2026-10-30): a vestige restoration plays a memory without a boss kill: also install them at a memory start
-        if ((g_bosskill_at || g_memory_at || g_restore_seen_at) && !g_late_installed && InterlockedExchange(&g_late_installed, 1) == 0) {
-            logf_("late scenario trace: installing %d hooks (%s)", LATE_N, g_bosskill_at ? "after the boss kill" : g_memory_at ? "memory start" : "restoration screen");
+        if ((g_bosskill_at || g_memory_at || g_restore_seen_at || restui_fresh() || g_vest_menu_at) && !g_late_installed && InterlockedExchange(&g_late_installed, 1) == 0) {
+            logf_("late scenario trace: installing %d hooks (%s)", LATE_N, g_bosskill_at ? "after the boss kill" : g_memory_at ? "memory start" : "restoration chosen in a talk menu");
             for (int i = 0; i < LATE_N; i++) install(g_late_name[i], g_late_addr[i], g_late_expect[i], g_late_det[i], (void **)&g_late_orig[i]);
             if (g_diag_hooks) install("MuseumUtilityActor:IsPlayerPlayable", ADDR_EXEC_PLAYER_PLAYABLE,
                     "\xE9\x1B\xA1\xCF\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_playable, (void **)&g_orig_playable);
@@ -4809,6 +4961,122 @@ static void cl_collect_previous(void) {
              newest[0] ? ", with crash report " : "", newest);
 }
 
+// Player settings (2026-11-25; owner: "can you start working on the framework for coop via the .ini file?", chose "a player settings
+// file"). <Win64>\seamless_coop_settings.ini is the one file players edit. At every start, from DllMain, before anything reads its
+// switches, its on/off choices are written into the files the parts of the mod read: plugins\CoopNative.ini (this DLL and CoopProbe),
+// ue4ss\Mods\CoopSeamless\config.txt and ue4ss\Mods\CoopProgress\config.txt. Only the lines a setting owns are changed (each one is
+// logged); every other line stays as it is. cooperative_password and the [Difficulty] values are read by the Lua mods from the
+// settings file itself. Without the settings file nothing is changed.
+static char *st_trim(char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    char *e = s + strlen(s);
+    while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) *--e = 0;
+    return s;
+}
+static int st_onoff(const char *v) {   // 1 on, 0 off, -1 not understood
+    if (!_stricmp(v, "on") || !_stricmp(v, "1") || !_stricmp(v, "yes") || !_stricmp(v, "true")) return 1;
+    if (!_stricmp(v, "off") || !_stricmp(v, "0") || !_stricmp(v, "no") || !_stricmp(v, "false")) return 0;
+    return -1;
+}
+static char g_st_buf[65536], g_st_out[65536 + 512];
+// sets "key=value" in a key=value file (replaces the line that starts with "key=", or appends it); 1 = changed
+static int st_set(const char *path, const char *shortname, const char *key, const char *value, const char *setting) {
+    FILE *f = _fsopen(path, "rb", _SH_DENYNO);
+    if (!f) { logf_("settings: %s not found, %s for %s not written", shortname, key, setting); return 0; }
+    size_t n = fread(g_st_buf, 1, sizeof g_st_buf - 1, f);
+    fclose(f);
+    g_st_buf[n] = 0;
+    const char *nl = strstr(g_st_buf, "\r\n") ? "\r\n" : "\n";
+    size_t klen = strlen(key);
+    char *hit = NULL;
+    for (char *p = g_st_buf; p && *p; ) {
+        if (strncmp(p, key, klen) == 0 && p[klen] == '=') { hit = p; break; }
+        char *e = strchr(p, '\n');
+        p = e ? e + 1 : NULL;
+    }
+    if (hit) {
+        char *v = hit + klen + 1, *le = v;
+        while (*le && *le != '\r' && *le != '\n') le++;
+        if ((size_t)(le - v) == strlen(value) && strncmp(v, value, (size_t)(le - v)) == 0) return 0;   // already so
+        snprintf(g_st_out, sizeof g_st_out, "%.*s%s=%s%s", (int)(hit - g_st_buf), g_st_buf, key, value, le);
+    } else {
+        snprintf(g_st_out, sizeof g_st_out, "%s%s%s=%s%s", g_st_buf, (n > 0 && g_st_buf[n - 1] != '\n') ? nl : "", key, value, nl);
+    }
+    char tmp[MAX_PATH + 8];
+    snprintf(tmp, sizeof tmp, "%s.new", path);
+    FILE *w = fopen(tmp, "wb");
+    if (!w) { logf_("settings: could not write %s", shortname); return 0; }
+    fwrite(g_st_out, 1, strlen(g_st_out), w);
+    fclose(w);
+    if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) { DeleteFileA(tmp); logf_("settings: could not replace %s (error %lu)", shortname, GetLastError()); return 0; }
+    logf_("settings: %s -> %s %s=%s", setting, shortname, key, value);
+    return 1;
+}
+static void settings_apply(void) {
+    char win64[MAX_PATH];
+    snprintf(win64, sizeof win64, "%s", g_dir);   // ...\Win64\plugins\ -> ...\Win64\ .
+    size_t len = strlen(win64);
+    if (len && win64[len - 1] == '\\') win64[--len] = 0;
+    char *bs = strrchr(win64, '\\');
+    if (!bs) return;
+    bs[1] = 0;
+    char sp[MAX_PATH], ini[MAX_PATH], sl[MAX_PATH], pr[MAX_PATH];
+    snprintf(sp, sizeof sp, "%sseamless_coop_settings.ini", win64);
+    snprintf(ini, sizeof ini, "%sCoopNative.ini", g_dir);
+    snprintf(sl, sizeof sl, "%sue4ss\\Mods\\CoopSeamless\\config.txt", win64);
+    snprintf(pr, sizeof pr, "%sue4ss\\Mods\\CoopProgress\\config.txt", win64);
+    FILE *f = _fsopen(sp, "r", _SH_DENYNO);
+    if (!f) { logf_("settings: no seamless_coop_settings.ini in the Win64 folder -> the internal switches are used as they are"); return; }
+    char line[600], section[64] = "";
+    int changed = 0, read = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *s = st_trim(line);
+        if (!*s || *s == ';' || *s == '#') continue;
+        if (*s == '[') { char *e = strchr(s, ']'); if (e) *e = 0; snprintf(section, sizeof section, "%s", s + 1); continue; }
+        char *eq = strchr(s, '=');
+        if (!eq) { logf_("settings: line not understood (no '='): [%s] %.60s", section, s); continue; }
+        *eq = 0;
+        char *key = st_trim(s), *val = st_trim(eq + 1);
+        int b = st_onoff(val);
+        read++;
+        #define ST_NEED_ONOFF() if (b < 0) { logf_("settings: %s = '%s' is not on/off -> left as it is", key, val); continue; }
+        if (!_stricmp(key, "teleport_vote")) {
+            ST_NEED_ONOFF();
+            changed += st_set(ini, "CoopNative.ini", "teleport_vote", b ? "1" : "0", key);
+            changed += st_set(ini, "CoopNative.ini", "vote_home_base", b ? "1" : "0", key);
+        } else if (!_stricmp(key, "memory_vote")) {
+            ST_NEED_ONOFF();
+            changed += st_set(ini, "CoopNative.ini", "memory_vote", b ? "1" : "0", key);
+        } else if (!_stricmp(key, "shared_boss_rewards")) {
+            ST_NEED_ONOFF();
+            changed += st_set(pr, "CoopProgress config.txt", "guest_rewards", b ? "1" : "0", key);
+        } else if (!_stricmp(key, "guest_story_progress")) {
+            ST_NEED_ONOFF();
+            changed += st_set(pr, "CoopProgress config.txt", "guest_progress", b ? "1" : "0", key);
+            changed += st_set(pr, "CoopProgress config.txt", "host_publish", b ? "1" : "0", key);
+        } else if (!_stricmp(key, "remember_session")) {
+            ST_NEED_ONOFF();
+            changed += st_set(sl, "CoopSeamless config.txt", "remember", b ? "1" : "0", key);
+        } else if (!_stricmp(key, "auto_host") || !_stricmp(key, "auto_join")) {
+            const char *v = !_stricmp(val, "auto") ? "auto" : !_stricmp(val, "always") ? "always" : !_stricmp(val, "off") ? "off" : NULL;
+            if (!v) { logf_("settings: %s = '%s' is not auto/always/off -> left as it is", key, val); continue; }
+            changed += st_set(sl, "CoopSeamless config.txt", !_stricmp(key, "auto_host") ? "host" : "guest", v, key);
+        } else if (!_stricmp(key, "cooperative_password")) {
+            logf_("settings: cooperative_password %s (CoopSeamless sets it as the game's matchmaking password)", *val ? "given" : "empty: the game's own setting stays");
+        } else if (!_stricmp(key, "enemy_health_per_player") || !_stricmp(key, "enemy_damage_per_player") ||
+                   !_stricmp(key, "boss_health_per_player") || !_stricmp(key, "boss_damage_per_player")) {
+            char *end; long pct = strtol(val, &end, 10);
+            if (end == val || *st_trim(end) || pct < 0 || pct > 1000) logf_("settings: %s = '%s' is not a percentage from 0 to 1000 -> 0 is used", key, val);
+            else logf_("settings: %s = %ld %% (the host's CoopProbe applies it)", key, pct);
+        } else {
+            logf_("settings: unknown setting '%s' in [%s] -> ignored", key, section);
+        }
+        #undef ST_NEED_ONOFF
+    }
+    fclose(f);
+    logf_("settings: seamless_coop_settings.ini read (%d settings, %d internal line(s) changed)", read, changed);
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
@@ -4831,6 +5099,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
             snprintf(kp, sizeof kp, "%sCoopNative.ticked", g_dir);
             DeleteFileA(kp);   // a leftover from the last run must not release the mods early
         }
+        settings_apply();   // the player settings file, before the worker or any mod reads a switch
         HANDLE h = CreateThread(NULL, 0, worker, NULL, 0, NULL);
         if (h) CloseHandle(h);
     }

@@ -863,7 +863,12 @@ pcall(function()
             log("teleport vote: over, " .. (ok and "everyone agreed" or "cancelled"))
             voteCloseDialog()
             local reason = text:match("^CoopVoteEnd:0,(.+)$")
-            if not ok and memHeld then memSkipHeld("vote cancelled"); votePopup("Memory cancelled" .. (reason and (": " .. reason) or ""))
+            if rvMine then
+                local a = rvMine.addr
+                rvMine = nil
+                pcall(rvDecide, a, ok, reason)
+                reason = nil
+            elseif not ok and memHeld then memSkipHeld("vote cancelled"); votePopup("Memory cancelled" .. (reason and (": " .. reason) or ""))
             elseif not ok and voteMineAt and os.clock() - voteMineAt < 40 then voteLiftOwnFade(); votePopup("Teleport cancelled" .. (reason and (": " .. reason) or "")) end
             voteMineAt = nil
         elseif text and text:find("^CoopItemGate:") then
@@ -885,7 +890,7 @@ pcall(function()
                 if gwWant[wn] ~= (wv == "1") then log("fog: the host's game wall " .. wn .. " is " .. (wv == "1" and "on" or "off")) end
                 gwWant[wn] = (wv == "1")
             end
-        elseif text and text:find("^CoopCmd:") then
+        elseif text and text:find("^CoopCmd:") and iniHas("test_commands=1") then
             local cmd = text:sub(9)
             local native = cmd:match("^native (.+)$")
             local fc = io.open(WIN64 .. "\\plugins\\" .. (native and "CoopNative.cmd" or "CoopProbe.cmd"), "a")
@@ -1992,23 +1997,26 @@ end
 function votePass()
     local v = voteState
     v.passAt = os.clock()
-    if not v.mem and not v.vmem then
+    if not v.mem and not v.vmem and not v.rvote then
         local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
         if c then c:write("votepass\n"); c:close() end
     end
     if v.vmem then vmemRelease("everyone agreed") end
     voteSendAll("CoopVoteEnd:1")
-    log((v.mem or v.vmem) and "memory vote: everyone agreed -> the memory starts in a moment" or "teleport vote: everyone agreed -> teleport in a moment")
+    if v.rvote and not v.fromGuest and rvMine then local a = rvMine.addr; rvMine = nil; rvDecide(a, true) end
+    log((v.mem or v.vmem or v.rvote) and "memory vote: everyone agreed -> the memory starts in a moment" or "teleport vote: everyone agreed -> teleport in a moment")
 end
 function voteEnd(why, selfDeclined)
     local v = voteState
     local reason = why
     if selfDeclined then reason = (votePlayerName(localPC()) or "The host") .. " declined" end
     voteSendAll("CoopVoteEnd:0," .. reason)
-    local what = (v and v.mem) and "Memory cancelled" or (v and v.vmem) and "Memory skipped" or "Teleport cancelled"
-    if not selfDeclined then votePopup(what .. ": " .. why) end
-    log(((v and (v.mem or v.vmem)) and "memory vote" or "teleport vote") .. ": cancelled (" .. why .. ")")
-    if v and v.vmem then
+    local what = (v and v.mem) and "Memory cancelled" or (v and v.vmem) and "Memory skipped" or (v and v.rvote) and "Restoration cancelled" or "Teleport cancelled"
+    if not selfDeclined and not (v and v.rvote and not v.fromGuest) then votePopup(what .. ": " .. why) end
+    log(((v and (v.mem or v.vmem or v.rvote)) and "memory vote" or "teleport vote") .. ": cancelled (" .. why .. ")")
+    if v and v.rvote then
+        if not v.fromGuest and rvMine then local a = rvMine.addr; rvMine = nil; rvDecide(a, false, why) end
+    elseif v and v.vmem then
         vmemRelease("vote: " .. why)
         if vmem and why ~= "not a memory" then vmem.skipAt = os.clock() + 8 end
     elseif v and v.mem then memSkipHeld("vote cancelled: " .. why)
@@ -2041,7 +2049,7 @@ function voteTick()
     pcall(voteDialogTick, host)
     local v = voteState
     if host and v then
-        if v.passAt and v.vmem then
+        if v.passAt and (v.vmem or v.rvote) then
             voteState = nil
         elseif v.passAt and os.clock() - v.passAt > 1.0 and v.mem then
             voteState = nil
@@ -3352,7 +3360,12 @@ function vmemTick()
     local rp = WIN64 .. "\\plugins\\CoopNative.restseen"
     local rf = io.open(rp, "r")
     if rf then
+        local armed = (rf:read("*a") or ""):find("armed", 1, true) ~= nil
         rf:close(); os.remove(rp)
+        if armed and not (vmem and vmem.on) then
+            vmem = { on = true, at = now, armed = true }
+            vmLog("CoopNative armed the memory start at our restoration (before its teleport): guests follow like a group teleport")
+        end
         if not vmRestAt or now - vmRestAt > 90 then vmLog("the restoration screen is in use -> watching our teleport driver for 90 s") end
         vmRestAt = now
     end
@@ -3403,14 +3416,17 @@ function vmemTick()
                 if not isHost then
                     vmLog(string.format("our own restoration teleports us (driver %X) to %s at %s (guest: logged only)", da, tostring(pkg or "level unknown"), at))
                     vmRestAt = nil
-                elseif not (vmem and vmem.on) then
+                elseif vmem and vmem.on and vmem.armed and not vmem.entrySeen then
                     vmRestAt = nil
-                    vmem = { on = true, at = now, pend = { d = d, at = now, entry = true } }
-                    local guests = #voteGuests()
-                    local vote = iniHas("memory_vote=1") and guests > 0 and not voteState
-                    vmCmd(vote and "vmem start nofade" or "vmem start")
-                    vmLog(string.format("our restoration teleports us into the memory (driver %X, %d guest(s)) -> memory state on, guests follow", da, guests))
-                    if vote then pcall(vmemVoteStart, d, pc) end
+                    vmem.entrySeen = true
+                    vmem.pend = { d = d, at = now, entry = true }
+                    vmLog(string.format("our restoration teleports us into the memory (driver %X; the start was armed before it)", da))
+                elseif not (vmem and vmem.on) then
+                    -- fallback: CoopNative did not arm it (e.g. the list flag was late)
+                    vmRestAt = nil
+                    vmem = { on = true, at = now, entrySeen = true, pend = { d = d, at = now, entry = true } }
+                    vmCmd("vmem start")
+                    vmLog(string.format("our restoration teleports us into the memory (driver %X, not armed before) -> memory state on, guests follow", da))
                 else
                     vmCmd("vmem tp")
                     vmem.pend = { d = d, at = now }
@@ -3418,6 +3434,115 @@ function vmemTick()
                 end
             end
         end
+    end
+end
+-- Memory vote at the restoration's confirm (kit 253; owner 11-25: "the vote comes through but it starts anyway. it should call the function
+-- to start the memory only after a decision has been made"; the driver's pause token did not take: IsKept false). While the
+-- restoration list (WDT_RestorationList_C) is open with other players around, CoopNative holds the confirm's Yes and writes
+-- CoopNative.memvotereq (the dialog); the vote runs on the host (the restorer's dialog stays open); agreed -> the restorer repeats the
+-- Yes (CoopNative.memvotepass lets it through), declined / no answer -> the restorer answers No (EN_Dialog_Option No = 3): nothing is
+-- restored. On the host the restoration's own session check then arms the memory start before its teleport (CoopNative).
+ruAt, ruOpen, rvMine, coopFlagAt, coopFlagLast = -1000, false, nil, -1000, nil
+function restUiTick()
+    if not iniHas("memory_vote=1") and not iniHas("vestige_relay=1") then return end
+    local now = os.clock()
+    if now - ruAt < 0.5 then return end
+    ruAt = now
+    local gs = FindFirstOf("BP_AppGameState_C")
+    local sm = FindFirstOf("AppSessionManager")
+    local multi = valid(gs) and valid(sm) and try(function() return sm:IsOnlineMultiplay(gs) end) == true
+    local isHost = valid(gs) and try(function() return gs.Role end) == 3
+    local cf = multi and ("coop 1 " .. (isHost and "host" or "guest")) or "coop 0"
+    if cf ~= coopFlagLast or now - coopFlagAt > 2 then vmCmd(cf); coopFlagLast, coopFlagAt = cf, now end
+    if not streamSettled(now) or not worldSettledAfterTravel(now) then return end
+    local open = false
+    local info = ""
+    if multi and not voteDialog then
+        -- the restoration screen's UI component exists while the screen is up (a destroyed one is left out by the load guard);
+        -- its list widget must be shown too (a child widget is never "in the viewport" itself)
+        local comp = FindFirstOf("BP_BCRestorationUIComponent_C")
+        local w = valid(comp) and FindFirstOf("WDT_RestorationList_C") or nil
+        local inVp = valid(w) and try(function() return w:IsInViewport() end) == true
+        local vis = valid(w) and try(function() return w:IsVisible() end) == true
+        open = valid(comp) and (inVp or vis)
+        info = string.format(" (screen component %s, list %s, in viewport %s, visible %s)", tostring(valid(comp)), tostring(valid(w)), tostring(inVp), tostring(vis))
+    end
+    if open ~= ruOpen then vmLog("restoration list " .. (open and "open" or "closed") .. info) end
+    if open then
+        vmCmd("restui 1 " .. (isHost and "host" or "guest"))
+    elseif ruOpen then vmCmd("restui 0") end
+    ruOpen = open
+end
+function rvFindDialog(addr)
+    for _, cn in ipairs({ "WDT_YesNoDialog_C", "WDT_CommonDialog_C", "DialogBase" }) do
+        for _, w in ipairs(FindAllOf(cn) or {}) do
+            if valid(w) and try(function() return w:GetAddress() end) == addr then return w end
+        end
+    end
+    return nil
+end
+function rvDecide(addr, yes, why)
+    -- (kit 254) the vote runs when "Restore vestiges" is chosen in a companion's menu; agreed -> CoopNative.memvotepass lets the next
+    -- choice open the restoration (2 minutes), declined -> nothing is restored
+    if yes then
+        local f = io.open(WIN64 .. "\\plugins\\CoopNative.memvotepass", "w")
+        if f then f:write("1"); f:close() end
+        vmLog("vote passed -> choosing Restore vestiges again opens the restoration (2 minutes)")
+        votePopup("Everyone agreed: choose Restore vestiges again")
+    else
+        os.remove(WIN64 .. "\\plugins\\CoopNative.memvotepass")
+        vmLog("vote failed (" .. tostring(why) .. ") -> no restoration")
+        votePopup("Restoring a vestige is not possible now" .. (why and (": " .. why) or ""))
+    end
+end
+function rvStart(addr, fromGuest)
+    local guests = voteGuests()
+    voteState = { rvote = true, fromGuest = fromGuest, dlg = addr, at = os.clock(), yes = 0, need = #guests }
+    local who = fromGuest and votePlayerName(guests[1]) or votePlayerName(localPC())
+    local text = (who or "Your partner") .. " wants to restore a vestige and watch its memory together."
+    -- (the restorer's own menu shows the game's "unavailable in multiplayer" notice once while the others are asked)
+    log("memory vote: " .. (fromGuest and "the guest wants" or "we want") .. " to restore a vestige; " .. #guests .. " answer(s) needed")
+    if #guests == 0 then votePass(); return end
+    voteSendAll(string.format("CoopVote:-1,-1,%d,%s", fromGuest and 1 or 0, text))
+    if fromGuest then voteOpenDialog(text) else votePopup("Waiting for your partner to agree to watch the memory") end
+end
+function rvTick()
+    local path = WIN64 .. "\\plugins\\CoopNative.memvotereq"
+    local f = io.open(path, "r")
+    if not f then return end
+    local s = f:read("*l") or ""; f:close(); os.remove(path)
+    local gs = FindFirstOf("BP_AppGameState_C")
+    local isHost = valid(gs) and try(function() return gs.Role end) == 3
+    if rvMine and os.clock() - rvMine.at < 35 then return end   -- already asking
+    if isHost then
+        if voteState then vmLog("Restore vestiges chosen while another vote runs -> not now"); rvDecide(nil, false, "another vote is running"); return end
+        rvMine = { at = os.clock() }
+        vmLog("Restore vestiges chosen -> everyone is asked first")
+        rvStart(nil, false)
+    else
+        rvMine = { at = os.clock() }
+        voteMineAt = os.clock()
+        vmLog("Restore vestiges chosen -> the host asks everyone first (" .. tostring(fsToHost(23, 1)) .. ")")
+        votePopup("Waiting for the others to agree to watch the memory")
+    end
+end
+-- names from CoopNative (FName indices) as text: who starts a deferred teleport
+function namesTick()
+    local path = WIN64 .. "\\plugins\\CoopNative.names"
+    local f = io.open(path, "r")
+    if not f then return end
+    local lines = {}
+    for l in f:lines() do lines[#lines + 1] = l end
+    f:close(); os.remove(path)
+    local function nm(i, n)
+        local ok, s = pcall(function() return FName(tonumber(i)):ToString() end)
+        s = ok and s or ("#" .. tostring(i))
+        if n and tonumber(n) and tonumber(n) > 0 then s = s .. "_" .. (tonumber(n) - 1) end
+        return s
+    end
+    for _, l in ipairs(lines) do
+        local label, oi, on, ci, fi = l:match("^(%S+) (%-?%d+) (%-?%d+) (%-?%d+) (%-?%d+)")
+        if label then log("trace: " .. label .. " called by " .. nm(oi, on) .. " (" .. nm(ci) .. ") in " .. nm(fi)) end
     end
 end
 rcState = nil
@@ -3618,7 +3743,8 @@ local function groupTeleport()
             -- ground at the cutscene spot). For the memory-end teleport ("start memend") the guests follow only once the host can
             -- move again (cutscene over: move input not ignored for 2 s), up to 3 minutes.
             pendingTp = { at = os.clock(), oldHost = valid(m0) and try(function() return m0:GetAddress() end) or nil, memend = what:find("memend") ~= nil,
-                          quiet = what:find("quiet") ~= nil, nofade = what:find("nofade") ~= nil }
+                          quiet = what:find("quiet") ~= nil, nofade = what:find("nofade") ~= nil, warp = what:find("warp") ~= nil,
+                          hostStart = valid(m0) and try(function() return m0:K2_GetActorLocation() end) or nil }
             -- (kit 252) "quiet" = a restoration memory's teleport: no Mistle teleport animation and no loading-screen gate (the game's own
             -- deferred teleport covers the host); "nofade" = a memory vote runs, his screen stays visible for the vote dialog
             log("group teleport: host teleports, guests follow once the host has arrived")
@@ -3644,7 +3770,7 @@ local function groupTeleport()
             pendingTp.arrivedAt = os.clock()
             if tgHolding and not pendingTp.memend then
                 pcall(tgStart)
-            elseif iniHas("arrival_hold=1") and not pendingTp.memend and os.clock() - pendingTp.at < 7 then
+            elseif iniHas("arrival_hold=1") and not pendingTp.memend and not pendingTp.quiet and os.clock() - pendingTp.at < 7 then
                 arrHold = { at = os.clock() }
                 log(string.format("group teleport: arrival after only %.1f s (the target area may still be on its way out) -> host held until the streaming settles", os.clock() - pendingTp.at))
             end
@@ -3700,7 +3826,7 @@ local function groupTeleport()
             log("group teleport: no finished report within " .. limit .. " s -> bringing the guests anyway")
             pendingTp.finishedAt = os.clock() - 2
         elseif not pendingTp.memend then
-            log("group teleport: host did not arrive within " .. limit .. " s, given up"); pendingTp = nil; return
+            log("group teleport: host did not arrive within " .. limit .. " s, given up"); voteSendAll("CoopTeleportCancel"); pendingTp = nil; return
         end
     end
     local gs = FindFirstOf("BP_AppGameState_C")
@@ -3710,8 +3836,30 @@ local function groupTeleport()
     local mine = valid(pc) and try(function() return pc.Pawn end) or nil
     if not valid(mine) or try(function() return helper:IsDeath(mine) end) or try(function() return helper:IsDying(mine) end) then return end
     local addr = try(function() return mine:GetAddress() end)
+    -- (kit 255) purple Mistle: arrived when the host stands more than 50 m from where it pressed and no teleport driver of ours runs;
+    -- if after 8 s nothing moved (e.g. enemies near: the portal refused), the guests are let go again
+    if pendingTp.warp and not pendingTp.arrivedAt then
+        local hl = try(function() return mine:K2_GetActorLocation() end)
+        local s0 = pendingTp.hostStart
+        local moved = hl and s0 and ((hl.X - s0.X) ^ 2 + (hl.Y - s0.Y) ^ 2 + (hl.Z - s0.Z) ^ 2) > 5000 * 5000
+        local pcw = localPC()
+        local pcwA = valid(pcw) and try(function() return pcw:GetAddress() end)
+        local running = false
+        for _, d in ipairs(FindAllOf("DeferredTeleportDriver") or {}) do
+            if valid(d) and try(function() return d.IsRunning end) == true and vmOwnDriver(d, pcwA, addr) then running = true end
+        end
+        if (moved or addr ~= pendingTp.oldHost) and not running then
+            pendingTp.arrivedAt, pendingTp.warpMoved = os.clock(), true
+            log("group teleport: the host arrived through the purple Mistle" .. (moved and " (moved)" or " (new character)"))
+        elseif not moved and not running and addr == pendingTp.oldHost and os.clock() - pendingTp.at > 8 then
+            log("group teleport: the purple Mistle did not teleport the host within 8 s -> guests let go, their screens come back")
+            voteSendAll("CoopTeleportCancel")
+            pendingTp = nil
+            return
+        end
+    end
     -- arrived: CoopNative saw the characters re-spawn, and the host's pawn is a new one (the address alone changed during loading)
-    local arrived = pendingTp.arrivedAt and addr and addr ~= pendingTp.oldHost
+    local arrived = pendingTp.arrivedAt and addr and (addr ~= pendingTp.oldHost or pendingTp.warpMoved)
     if not arrived then return end
     pendingTp.newSeenAt = pendingTp.newSeenAt or os.clock()
     if os.clock() - pendingTp.newSeenAt < 3 then return end   -- let the host's area finish loading
@@ -4060,10 +4208,12 @@ local tpfHostPos, tpfWaitFrom, tpfWaitAt = nil, nil, nil   -- (unused since v2)
 -- v2 (owner 21:1x: the fade came only after the jank, and once his screen went dark for 5 s while standing): the host sends
 -- ClientMessage("CoopTeleportFade") at the start of its teleport; the distance trigger is gone
 local tpfMessageAt = nil
+tpfCancelAt = nil
 pcall(function()
     RegisterHook("/Script/Engine.PlayerController:ClientMessage", function(ctx, s)
         local text = try(function() return s:get():ToString() end)
         if text == "CoopTeleportFade" then tpfMessageAt = os.clock() end
+        if text == "CoopTeleportCancel" then tpfCancelAt = os.clock() end
     end)
 end)
 local function tpfadeSend(ctx, on)
@@ -4115,6 +4265,17 @@ local function guestTeleportFade()
     end
     local hostName = valid(host) and name(host) or nil
     pcall(arrivalTick, helper)
+    if tpfCancelAt then
+        -- (kit 256) the host dropped its teleport (a purple Mistle that did not go, or no arrival): screen back, hold off, now
+        tpfCancelAt = nil
+        local ctxc = valid(mine) and try(function() return mine:GetAddress() end)
+        if not ctxc and valid(pc) then ctxc = try(function() return pc:GetAddress() end) end
+        local cmc = valid(mine) and try(function() return mine.CharacterMovement end) or nil
+        if valid(cmc) and try(function() return cmc.MovementMode end) == 5 then pcall(function() cmc:SetMovementMode(3, 0) end) end
+        local lifted = ctxc and tpfadeSend(ctxc, false)
+        log("teleport fade: the host dropped its teleport -> our screen comes back (" .. tostring(lifted) .. ")")
+        tpfOnAt, tpfMineAt, tpfMessageAt, tpHoldOn = nil, nil, nil, nil
+    end
     if tpHoldOn and not tpfOnAt then
         if mineName == tpHoldOn then
             local cmr = valid(mine) and try(function() return mine.CharacterMovement end) or nil
@@ -4329,7 +4490,17 @@ function veilWatch()
             if gmf then gmf:close() end
             -- the window file exists only on the guest; on the host memHostOn = the host's memory runs (relay memstart..memend)
             if memHostOn then inMemory = true end
-            if ft and ft ~= 0 and inBase ~= true and not inMemory then
+            -- 2026-11-25 playthrough: this also cleared the game's own modes on a solo character (mode 4 = the prologue's injured walk at
+            -- 18:43:24, mode 1 later): the limp was gone. Only the memory mode (3) is ours to clear, and only in a co-op session.
+            local gs0 = FindFirstOf("BP_AppGameState_C")
+            local sm0 = FindFirstOf("AppSessionManager")
+            local multi0 = valid(gs0) and valid(sm0) and try(function() return sm0:IsOnlineMultiplay(gs0) end) == true
+            if ft and ft ~= 0 and ft ~= 3 then
+                log("special mode: " .. n .. " has the game's mode " .. tostring(ft) .. " -> left as it is")
+            elseif ft == 3 and not multi0 then
+                log("special mode: " .. n .. " has mode 3 outside co-op -> left as it is")
+            end
+            if ft == 3 and multi0 and inBase ~= true and not inMemory then
                 local gs = FindFirstOf("BP_AppGameState_C")
                 local isHost = valid(gs) and try(function() return gs.Role end) == 3
                 local mine = try(function() return localPC().Pawn end)
@@ -4337,6 +4508,141 @@ function veilWatch()
                 local a = own and pcall(function() helper:ClearRestrictedActionInBaseInfo(p) end)
                 local b = isHost and pcall(function() helper:ClearRestrictedActionInBaseInfoHost(p) end)
                 log("special mode: " .. n .. " had mode " .. tostring(ft) .. " in the field -> cleared (own " .. tostring(a) .. ", host " .. tostring(b) .. ")")
+            end
+        end
+    end
+end
+-- Difficulty from the player settings file (2026-11-25, framework; <Win64>\seamless_coop_settings.ini [Difficulty]). Host only: with
+-- N players in the world, every living enemy gets (1 + (N-1) * percent/100) times the game's own maximum health
+-- (CharacterHelper:SetDefaultMaxHealth, health kept at the same share) and times its own AttackScale (enemy damage). Bosses
+-- (CharacterHelper:IsBoss) use the boss_ lines. The game's own values are remembered per enemy and come back when the guests leave;
+-- an enemy whose values the game changed (a new enemy at a reused address, a rest reload) is taken as new. All four at 0 = nothing
+-- is touched. Every change is logged (first 30) with the maximum health read back, to see that the game uses it.
+diffCfg, diffRec, diffAt, diffLogs = nil, {}, -1000, 0
+function settingsNumber(text, key)
+    local v = text:match("\n%s*" .. key .. "%s*=%s*([^\r\n;]*)")
+    local n = v and tonumber((v:gsub("%s+$", "")))
+    if not n or n < 0 or n > 1000 then return 0 end
+    return n
+end
+function difficultyTick()
+    local now = os.clock()
+    if now - diffAt < 1 then return end
+    diffAt = now
+    if not diffCfg then
+        local f = io.open(WIN64 .. "\\seamless_coop_settings.ini", "r")
+        local t = f and ("\n" .. (f:read("*a") or "")) or "\n"
+        if f then f:close() end
+        diffCfg = { eh = settingsNumber(t, "enemy_health_per_player"), ed = settingsNumber(t, "enemy_damage_per_player"),
+                    bh = settingsNumber(t, "boss_health_per_player"), bd = settingsNumber(t, "boss_damage_per_player") }
+        log(string.format("difficulty: settings file %s: enemy health +%g %%, enemy damage +%g %%, boss health +%g %%, boss damage +%g %% per extra player",
+            f and "read" or "not found", diffCfg.eh, diffCfg.ed, diffCfg.bh, diffCfg.bd))
+    end
+    local c = diffCfg
+    if c.eh == 0 and c.ed == 0 and c.bh == 0 and c.bd == 0 then return end
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not valid(gs) or try(function() return gs.Role end) ~= 3 then return end
+    local players = 0
+    for _, pc in ipairs(FindAllOf("ActionPlayerController_C") or {}) do if valid(pc) then players = players + 1 end end
+    if players < 1 then return end
+    local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+    local seen = {}
+    for _, e in ipairs(FindAllOf("EnemyCommonBase") or {}) do
+        local a = valid(e) and try(function() return e:GetAddress() end)
+        if a and try(function() return helper:IsDeath(e) end) ~= true then
+            seen[a] = true
+            local dflt = try(function() return helper:GetDefaultMaxHealth(e) end)
+            local as = try(function() return e.AttackScale end)
+            local r = diffRec[a]
+            if type(dflt) == "number" and dflt > 0 and type(as) == "number" then
+                if not r or (math.abs(dflt - r.appliedH) > 0.5 and math.abs(dflt - r.baseH) > 0.5) or math.abs(as - r.baseD * r.fD) > 0.0005 then
+                    r = { baseH = dflt, appliedH = dflt, fH = 1, baseD = as, fD = 1, boss = try(function() return helper:IsBoss(e) end) == true }
+                    diffRec[a] = r
+                end
+                local ph, pd = r.boss and c.bh or c.eh, r.boss and c.bd or c.ed
+                local wantH, wantD = 1 + (players - 1) * ph / 100, 1 + (players - 1) * pd / 100
+                if math.abs(wantH - r.fH) > 0.0005 then
+                    local hp, mx = try(function() return helper:GetHealth(e) end), try(function() return helper:GetMaxHealth(e) end)
+                    local share = (type(hp) == "number" and type(mx) == "number" and mx > 0) and hp / mx or 1
+                    local ok = pcall(function() helper:SetDefaultMaxHealth(e, r.baseH * wantH) end)
+                    local mx2 = try(function() return helper:GetMaxHealth(e) end)
+                    if ok and type(mx2) == "number" and share > 0 then pcall(function() helper:SetHealth(e, mx2 * share) end) end
+                    r.fH, r.appliedH = wantH, r.baseH * wantH
+                    diffLogs = diffLogs + 1
+                    if diffLogs <= 30 then
+                        log(string.format("difficulty: %s%s health x%.2f (%d players): default max %.0f -> %.0f %s, max health read back %s -> %s",
+                            name(e), r.boss and " (boss)" or "", wantH, players, r.baseH, r.baseH * wantH, ok and "set" or "FAILED", tostring(mx), tostring(mx2)))
+                    end
+                end
+                if math.abs(wantD - r.fD) > 0.0005 then
+                    local ok = pcall(function() e.AttackScale = r.baseD * wantD end)
+                    r.fD = wantD
+                    diffLogs = diffLogs + 1
+                    if diffLogs <= 30 then
+                        log(string.format("difficulty: %s%s damage x%.2f (%d players): AttackScale %.3f -> %.3f %s", name(e), r.boss and " (boss)" or "",
+                            wantD, players, r.baseD, r.baseD * wantD, ok and "set" or "FAILED"))
+                    end
+                end
+            end
+        end
+    end
+    for a in pairs(diffRec) do if not seen[a] then diffRec[a] = nil end end
+end
+-- 2026-11-25 playthrough (owner, as the guest: "cant see weapon after cutscene ... i couldnt see his weapon"; switching weapons brought
+-- it back before). A cutscene hides the players' weapons on each PC and shows them again for the own character; the other player's copy
+-- stays without one. When a cutscene has been over for 2 s (no level sequence playing, not in Home Base, not in a memory, no group
+-- teleport hold), every other player's character gets the game's own weapon-visibility call again (the anim notify the game uses), and
+-- the equipment actors on it are logged before and after (only the active weapon is shown by the game; hidden spare ones stay hidden).
+-- Off with weapon_reshow=0.
+wsPlaying, wsEndAt, wsAt, wsDone, wsLogs = false, nil, -1000, true, 0
+function weaponShowTick()
+    if iniHas("weapon_reshow=0") then return end
+    local now = os.clock()
+    if now - wsAt < 0.5 then return end
+    wsAt = now
+    local playing = false
+    for _, sp in ipairs(FindAllOf("LevelSequencePlayer") or {}) do
+        if valid(sp) and try(function() return sp:IsPlaying() end) then playing = true; break end
+    end
+    if playing then wsPlaying, wsEndAt, wsDone = true, nil, false; return end
+    if wsPlaying then wsPlaying, wsEndAt = false, now end
+    if wsDone or not wsEndAt or now - wsEndAt < 2 then return end
+    if pendingTp or hbInBase() then return end
+    local gmf = io.open(WIN64 .. "\\plugins\\CoopNative.guestmem", "r")
+    local inMemory = gmf and ((gmf:read("*a") or ""):match("1") ~= nil) or false
+    if gmf then gmf:close() end
+    if inMemory or memHostOn then return end
+    wsDone = true
+    local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+    local mine = try(function() return localPC().Pawn end)
+    local mineN = valid(mine) and name(mine) or ""
+    local equip = FindAllOf("EquipmentBase") or {}
+    for _, p in ipairs(FindAllOf("BP_Player_C") or {}) do
+        local n = valid(p) and name(p) or nil
+        if n and n ~= mineN and try(function() return helper:IsDeath(p) end) ~= true then
+            local function eqState()
+                local vis, hid = 0, 0
+                for _, e in ipairs(equip) do
+                    if valid(e) then
+                        local par = try(function() return e:GetAttachParentActor() end)
+                        if valid(par) and name(par) == n then
+                            if try(function() return e.bHidden end) == true then hid = hid + 1 else vis = vis + 1 end
+                        end
+                    end
+                end
+                return vis .. " shown/" .. hid .. " hidden"
+            end
+            local out = {}
+            pcall(function() helper:GetRestrictedActionInBaseInfo(p, out) end)
+            local info = out.OutInfo or out
+            local ft = try(function() return info.FieldType end)
+            local wv = try(function() return info.bWeaponVisibility end)
+            local before = eqState()
+            local ok = pcall(function() helper:OnAnimNotifyStateChangeVisibilityOfWeapon(p, true, 0.0) end)
+            wsLogs = wsLogs + 1
+            if wsLogs <= 40 then
+                log("weapon reshow: cutscene over -> " .. n .. " (mode " .. tostring(ft) .. ", weapon visibility " .. tostring(wv) .. "): equipment " .. before ..
+                    " -> weapon shown " .. tostring(ok) .. ", now " .. eqState())
             end
         end
     end
@@ -5457,6 +5763,9 @@ function fsHostIn()
             elseif kind == 15 then
                 hostGuestMenuAt = data == 1 and os.clock() or nil
                 log("level-up: the guest's Mistle menu is " .. (data == 1 and "open (his character goes first on our protect list for the level-up relay)" or "closed"))
+            elseif kind == 23 then
+                if voteState then voteSendAll("CoopVoteEnd:0,another vote is running")
+                else pcall(rvStart, nil, true) end
             elseif kind == 21 or kind == 22 then
                 pcall(vestigeRelayHostIn, kind, data)
             elseif kind == 19 then
@@ -5951,6 +6260,56 @@ local function guestRestRequest()
         local ok = type(max) == "number" and pcall(function() helper:SetHealth(mine, max) end)
         healCheck = { p = mine, at = os.clock() }
         log("guest rest: menu " .. tostring(opened) .. ", health " .. tostring(before) .. " -> " .. tostring(max) .. " " .. (ok and "set" or "FAILED"))
+        pcall(guestRestRefill, mine)
+    end
+end
+-- 2026-11-25 playthrough (owner: "the rest doesn't seem to restore everything like Ichor ... study up on what the rest function actually
+-- does for the player"; "after leveling up, you should be put back to full health"). A guest's rest skips the Mistle's own rest (it runs
+-- host-only parts), so the player part of a rest is done here with the game's own calls: health and Ichor to their maximum, the Regen
+-- charges back (ResetRegenerationUsageCount), status effects cleared (ClearAllCondition), items topped up from storage
+-- (ReplenishItemsFromStorage, the auto-replenish of a rest). While his Mistle menu is open, health and Ichor are kept at their maximum,
+-- so a level-up there (it raises the maximum) also ends at full health. Off with guest_rest_full=0.
+function guestRestRefill(mine)
+    if iniHas("guest_rest_full=0") then return end
+    local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+    if not valid(mine) or not valid(helper) then return end
+    local i0 = try(function() return helper:GetIchor(mine, false) end)
+    local imax = try(function() return helper:GetMaxIchor(mine) end)
+    local oki = type(imax) == "number" and imax > 0 and pcall(function() helper:SetIchor(mine, imax) end)
+    local r0 = try(function() return helper:GetRegenerationUsageCount(mine) end)
+    local okr = pcall(function() helper:ResetRegenerationUsageCount(mine) end)
+    local r1 = try(function() return helper:GetRegenerationUsageCount(mine) end)
+    local okc = pcall(function() helper:ClearAllCondition(mine) end)
+    local okp = false
+    local icls = StaticFindObject("/Script/Extensions.ItemComponent")
+    local ic = valid(icls) and try(function() return mine:GetComponentByClass(icls) end) or nil
+    if valid(ic) then okp = pcall(function() ic:ReplenishItemsFromStorage() end) end
+    log(string.format("guest rest: Ichor %s -> %s %s, Regen uses %s -> %s %s, status effects cleared %s, items from storage %s",
+        tostring(i0), tostring(imax), oki and "set" or "FAILED", tostring(r0), tostring(r1), okr and "reset" or "FAILED", tostring(okc),
+        valid(ic) and tostring(okp) or "no item component"))
+    grFullAt, grFullPawn = os.clock(), mine
+end
+grFullAt, grFullPawn, grFullLogs = -1000, nil, 0
+function guestRestKeepFull()
+    if not menuWatch or iniHas("guest_rest_full=0") then return end
+    local now = os.clock()
+    if now - grFullAt < 0.5 then return end
+    grFullAt = now
+    local mine = try(function() return localPC().Pawn end)
+    if not valid(mine) then return end
+    local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+    local hp, hmax = try(function() return helper:GetHealth(mine) end), try(function() return helper:GetMaxHealth(mine) end)
+    local ic, imax = try(function() return helper:GetIchor(mine, false) end), try(function() return helper:GetMaxIchor(mine) end)
+    local did = {}
+    if type(hp) == "number" and type(hmax) == "number" and hp < hmax - 0.5 and pcall(function() helper:SetHealth(mine, hmax) end) then
+        did[#did + 1] = string.format("health %.0f -> %.0f", hp, hmax)
+    end
+    if type(ic) == "number" and type(imax) == "number" and ic < imax - 0.05 and pcall(function() helper:SetIchor(mine, imax) end) then
+        did[#did + 1] = string.format("Ichor %.1f -> %.1f", ic, imax)
+    end
+    if #did > 0 then
+        grFullLogs = grFullLogs + 1
+        if grFullLogs <= 30 then log("guest rest: menu open, kept full (a level-up raises the maximum): " .. table.concat(did, ", ")) end
     end
 end
 local function guestRestHealCheck()
@@ -6470,7 +6829,7 @@ function sceneMgrSend()
     log(string.format("scene flags: manager %X %s", ad, name(m)))
 end
 -- Co-op version on the title screen (owner 2026-11-03: to see that both PCs run the same kit). The game's version text on the
--- title gets "  /  co-op <kit>" appended (plugins\\CoopKitVersion.txt).
+-- title gets "  /  seamless co-op <kit>" appended (plugins\\CoopKitVersion.txt).
 -- v2 (2026-11-03, after title-screen crashes inside UE4SS): no search while menus are being built. Every 2 s only a cheap check
 -- whether the title menu component exists; once it has existed for 5 s, ONE pass over the text blocks; at most 3 passes per
 -- title visit, and nothing while a world (our player character) exists. The first pass logs the title's texts once.
@@ -6500,8 +6859,8 @@ function titleVersion()
             -- the real line is "Game client ver. 1.53.93354" (owner 2026-11-04); "Version: First Blood" was another text
             -- 19:15 test: no text block holds that line, so the version goes behind the copyright line the owner can see
             elseif #txt < 60 and (txt:lower():find("ver%.%s*%d") or txt:find("BANDAI NAMCO", 1, true)) then
-                local ok = pcall(function() tb:SetText(FText(txt .. "  /  co-op " .. ver)) end)
-                log("title version: '" .. txt .. "' -> co-op " .. ver .. " " .. tostring(ok) .. " visible=" .. tostring(vis) .. " " .. tostring(try(function() return tb:GetFullName() end)):sub(1, 160))
+                local ok = pcall(function() tb:SetText(FText(txt .. "  /  seamless co-op " .. ver)) end)
+                log("title version: '" .. txt .. "' -> seamless co-op " .. ver .. " " .. tostring(ok) .. " visible=" .. tostring(vis) .. " " .. tostring(try(function() return tb:GetFullName() end)):sub(1, 160))
                 if ok then titleDone = true end
             end
         end
@@ -7816,16 +8175,19 @@ local function probeCommands()
     if world then pcall(memoryFollow) end
     if world then pcall(memoryBaseLog) end
     if world then pcall(veilWatch) end
+    if world then pcall(weaponShowTick) end
     local okr, er = pcall(sceneRelay)
     if not okr and not relayErr then relayErr = true; log("scene relay ERROR " .. tostring(er):sub(1, 160)) end
     guestLevelWatch()
     guestRestRequest()
+    pcall(guestRestKeepFull)
     resyncAfterMenu()
     guestLevelUpRelay()
     if os.clock() <= disableUntil then disableGuestMenuEntries() elseif not disabledLogged and disableUntil > 0 then disabledLogged = true end
     guestRestHealCheck()
     probeQueue = probeQueue or {}
-    local fq = io.open(PROBE_CMD, "r")
+    -- (prototype 2026-11-25) the command file is a test channel: only with test_commands=1
+    local fq = iniHas("test_commands=1") and io.open(PROBE_CMD, "r") or nil
     if fq then
         local text = fq:read("*a") or ""
         fq:close(); os.remove(PROBE_CMD)
@@ -8215,7 +8577,11 @@ LoopAsync(200, function()
         pcall(mapOwnTick)
         pcall(vestigeRelayGuestTick)
         pcall(vmemTick)
+        pcall(restUiTick)
+        pcall(rvTick)
+        pcall(namesTick)
         pcall(enemyStateTick)
+        pcall(difficultyTick)
         local ok, e = pcall(groupRest, rested)
         if not ok and not groupRestErr then groupRestErr = true; log("group rest ERROR " .. tostring(e):sub(1, 160)) end
         local okc, ec = pcall(combatProbe)

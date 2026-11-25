@@ -1,0 +1,50 @@
+; Code Vein seamless co-op - player settings
+;
+; Change a value after the "=" and save this file while the game is closed; it is read at every start.
+; Lines that start with ";" are notes. Each player has their own copy of this file:
+;   - the password has to be the same on every PC,
+;   - in a session the host's [Votes], [Rewards] and [Difficulty] count for the host's world.
+
+[Session]
+; Only players with the same password see each other's distress signals. The mod sets it as the
+; game's own matchmaking password at every start. Leave it empty to keep what you set in the
+; game's options.
+cooperative_password =
+
+; Host: open your world for co-op again by itself after a session closed (boss kill, death, area change).
+;   auto   = once you have hosted by hand in this game run
+;   always = also without hosting by hand first
+;   off    = only when you send a distress signal yourself
+auto_host = auto
+
+; Guest: search for the host and join again by itself after a disconnect. Same choices as auto_host.
+auto_join = auto
+
+; Keep your role and the host's name after a crash or a restart, so auto_host / auto_join carry on (on / off).
+remember_session = on
+
+[Votes]
+; Everyone is asked before a Mistle teleport or a trip to Home Base (on).
+; off = whoever teleports takes everyone along without asking.
+teleport_vote = on
+
+; Everyone is asked before a vestige memory starts (on).
+; off = the memory starts for everyone at once.
+memory_vote = on
+
+[Rewards]
+; Guests also get the rewards of a boss you killed together (on / off).
+shared_boss_rewards = on
+
+; The story position reached together (boss kills, story events) also counts in the guest's own world (on / off).
+guest_story_progress = on
+
+[Difficulty]
+; Used by the host only. Percent added for every player beyond the first while they are in the host's
+; world, on top of the game's own values. 0 = the game's own balance (default).
+; Example: enemy_health_per_player = 50 -> with one guest enemies have 150 % health, with two guests 200 %.
+; Values from 0 to 1000. Bosses use the boss_ lines, every other enemy the enemy_ lines.
+enemy_health_per_player = 0
+enemy_damage_per_player = 0
+boss_health_per_player = 0
+boss_damage_per_player = 0

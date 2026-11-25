@@ -349,9 +349,53 @@ local function checkVersion(theirs)
     end
 end
 
+-- Player settings file (2026-11-25): cooperative_password in <Win64>\seamless_coop_settings.ini becomes the game's own matchmaking
+-- password (ConfigurationManager, the object behind Options > the password setting), so only players with the same password see each
+-- other's distress signals. Empty = the game's own setting stays. Checked every 5 s and set again when the game's value differs (e.g.
+-- after it loaded its options). The password itself is never written to the log.
+local SETTINGS_PATH = (MOD_DIR:match("^(.*)[/\\]ue4ss[/\\]Mods[/\\]") or ".") .. "\\seamless_coop_settings.ini"
+local pwAt, pwLogged = -1000, nil
+local function settingsPassword()
+    local f = io.open(SETTINGS_PATH, "r")
+    if not f then return nil end
+    local pw
+    for line in f:lines() do
+        local v = line:match("^%s*cooperative_password%s*=%s*(.-)%s*$")
+        if v then pw = v end
+    end
+    f:close()
+    return pw
+end
+local function applyPassword()
+    if os.clock() - pwAt < 5 then return end
+    pwAt = os.clock()
+    local pw = settingsPassword()
+    if not pw or pw == "" then
+        if pwLogged ~= "none" then pwLogged = "none"; log("password: none in seamless_coop_settings.ini -> the game's own matchmaking password setting is used") end
+        return
+    end
+    local cm = FindFirstOf("BP_ConfigurationManager_C")
+    if not valid(cm) then cm = FindFirstOf("ConfigurationManager") end
+    if not valid(cm) then return end
+    local cur = try(function() return cm:GetMatchingPassword():ToString() end)
+    local on = try(function() return cm:IsMatchingPasswordEnabled() end)
+    if cur == pw and on == true then
+        if pwLogged ~= "same" then pwLogged = "same"; log("password: the game's matchmaking password matches the settings file (" .. #pw .. " characters)") end
+        return
+    end
+    local a, ea = pcall(function() cm:SetMatchingPasswordEnabled(true) end)
+    local b, eb = pcall(function() cm:SetMatchingPassword(pw) end)
+    local now = try(function() return cm:GetMatchingPassword():ToString() end)
+    pwLogged = "set"
+    log("password: game's matchmaking password " .. (cur == nil and "unknown" or (cur == "" and "empty" or "different")) .. ", enabled " .. tostring(on) ..
+        " -> set from the settings file (" .. #pw .. " characters): enable " .. (a and "ok" or tostring(ea):sub(1, 80)) .. ", password " ..
+        (b and "ok" or tostring(eb):sub(1, 80)) .. ", reads back " .. (now == pw and "the same" or "DIFFERENT"))
+end
+
 local stateLoaded, sigLogged, wasSearching, versionAt = false, false, false, nil
 local function tick()
     readConfig()
+    pcall(applyPassword)
     if cfg.enabled == "0" then allowSend = false; return end
     local s = snapshot()
     if not s then return end
