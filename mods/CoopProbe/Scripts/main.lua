@@ -10,6 +10,76 @@ local function stamp()
 end
 local function log(s) print(TAG .. stamp() .. " " .. tostring(s) .. "\n") end
 local function try(f) local ok, v = pcall(f); if ok then return v end return nil end
+
+-- Hands off while loading (2026-11-21; NOTES "11-21 crash review"). During every load, rest reset, join and teleport the game builds the
+-- new objects (enemies above all) on its loading thread, and FindAllOf / FindFirstOf already return them while they are half built.
+-- Calling into a half-built enemy from the game thread is the prime suspect for the BitArrayIndex load crash (first seen 10-28, the day
+-- after the first per-tick enemy search; the unmodded game survives the same steps). Every search in this mod therefore leaves out the
+-- objects the engine itself still marks as being loaded or destroyed: object flags NeedInitialization, NeedLoad, NeedPostLoad,
+-- NeedPostLoadSubobjects, BeginDestroyed, FinishDestroyed and internal flags Async, AsyncLoading, Unreachable, PendingKill (UE 4.18 bits).
+-- No timers: an object is used again as soon as the engine clears its flags. load_guard=0 in CoopNative.ini switches it off.
+do
+    local src = debug.getinfo(1, "S").source
+    local base = src:match("^@(.*)[/\\]ue4ss[/\\]Mods[/\\]") or "."
+    local who = src:match("[/\\]Mods[/\\]([^/\\]+)[/\\]") or "?"
+    local f = io.open(base .. "\\plugins\\CoopNative.ini", "r")
+    local s = f and f:read("*a") or ""
+    if f then f:close() end
+    local function glog(m) print("[LoadGuard:" .. who .. "] " .. os.date("%H:%M:%S") .. " " .. m .. "\n") end
+    if s:find("load_guard=0", 1, true) then
+        glog("off (load_guard=0)")
+    else
+        local RF_BUSY = 0x200 | 0x400 | 0x1000 | 0x2000 | 0x8000 | 0x10000
+        local IF_BUSY = (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29)
+        local rawAll, rawFirst = FindAllOf, FindFirstOf
+        local on, apiOk, firstSeen = true, false, false
+        local skipped, example, since = 0, "?", os.clock()
+        local function busy(o)
+            local okA, a = pcall(function() return o:HasAnyFlags(RF_BUSY) end)
+            local okB, b = pcall(function() return o:HasAnyInternalFlags(IF_BUSY) end)
+            if okA and okB then apiOk = true; return a == true or b == true end
+            if apiOk then return true end   -- the check works, this one object does not answer: leave it out
+            on = false
+            glog("flag check not usable here (" .. tostring(okA and b or a):sub(1, 120) .. ") -> off")
+            return false
+        end
+        local function note(o)
+            skipped = skipped + 1
+            local n = "?"
+            pcall(function() n = o:GetFName():ToString() end)
+            example = n
+            if not firstSeen then firstSeen = true; glog("first object left out while the engine still builds or removes it: " .. n) end
+            local now = os.clock()
+            if now - since >= 30 then
+                glog("left out " .. skipped .. " still-loading / being-removed object(s) in the last " .. math.floor(now - since) .. " s (e.g. " .. example .. ")")
+                skipped, since = 0, now
+            end
+        end
+        FindAllOf = function(cls)
+            local all = rawAll(cls)
+            if not on or type(all) ~= "table" then return all end
+            local out = {}
+            for _, o in ipairs(all) do
+                if on and busy(o) then note(o) else out[#out + 1] = o end
+            end
+            if #out == 0 then return nil end
+            return out
+        end
+        FindFirstOf = function(cls)
+            local o = rawFirst(cls)
+            if not on or o == nil then return o end
+            local okv, v = pcall(function() return o:IsValid() end)
+            if not (okv and v) then return o end
+            if not busy(o) or not on then return o end
+            note(o)
+            for _, x in ipairs(rawAll(cls) or {}) do
+                if not busy(x) then return x end
+            end
+            return nil
+        end
+        glog("on: searches leave out objects the engine still builds or removes (load_guard=0 in CoopNative.ini switches it off)")
+    end
+end
 local function valid(o) return o ~= nil and try(function() return o:IsValid() end) end
 local function name(o) return try(function() return o:GetFName():ToString() end) or "?" end
 
@@ -484,6 +554,7 @@ local lastCombat, lastCombatKey, combatErr, combatTick, respawnErr = nil, "", fa
 local function combatProbe()
     combatTick = combatTick + 1
     if combatTick % 3 ~= 0 then return end   -- every 0.6 s
+    if not iniHas("combat_probe=1") then return end   -- research only (2026-11-21: off by default, see the load guard above)
     local ai = StaticFindObject("/Script/Extensions.Default__EnemyAIUtility")
     local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
     if not (valid(ai) and valid(helper)) then return end
@@ -678,17 +749,55 @@ end
 
 -- Vestige restoration with a session (vestige_keep=1, R4 stage 2): CoopNative answers "no session" to the restoration screen's
 -- IsCreateSession / GetOnlineOtherPlayerNum; Lua hands over that screen's class once ("restclass <hex>"), like the menu class.
-local restClassSent = false
-local function sendRestoreClass()
-    if restClassSent or not iniHas("vestige_keep=1") then return end
-    local m = FindFirstOf("BP_BCRestorationUIComponent_C")
-    local cls = valid(m) and try(function() return m:GetClass() end) or nil
-    local addr = cls and try(function() return cls:GetAddress() end)
-    if not addr then return end
+local restClassSent = nil   -- (unused since kit 250)
+-- (kit 250) Crash fix (guest 19:01:37 at his join, UE4SS.dll+0xC77A80 on the game thread): kit 249 looked the restoration screen class
+-- and the companions' talk menu classes up by path every few seconds (StaticFindObject); Cyllene's menu class of HIS world (found
+-- 19:01:24) was being removed when he joined. Now CoopNative gets each class NAME's index once at start (an FName index never
+-- changes and needs no world). Only if this UE4SS cannot give name indices: the classes of menu/screen INSTANCES that exist (guarded
+-- searches, after the world has settled), never a class by path.
+local function vkCmd(line)
     local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
-    if c then c:write(string.format("restclass %X\n", addr)); c:close(); restClassSent = true end
-    log(string.format("vestige restoration: BP_BCRestorationUIComponent_C class at 0x%X sent to CoopNative", addr))
+    if c then c:write(line .. "\n"); c:close(); return true end
+    return false
 end
+local function nameIndex(n)
+    local ok, idx = pcall(function() return FName(n, 1):GetComparisonIndex() end)   -- 1 = FNAME_Add
+    if not (ok and type(idx) == "number" and idx > 0) then ok, idx = pcall(function() return FName(n):GetComparisonIndex() end) end
+    if ok and type(idx) == "number" and idx > 0 then return idx end
+    return nil, idx
+end
+VEST_MENU_NAMES = { "BP_Scenario_Base01_Io_Menu_C", "BP_Scenario_Base01_leda_Menu_C", "BP_Scenario_Base01_cyllene_Menu_C",
+                    "BP_Scenario_Base01_thebe_Menu_C", "BP_Scenario_Base01_themisto_Menu_C", "BP_Scenario_Base01_relics_Menu_C" }
+vkByName, vkInstSent, vkAt = nil, {}, -1000
+local function sendRestoreClass()
+    if not iniHas("vestige_keep=1") then return end
+    if vkByName == nil then
+        local n, err = 0, nil
+        local ri, re = nameIndex("BP_BCRestorationUIComponent_C")
+        if ri and vkCmd("restname " .. ri) then n = n + 1 else err = re end
+        for _, cn in ipairs(VEST_MENU_NAMES) do
+            local i, e = nameIndex(cn)
+            if i and vkCmd("vestmenuname " .. i) then n = n + 1 else err = err or e end
+        end
+        vkByName = n == 1 + #VEST_MENU_NAMES
+        log("vestige: " .. n .. " of " .. (1 + #VEST_MENU_NAMES) .. " class name indices (restoration screen, talk menus) sent to CoopNative" ..
+            (vkByName and "" or (" -> the rest by their instances (" .. tostring(err):sub(1, 100) .. ")")))
+    end
+    if vkByName then return end
+    local now = os.clock()
+    if now - vkAt < 2 or not streamSettled(now) or not worldSettledAfterTravel(now) then return end
+    vkAt = now
+    for _, cn in ipairs({ "BP_BCRestorationUIComponent_C", table.unpack(VEST_MENU_NAMES) }) do
+        local m = FindFirstOf(cn)
+        local cls = valid(m) and try(function() return m:GetClass() end) or nil
+        local addr = valid(cls) and try(function() return cls:GetAddress() end)
+        if addr and vkInstSent[cn] ~= addr then
+            local cmd = cn == "BP_BCRestorationUIComponent_C" and "restclass" or "vestmenu"
+            if vkCmd(string.format("%s %X", cmd, addr)) then vkInstSent[cn] = addr; log(string.format("vestige: %s class at 0x%X (from an open instance) sent to CoopNative", cn, addr)) end
+        end
+    end
+end
+local function sendVestMenus() end   -- (kit 250: done by sendRestoreClass)
 
 -- Keep a guest dying instead of dead (keep_dying=1, both PCs, R5 v2). Patching the guest's death sequence after a respawn left him
 -- without input (session 8), so CoopNative vetoes the final death for the characters listed in CoopNative.protect while the host
@@ -745,14 +854,30 @@ pcall(function()
             local mine = voteMineAt and os.clock() - voteMineAt < 40
             log("teleport vote: the host asks (FieldID " .. tostring(fid) .. ", from " .. (fromGuest == "1" and "a guest" or "the host") .. ")" .. (mine and ", our own proposal" or "") .. ": " .. tostring(vtext))
             if vtext == nil or vtext == "" then vtext = (fromGuest == "1" and "Your partner" or "The host") .. " wants to travel to another Mistle." end
-            if not mine then voteOpenDialog(vtext) end
+            if not mine and iniHas("test_autovote=1") then
+                log("teleport vote: answered yes at once (test_autovote)")
+                pcall(fsToHost, 17, 1)
+            elseif not mine then voteOpenDialog(vtext) end
         elseif text and text:find("^CoopVoteEnd:") then
             local ok = text:sub(13) == "1"
             log("teleport vote: over, " .. (ok and "everyone agreed" or "cancelled"))
             voteCloseDialog()
             local reason = text:match("^CoopVoteEnd:0,(.+)$")
-            if not ok and voteMineAt and os.clock() - voteMineAt < 40 then voteLiftOwnFade(); votePopup("Teleport cancelled" .. (reason and (": " .. reason) or "")) end
+            if not ok and memHeld then memSkipHeld("vote cancelled"); votePopup("Memory cancelled" .. (reason and (": " .. reason) or ""))
+            elseif not ok and voteMineAt and os.clock() - voteMineAt < 40 then voteLiftOwnFade(); votePopup("Teleport cancelled" .. (reason and (": " .. reason) or "")) end
             voteMineAt = nil
+        elseif text and text:find("^CoopItemGate:") then
+            pcall(itemGateReceive, text:sub(14))
+        elseif text and text:find("^CoopMemGo:") then
+            pcall(memPlayLocal, text:sub(11), "the host")
+        elseif text and text:find("^CoopMemory:") then
+            pcall(vestigeRelayPlay, text:sub(12), "the host")
+        elseif text and text:find("^CoopItemShow:") then
+            pcall(itemMirrorReceive, text:sub(14), true)
+        elseif text and text:find("^CoopItemHide:") then
+            pcall(itemMirrorReceive, text:sub(14), false)
+        elseif text and text:find("^CoopMapIcons:") then
+            pcall(mapMirrorReceive, text:sub(14))
         elseif text and text:find("^CoopGWall:") then
             local wn, wv = text:match("^CoopGWall:([^:]+):(%d)$")
             if wn then
@@ -1819,9 +1944,32 @@ end
 function voteText(who, fid, pid)
     local dest = voteDestName(fid, pid)
     log("teleport vote: FieldID " .. fid .. ", PointIndex " .. pid .. " = " .. tostring(dest) .. ", proposed by " .. tostring(who))
+    if not dest and fid == 0 then dest = "Home Base" end
     return (who or "Your partner") .. " wants to travel to " .. (dest or "another Mistle") .. ".", dest
 end
+function voteFieldName(fid)
+    local asset
+    for _, cn in ipairs({ "AppGameSingleton", "BP_AppGameSingleton_C" }) do
+        local s = FindFirstOf(cn)
+        local a = valid(s) and try(function() return s.CheckPointDefinition end)
+        if valid(a) and not asset then asset = a end
+    end
+    if not asset then asset = FindFirstOf("CheckPointDefinitionAsset") end
+    if not valid(asset) then return nil end
+    return try(function() return asset.FieldList[fid + 1].FieldDisplayName:ToString() end)
+end
+function voteIsDepths(fid)
+    local fname = voteFieldName(fid)
+    if type(fname) == "string" and fname ~= "" then return fname:find("Depth") ~= nil end
+    return fid == 15
+end
 function voteStart(fid, pid, fromGuest)
+    if iniHas("depths_block=1") and voteIsDepths(fid) then
+        voteState = { fid = fid, pid = pid, fromGuest = fromGuest, at = os.clock(), yes = 0, need = 1 }
+        log("teleport vote: FieldID " .. fid .. " is in the Depths -> refused (depths_block)")
+        voteEnd("travelling into the Depths together is not supported yet")
+        return
+    end
     local guests = voteGuests()
     local need = fromGuest and #guests or #guests   -- host proposes: every guest; a guest proposes: the host + the other guests
     voteState = { fid = fid, pid = pid, fromGuest = fromGuest, at = os.clock(), yes = 0, need = need }
@@ -1844,19 +1992,27 @@ end
 function votePass()
     local v = voteState
     v.passAt = os.clock()
-    local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
-    if c then c:write("votepass\n"); c:close() end
+    if not v.mem and not v.vmem then
+        local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
+        if c then c:write("votepass\n"); c:close() end
+    end
+    if v.vmem then vmemRelease("everyone agreed") end
     voteSendAll("CoopVoteEnd:1")
-    log("teleport vote: everyone agreed -> teleport in a moment")
+    log((v.mem or v.vmem) and "memory vote: everyone agreed -> the memory starts in a moment" or "teleport vote: everyone agreed -> teleport in a moment")
 end
 function voteEnd(why, selfDeclined)
     local v = voteState
     local reason = why
     if selfDeclined then reason = (votePlayerName(localPC()) or "The host") .. " declined" end
     voteSendAll("CoopVoteEnd:0," .. reason)
-    if not selfDeclined then votePopup("Teleport cancelled: " .. why) end
-    log("teleport vote: cancelled (" .. why .. ")")
-    if v and not v.fromGuest then voteLiftOwnFade() end
+    local what = (v and v.mem) and "Memory cancelled" or (v and v.vmem) and "Memory skipped" or "Teleport cancelled"
+    if not selfDeclined then votePopup(what .. ": " .. why) end
+    log(((v and (v.mem or v.vmem)) and "memory vote" or "teleport vote") .. ": cancelled (" .. why .. ")")
+    if v and v.vmem then
+        vmemRelease("vote: " .. why)
+        if vmem and why ~= "not a memory" then vmem.skipAt = os.clock() + 8 end
+    elseif v and v.mem then memSkipHeld("vote cancelled: " .. why)
+    elseif v and not v.fromGuest then voteLiftOwnFade() end
     voteCloseDialog()
     voteState = nil
 end
@@ -1885,7 +2041,13 @@ function voteTick()
     pcall(voteDialogTick, host)
     local v = voteState
     if host and v then
-        if v.passAt and os.clock() - v.passAt > 1.0 then
+        if v.passAt and v.vmem then
+            voteState = nil
+        elseif v.passAt and os.clock() - v.passAt > 1.0 and v.mem then
+            voteState = nil
+            voteSendAll("CoopMemGo:" .. v.mem)
+            memPlayLocal(v.mem, v.fromGuest and "the guest" or "we")
+        elseif v.passAt and os.clock() - v.passAt > 1.0 then
             voteState = nil
             local comp = FindFirstOf("BP_CheckpointUIComponent_C")
             local ok, e = pcall(function() comp:RequestPlayerSpawnToCheckPoint(v.fid, v.pid) end)
@@ -1907,7 +2069,14 @@ function droppedRpcTick()
         local key = actor .. ":" .. fn
         if not droppedSeen[key] or now - droppedSeen[key] > 5 then
             droppedSeen[key] = now
-            if fn == "Server_SetChestState" and iniHas("guest_chest=1") then
+            local near, dist = false, nil
+            if fn == "Server_SetChestState" then near, dist = chestNear(actor, 500) end
+            if fn == "Server_SetChestState" and iniHas("guest_chest=1") and not near then
+                if droppedLines < 100 then
+                    droppedLines = droppedLines + 1
+                    log("chest sync: dropped Server_SetChestState on " .. actor .. " ignored (we are " .. (dist and string.format("%.0f m", dist / 100) or "not") .. " near it: not our opening)")
+                end
+            elseif fn == "Server_SetChestState" and iniHas("guest_chest=1") then
                 local var, num = actor:match("^BP_ItemBox(%d*)_(%d+)$")
                 if num and tonumber(num) < 1000000 then
                     local code = (tonumber(var) or 0) * 1000000 + tonumber(num)
@@ -1932,9 +2101,11 @@ function fallVoiceTick()
     local mine = valid(pc) and try(function() return pc.Pawn end) or nil
     local mn = valid(mine) and name(mine) or ""
     local now = os.clock()
+    local seen = {}
     for _, p in ipairs(FindAllOf("BP_Player_C") or {}) do
         if valid(p) and name(p) ~= mn then
             local n = name(p)
+            seen[n] = true
             local st = fvState[n] or {}
             fvState[n] = st
             local dead = try(function() return helper:IsDeath(p) end) == true
@@ -1942,15 +2113,31 @@ function fallVoiceTick()
                 st.dead = false
                 local mode = try(function() return p.CharacterMovement.MovementMode end)
                 local v = try(function() return p:GetVelocity() end)
-                if mode == 3 and v and v.Z < -1500 then st.fallAt = now end
+                if mode == 3 and v and v.Z < -1500 then
+                    st.fallAt = now
+                    st.loc = try(function() return p:K2_GetActorLocation() end) or st.loc
+                    st.ev = try(function() return p.Death.FallDeathVoice end) or st.ev
+                    st.played = false
+                end
             elseif not st.dead then
                 st.dead = true
-                if st.fallAt and now - st.fallAt < 1.5 then
+                if st.fallAt and now - st.fallAt < 1.5 and not st.played then
+                    st.played = true
                     local ev = try(function() return p.Death.FallDeathVoice end)
                     local ok = valid(ev) and pcall(function() ak:PostEvent(ev, p, false, "") end)
                     log("fall voice: " .. n .. " died falling -> his fall-death scream " .. (ok and "played here" or ("not played (event " .. tostring(valid(ev)) .. ")")))
                 end
             end
+        end
+    end
+    for n, st in pairs(fvState) do
+        if not seen[n] then
+            if st.fallAt and now - st.fallAt < 2 and not st.played and st.loc then
+                st.played = true
+                local ok = valid(st.ev) and pcall(function() ak:PostEventAtLocation(st.ev, st.loc, { Pitch = 0, Yaw = 0, Roll = 0 }, "", localPC()) end)
+                log("fall voice: " .. n .. " vanished while falling -> his fall-death scream " .. (ok and "played where he fell" or ("not played (event " .. tostring(valid(st.ev)) .. ")")))
+            end
+            if not st.fallAt or now - st.fallAt > 5 then fvState[n] = nil end
         end
     end
 end
@@ -1959,6 +2146,7 @@ function itemCensusTick()
     if not iniHas("item_census=1") then return end
     local now = os.clock()
     if now - icAt < 20 then return end
+    if not streamSettled(now) then return end
     icAt = now
     local pc = localPC()
     local me = valid(pc) and try(function() return pc.Pawn end) or nil
@@ -1991,6 +2179,1245 @@ function itemCensusTick()
     icLines = icLines + 1
     if icLines <= 120 then
         log(string.format("item census: %d field items, %d hidden, %d taken; nearest: %s", total, hidden, got, table.concat(near, " | ")))
+    end
+end
+esState, esAt, esLines = {}, -1000, 0
+function enemyStateTick()
+    if not iniHas("rest_census=1") then return end
+    -- host only (2026-11-21): on a guest this probe reads every enemy right after a reload, while his game is still re-attaching them to
+    -- the host's; his scripting layer crashed both times it ran there (11-20 09:50 teleport arrival, 11-21 10:34 rest reload, UE4SS+0xC77370)
+    local gsx = FindFirstOf("BP_AppGameState_C")
+    if not (valid(gsx) and try(function() return gsx.Role end) == 3) then return end
+    local now = os.clock()
+    if now - esAt < 1 then return end
+    if not streamSettled(now) then return end
+    esAt = now
+    local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+    for _, e in ipairs(FindAllOf("EnemyCommonBase") or {}) do
+        if valid(e) then
+            local n = name(e)
+            local s = string.format("dead=%s vis=%s tick=%s coll=%s", tostring(try(function() return helper:IsDeath(e) end) == true),
+                tostring(try(function() return e.Mesh:IsVisible() end)), tostring(try(function() return e:IsActorTickEnabled() end)),
+                tostring(try(function() return e:GetActorEnableCollision() end)))
+            if esState[n] ~= s then
+                if esState[n] ~= nil and s:find("^dead=true") and os.clock() - (esKillWinAt or -1000) > 30 then
+                    esKillWinAt = os.clock()
+                    local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
+                    if c then c:write("killwin\n"); c:close() end
+                end
+                if esState[n] ~= nil and esLines < 400 then
+                    esLines = esLines + 1
+                    log("enemy state: " .. n .. " " .. esState[n] .. " -> " .. s)
+                end
+                esState[n] = s
+            end
+        end
+    end
+end
+lrAt, lrLast, lrFlag, lrLines = -1000, nil, nil, 0
+function levelResetProbe(force)
+    if not iniHas("rest_census=1") then return end
+    local now = os.clock()
+    if not force and now - lrAt < 3 then return end
+    lrAt = now
+    local dm = FindFirstOf("DebugMenuComponent") or StaticFindObject("/Script/Extensions.Default__DebugMenuComponent")
+    local v = valid(dm) and try(function() return dm:GetLevelsToBeReset("") end)
+    local s = v ~= nil and tostring(try(function() return v:ToString() end) or v) or "n/a"
+    local gi = FindFirstOf("AppGameInstance")
+    local fv = valid(gi) and try(function() return gi:GetFlagToResetWithEnemy() end)
+    local fs = fv ~= nil and tostring(try(function() return fv:ToString() end) or fv) or "n/a"
+    if (s ~= lrLast or fs ~= lrFlag or force) and lrLines < 200 then
+        lrLines = lrLines + 1
+        log("level reset: levels to be reset = [" .. s:sub(1, 400) .. "], flag to reset with enemy = " .. fs:sub(1, 120) .. (force and " (at the rest)" or ""))
+    end
+    lrLast, lrFlag = s, fs
+end
+esHookDone = false
+function enemySpawnHookSetup()
+    if esHookDone or not iniHas("rest_census=1") then return end
+    esHookDone = true
+    local ok, e = pcall(function()
+        RegisterHook("/Script/Extensions.EnemyCommonBase:Multicast_SpawnRPC", function(ctx)
+            esLines = esLines + 1
+            if esLines > 400 then return end
+            local c = try(function() return ctx:get() end)
+            log("enemy state: Multicast_SpawnRPC on " .. (valid(c) and name(c) or "?"))
+        end)
+    end)
+    log("enemy state: Multicast_SpawnRPC hook " .. (ok and "registered" or ("not available (" .. tostring(e):sub(1, 80) .. ")")))
+end
+pcall(enemySpawnHookSetup)
+-- Single-player rest reset in co-op (rest_reload=1, host; owner 2026-11-21: "build the single-player-style rest reset"). Alone, every rest
+-- reloads the area's _Enemy levels from disk = the complete reset; online the game skips that (its zone streaming stops at a co-op
+-- check). CoopNative lets the zone streaming run like single-player from the rest start. This part (1) tells CoopNative when that is
+-- safe: we are the host and every guest is within 40 m, so no level under a guest can unload; (2) watches the rest's enemy levels:
+-- they unload and come back (the game's own reset, logged with how many enemies are new objects) -> zone streaming back to the co-op
+-- behaviour; the rest ends (the EnemyLevelResetByCheckPoint channel opens again) without an unload -> the same, logged as "no reload".
+-- A teleport from the Mistle menu hands over to the teleport gate, which owns the zone streaming switch from then on.
+RR_NEAR = 4000
+rrOk, rrSeq, rrState, rrLines = nil, nil, nil, 0
+pcall(function() os.remove(WIN64 .. "\\plugins\\CoopNative.restreload") end)
+local function rrLog(s) if rrLines < 150 then rrLines = rrLines + 1; log("rest reload: " .. s) end end
+local function rrEnemyLevels(withLevel)
+    local out = {}
+    for _, l in ipairs(FindAllOf("LevelStreamingKismet") or {}) do
+        if valid(l) then
+            local pkg = try(function() return l:GetWorldAssetPackageFName():ToString() end)
+            local n = type(pkg) == "string" and (pkg:match("[^/]+$") or pkg) or ""
+            if n:find("_Enemy", 1, true) then
+                local L = try(function() return l:IsLevelLoaded() end) == true
+                local V = try(function() return l:IsLevelVisible() end) == true
+                local sl = try(function() return l.bShouldBeLoaded end) == true
+                local lvl = withLevel and try(function() return l.LoadedLevel end) or nil
+                local la = valid(lvl) and try(function() return lvl:GetAddress() end) or nil
+                if L or sl then out[n] = { L = L, V = V, lvl = la } end
+            end
+        end
+    end
+    return out
+end
+local function rrEnemies()
+    local s, n = {}, 0
+    for _, e in ipairs(FindAllOf("EnemyCommonBase") or {}) do
+        local a = valid(e) and try(function() return e:GetAddress() end)
+        if a then s[a] = true; n = n + 1 end
+    end
+    return s, n
+end
+local function rrChannelOpen()
+    local sm = FindFirstOf("AppSessionManager")
+    if not valid(sm) then return nil end
+    return try(function() return sm:ExpectsBeOpenRaw(ENEMYRESET) end)
+end
+local function rrFinish(msg)
+    rrLog("#" .. tostring(rrState and rrState.seq) .. " " .. msg .. " -> zone streaming back to the game's co-op behaviour")
+    tgCmd("fieldstream 0")
+    rrState = nil
+end
+-- Guest part (2026-11-22, owner: "i tried resting twice in sucession and his game crashed"): the second reload unloaded his enemy levels
+-- 0.7 s after his game had shown them again, while their characters were still in setup ("Assertion failed: bRegistered",
+-- ActorComponent.cpp:753, on an EnemyContextComponent). His game counts its reloads (his _Enemy levels gone, then all loaded and shown,
+-- nothing streaming, and the game's own count of characters in setup back at 0 - CoopNative.setupcount) and reports done*2+busy to the
+-- host (kind 19) on every change and every 2 s; the host lets the next rest reload only when he has finished the last one.
+rrGuest, rrNeed = nil, nil
+-- after a travel (join, teleport, area change: ClientTravelInternal) the guest-side readers wait until his world has settled again
+-- (our character there and nothing streaming), so they never read objects of the world that is being torn down
+travelSettledAt = -1
+function worldSettledAfterTravel(now)
+    if coopTravelAt and coopTravelAt > travelSettledAt then
+        local pc = localPC()
+        local me = valid(pc) and try(function() return pc.Pawn end) or nil
+        if not (valid(me) and name(me):find("BP_Player_C", 1, true) and streamSettled(now)) then return false end
+        travelSettledAt = now
+    end
+    return true
+end
+grState, grDone, grSent, grSentAt, grLines = "idle", 0, nil, -1000, 0
+function restReloadGuestTick(now)
+    if not worldSettledAfterTravel(now) then return end
+    local cur = rrEnemyLevels(false)
+    local any, gone, back = false, false, true
+    for _, c in pairs(cur) do
+        any = true
+        if not c.L then gone = true end
+        if not (c.L and c.V) then back = false end
+    end
+    local f = io.open(WIN64 .. "\\plugins\\CoopNative.setupcount", "r")
+    local sc = f and tonumber(f:read("*l") or "") or 0
+    if f then f:close() end
+    if grState == "idle" and gone then
+        grState = "reloading"
+        if grLines < 100 then grLines = grLines + 1; log("rest reload (guest): the host's reset reloads our enemy levels") end
+    elseif grState == "reloading" and any and back and sc <= 0 and streamSettled(now) then
+        grState, grDone = "idle", grDone + 1
+        if grLines < 100 then grLines = grLines + 1; log("rest reload (guest): enemy levels back and every character set up (#" .. grDone .. ")") end
+    end
+    local v = grDone * 2 + ((grState == "reloading" or sc > 0) and 1 or 0)
+    if v ~= grSent or now - grSentAt > 2 then
+        grSent, grSentAt = v, now
+        pcall(fsToHost, 19, v % 16777216)
+    end
+end
+function restReloadTick()
+    if not iniHas("rest_reload=1") then return end
+    local now = os.clock()
+    local gsr = FindFirstOf("BP_AppGameState_C")
+    local roler = valid(gsr) and try(function() return gsr.Role end) or nil
+    if roler ~= nil and roler ~= 3 then pcall(restReloadGuestTick, now); return end
+    if not rrState then
+        local ok, why = false, "not the host"
+        local gs = FindFirstOf("BP_AppGameState_C")
+        if valid(gs) and try(function() return gs.Role end) == 3 then
+            local pc = localPC()
+            local me = valid(pc) and try(function() return pc.Pawn end) or nil
+            local ma = valid(me) and try(function() return me:GetAddress() end)
+            local ml = valid(me) and try(function() return me:K2_GetActorLocation() end)
+            local guests, far = 0, nil
+            for _, p in ipairs(FindAllOf("BP_Player_C") or {}) do
+                local pa = valid(p) and try(function() return p:GetAddress() end)
+                local ctl = pa and pa ~= ma and try(function() return p.Controller end) or nil
+                if valid(ctl) then
+                    guests = guests + 1
+                    local pl = try(function() return p:K2_GetActorLocation() end)
+                    if ml and pl then
+                        local d = math.sqrt((ml.X - pl.X) ^ 2 + (ml.Y - pl.Y) ^ 2 + (ml.Z - pl.Z) ^ 2)
+                        if d > RR_NEAR then far = string.format("%s %.0f m away", name(p), d / 100) end
+                    else
+                        far = name(p) .. " without a position"
+                    end
+                end
+            end
+            local g = rrGuest
+            if guests == 0 then why = "alone (the game's own rest reset runs)"
+            elseif far then why = "a guest is not near (" .. far .. ")"
+            elseif not g then why = "no report from the guest's game yet"
+            elseif rrNeed and g.done < rrNeed then why = "the guest's game is still loading the enemies of the last reset"
+            elseif g.busy then why = "the guest's game is still setting up characters"
+            else ok, why = true, guests .. " guest(s) within " .. (RR_NEAR / 100) .. " m, their game ready" end
+        end
+        if ok ~= rrOk then
+            rrOk = ok
+            tgCmd("restreload_ok " .. (ok and 1 or 0))
+            rrLog((ok and "allowed: " or "not now: ") .. why)
+        end
+    end
+    local f = io.open(WIN64 .. "\\plugins\\CoopNative.restreload", "r")
+    local seq = f and f:read("*l") or nil
+    if f then f:close() end
+    if seq and seq ~= rrSeq then
+        rrSeq = seq
+        local lv = rrEnemyLevels(true)
+        local names = {}
+        for n in pairs(lv) do names[#names + 1] = n end
+        table.sort(names)
+        local ea, en = rrEnemies()
+        rrNeed = (rrGuest and rrGuest.done or 0) + 1
+        rrState = { seq = seq, at = now, phase = "wait", lv = lv, names = names, ea = ea, en = en, sawClosed = false }
+        rrLog("#" .. seq .. " watching " .. (#names > 0 and table.concat(names, ", ") or "no enemy level") .. " (" .. en .. " enemies)")
+        if #names == 0 then rrFinish("no enemy level loaded here"); return end
+    end
+    local r = rrState
+    if not r then return end
+    if pendingTp or arrHold then
+        rrLog("#" .. r.seq .. " a teleport started -> the teleport gate takes over the zone streaming")
+        rrState = nil
+        return
+    end
+    local open = rrChannelOpen()
+    if open == false and not r.sawClosed then r.sawClosed = true end
+    local cur = rrEnemyLevels(true)
+    if r.phase == "wait" then
+        local gone = {}
+        for _, n in ipairs(r.names) do
+            local c, o = cur[n], r.lv[n]
+            if not c or not c.L or (o.lvl and c.lvl and c.lvl ~= o.lvl) then gone[#gone + 1] = n end
+        end
+        if #gone > 0 then
+            r.phase = "reload"
+            rrLog(string.format("#%s the game reloads %s (%.1f s after the rest start)", r.seq, table.concat(gone, ", "), now - r.at))
+        elseif open == true and r.sawClosed then
+            rrFinish(string.format("the rest ended after %.1f s without a reload of the enemy levels", now - r.at))
+            return
+        end
+    end
+    if r.phase == "reload" then
+        local back = true
+        for _, n in ipairs(r.names) do
+            local c = cur[n]
+            if not (c and c.L and c.V) then back = false end
+        end
+        if back and streamSettled(now) then
+            local ea, en = rrEnemies()
+            local new = 0
+            for a in pairs(ea) do if not r.ea[a] then new = new + 1 end end
+            rrFinish(string.format("enemy levels back %.1f s after the rest start: %d enemies (%d before), %d of them new objects", now - r.at, en, r.en, new))
+            return
+        end
+    end
+    if now - r.at > 120 then rrFinish("not finished after 120 s (last resort)") end
+end
+-- Map census (map_census=1, both PCs, research, read-only; owner 2026-11-21: "the map icons (as in mistles, chests, ladders etc.) should
+-- reflect whats on my end"). The map is the radar in its wide view; every field trigger brings its own icon: AFieldTriggerBase
+-- bShouldBeVisible (+0x5A0, set by the radar check, which runs on the server only), RadarDefaultIcon, and a per-class state that picks
+-- the icon (CheckPointState, ChestState, DoorState, SlidingLadderState, WarpPortalState, bMapReleased). The revealed map pieces are
+-- App_GameState.RadarScene.RepAreaOpenedData (replicated). Every 30 s while nothing streams, the full list goes to
+-- plugins\CoopProbe.mapcensus.txt (one line per object, to diff host against guest by name) and a summary line to the log when it changes.
+MC_CLASSES = {
+    { "CheckPointBase", "CheckPointState" }, { "ChestBase", "ChestState" }, { "DoorBase", "DoorState" },
+    { "SlidingLadderBase", "SlidingLadderState" }, { "LadderBase", nil }, { "SwitchBase", nil },
+    { "WarpPortalBase", "WarpPortalState" }, { "RadarMapReleaser", "bMapReleased" }, { "ScenarioPlayFieldTrigger", nil },
+}
+mcAt, mcLastSum, mcLines = -1000, nil, 0
+function mapCensusTick()
+    if not iniHas("map_census=1") then return end
+    local now = os.clock()
+    if now - mcAt < 30 then return end
+    if not streamSettled(now) or tpfOnAt ~= nil then return end
+    mcAt = now
+    local gs = FindFirstOf("BP_AppGameState_C")
+    local role = (valid(gs) and try(function() return gs.Role end) == 3) and "host" or "guest"
+    local rows, sums, seen = {}, {}, {}
+    for _, k in ipairs(MC_CLASSES) do
+        local n, vis, st, saved = 0, 0, {}, 0
+        for _, o in ipairs(FindAllOf(k[1]) or {}) do
+            local a = valid(o) and try(function() return o:GetAddress() end)
+            if a and not seen[a] then
+                seen[a] = true
+                n = n + 1
+                local v = try(function() return o.bShouldBeVisible end) == true
+                if v then vis = vis + 1 end
+                local mhs = try(function() return o.HoldState end)
+                if valid(mhs) and try(function() return mhs:GetBooldata("VisibleOnRadar") end) == true then saved = saved + 1 end
+                local s = k[2] and tostring(try(function() return o[k[2]] end)) or "-"
+                st[s] = (st[s] or 0) + 1
+                local hid = try(function() return o.bHidden end) == true
+                local icon = valid(try(function() return o.RadarDefaultIcon end)) and 1 or 0
+                local loc = try(function() return o:K2_GetActorLocation() end)
+                rows[#rows + 1] = string.format("%s\t%s\tstate=%s\tradar=%s\thidden=%s\ticon=%d\t%s", k[1], name(o), s, v and 1 or 0,
+                    hid and 1 or 0, icon, loc and string.format("%.0f,%.0f,%.0f", loc.X, loc.Y, loc.Z) or "?")
+            end
+        end
+        local sp = {}
+        for s, c in pairs(st) do sp[#sp + 1] = s .. "x" .. c end
+        table.sort(sp)
+        sums[#sums + 1] = string.format("%s %d (radar %d, saved %d; %s)", k[1], n, vis, saved, table.concat(sp, " "))
+    end
+    local area = "?"
+    local rs = valid(gs) and try(function() return gs.RadarScene end)
+    local arr = valid(rs) and try(function() return rs.RepAreaOpenedData end)
+    if arr then
+        local cnt = try(function() return arr:GetArrayNum() end) or 0
+        local hex, nz = {}, 0
+        for i = 1, cnt do
+            local b = try(function() return arr[i] end) or 0
+            if b ~= 0 then nz = nz + 1 end
+            hex[#hex + 1] = string.format("%02X", b)
+        end
+        area = string.format("%d bytes, %d not zero", cnt, nz)
+        rows[#rows + 1] = "RadarScene\tRepAreaOpenedData\t" .. table.concat(hex)
+    end
+    table.sort(rows)
+    local f = io.open(WIN64 .. "\\plugins\\CoopProbe.mapcensus.txt", "w")
+    if f then f:write(os.date("%H:%M:%S") .. " " .. role .. "\n" .. table.concat(rows, "\n") .. "\n"); f:close() end
+    local sum = role .. ": " .. table.concat(sums, " | ") .. " | map pieces " .. area
+    if sum ~= mcLastSum and mcLines < 60 then
+        mcLines = mcLines + 1
+        log("map census: " .. sum)
+    end
+    mcLastSum = sum
+end
+-- Map mirror (map_mirror=1, both PCs; owner 2026-11-22: the guest "is missing 98% of the icons that i have on the ridge ... it should
+-- reflect whats on my end"). The 11-22 map census: host and guest have the SAME field triggers in the SAME states and the same revealed
+-- map pieces; only AFieldTriggerBase.bShouldBeVisible (+0x5A0, "show this on the map") differs: set by the radar check on the host for
+-- nearly everything, on the guest only for what he stood next to (it is not replicated). The host sends the keys (<level world>:<actor>)
+-- of every field trigger shown on its map to the guests (ClientMessage "CoopMapIcons:k;k;..." in chunks, new ones only, everything again
+-- for a new guest, an unloaded object is sent again when it comes back); the guest switches bShouldBeVisible on for those objects and
+-- keeps the list, so reloaded copies get it again. Covers Mistles (rotten and restored), chests, doors, ladders, switches, area portals,
+-- map releasers and field items (all AFieldTriggerBase). Nothing is ever switched off.
+local function mmKey(o)
+    local lv = try(function() return o:GetOuter() end)
+    local w = valid(lv) and try(function() return lv:GetOuter() end) or nil
+    return (valid(w) and name(w) or "?") .. ":" .. name(o)
+end
+mmSent, mmHostAt, mmGuestKey, mmLines = {}, -1000, nil, 0
+mmWant, mmWantN, mmGuestAt = {}, 0, -1000
+function mapMirrorHostTick()
+    if not iniHas("map_mirror=1") then return end
+    local now = os.clock()
+    if now - mmHostAt < 2 then return end
+    if not streamSettled(now) or tpfOnAt ~= nil then return end
+    mmHostAt = now
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not (valid(gs) and try(function() return gs.Role end) == 3) then return end
+    local guests = voteGuests()
+    if #guests == 0 then mmSent, mmGuestKey = {}, nil; return end
+    local gk = {}
+    for _, c in ipairs(guests) do gk[#gk + 1] = tostring(try(function() return c:GetAddress() end)) end
+    gk = table.concat(gk, ",")
+    if gk ~= mmGuestKey then mmSent, mmGuestKey = {}, gk end
+    local present, new = {}, {}
+    for _, o in ipairs(FindAllOf("FieldTriggerBase") or {}) do
+        if valid(o) and try(function() return o.bShouldBeVisible end) == true then
+            local k = mmKey(o)
+            present[k] = true
+            if not mmSent[k] then new[#new + 1] = k end
+        end
+    end
+    for k in pairs(mmSent) do if not present[k] then mmSent[k] = nil end end
+    if #new == 0 then return end
+    local chunk, len, sent = {}, 0, 0
+    local function flush()
+        if #chunk > 0 then voteSendAll("CoopMapIcons:" .. table.concat(chunk, ";")); sent = sent + #chunk; chunk, len = {}, 0 end
+    end
+    for _, k in ipairs(new) do
+        mmSent[k] = true
+        if len + #k > 900 then flush() end
+        chunk[#chunk + 1] = k
+        len = len + #k + 1
+    end
+    flush()
+    if mmLines < 80 then mmLines = mmLines + 1; log("map mirror: sent " .. sent .. " icon(s) shown on our map to " .. #guests .. " guest(s)") end
+end
+function mapMirrorReceive(text)
+    local n = 0
+    for k in text:gmatch("[^;]+") do
+        if not mmWant[k] then mmWant[k] = true; mmWantN = mmWantN + 1; n = n + 1 end
+    end
+    if mmLines < 80 then mmLines = mmLines + 1; log("map mirror: the host shows " .. n .. " more icon(s) (" .. mmWantN .. " in all)") end
+end
+-- 2026-11-24 (owner chose "a": icons from the host's map, consistent with the shared map areas; his own map = "b", parked): the 11-24
+-- census showed no per-object "discovered" save flag (VisibleOnRadar 0 on all 18 host icons); the icons follow the unlocked map areas
+-- (shared from the host) plus the object's own state. With item_own his level items stay hidden and his own item copies stand in for
+-- them: a copy gets the icon of its level item (key via ioCopies), the hidden level item gets none, so a copy he picked up takes its
+-- icon with it.
+function mapMirrorGuestTick()
+    if not iniHas("map_mirror=1") or mmWantN == 0 then return end
+    local now = os.clock()
+    if now - mmGuestAt < 2 then return end
+    if not streamSettled(now) or tpfOnAt ~= nil or not worldSettledAfterTravel(now) then return end
+    mmGuestAt = now
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if valid(gs) and try(function() return gs.Role end) == 3 then return end
+    local on, have, copiesOn = 0, 0, 0
+    local itemsOwn = iniHas("item_own=1")
+    for _, o in ipairs(FindAllOf("FieldTriggerBase") or {}) do
+        local a = valid(o) and try(function() return o:GetAddress() end)
+        if a then
+            local ck = ioCopies and ioCopies[a]
+            if ck then
+                if mmWant[ck] and try(function() return o.bShouldBeVisible end) ~= true and pcall(function() o.bShouldBeVisible = true end) then copiesOn = copiesOn + 1 end
+            elseif itemsOwn and try(function() return o.ItemCount end) ~= nil then
+                if try(function() return o.bShouldBeVisible end) == true then pcall(function() o.bShouldBeVisible = false end) end
+            else
+                local k = mmKey(o)
+                if mmWant[k] then
+                    have = have + 1
+                    if try(function() return o.bShouldBeVisible end) ~= true and pcall(function() o.bShouldBeVisible = true end) then on = on + 1 end
+                end
+            end
+        end
+    end
+    on = on + copiesOn
+    if on > 0 and mmLines < 80 then
+        mmLines = mmLines + 1
+        log("map mirror: " .. on .. " icon(s) switched on like on the host's map (" .. have .. " of " .. mmWantN .. " wanted objects are here)")
+    end
+end
+-- Test commands (owner 2026-11-22: "are you capable of performing these tests on your own? ... go ahead"). Written into
+-- plugins\CoopProbe.cmd by the test scripts outside the game; every result goes to the log with the prefix "test:".
+--   uidump            every UserWidget (class, name, in viewport, visible) and the functions of each game widget class
+--                     -> plugins\CoopProbe.uidump.txt (to find the title screen's Continue)
+--   t_status          our character: position, health, players, enemies, the nearest Mistle
+--   t_rest            presses "decide" at the nearest Mistle within 6 m (AFieldTriggerBase:ProcessInputButtonEvent(PressDecide, us, true))
+--   t_kill <n>        host: the n nearest living enemies die through the game's own death path (CharacterHelper:RequestTryExecuteDeath)
+--   t_tp <fid> <pid>  host: Mistle teleport through the checkpoint UI component (the vote runs as for a menu teleport)
+--   t_census          the map census now
+--   t_call <class> <function>   calls a function without arguments on the first object of that class (research)
+--   t_give <asset> [n]  gives our character n (1) of an item through the game's own CharacterHelper:GetItemOrWeaponOrJinkaku; <asset> is
+--                     a full object path or a BloodCrystal data asset name (e.g. DA_Item_BloodCrystal_BrokenNormal_19 = Fionn's vestige A)
+-- test_autovote=1 (guest): a teleport vote from the host is answered "yes" at once instead of opening the dialog.
+local function tcMe()
+    local pc = localPC()
+    local me = valid(pc) and try(function() return pc.Pawn end) or nil
+    local loc = valid(me) and try(function() return me:K2_GetActorLocation() end) or nil
+    return me, loc
+end
+local function tcDist(a, b) return math.sqrt((a.X - b.X) ^ 2 + (a.Y - b.Y) ^ 2 + (a.Z - b.Z) ^ 2) end
+local function tcNearest(cls, loc, filter)
+    local best, bd = nil, nil
+    for _, o in ipairs(FindAllOf(cls) or {}) do
+        if valid(o) and (not filter or filter(o)) then
+            local l = try(function() return o:K2_GetActorLocation() end)
+            if l then
+                local d = tcDist(loc, l)
+                if not bd or d < bd then best, bd = o, d end
+            end
+        end
+    end
+    return best, bd
+end
+function uiDump()
+    local rows, classes, order = {}, {}, {}
+    for _, w in ipairs(FindAllOf("UserWidget") or {}) do
+        if valid(w) then
+            local cls = try(function() return w:GetClass() end)
+            local cn = valid(cls) and try(function() return cls:GetFullName() end) or "?"
+            local inv = try(function() return w:IsInViewport() end)
+            local vis = try(function() return w:IsVisible() end)
+            rows[#rows + 1] = string.format("%s\t%s\tviewport=%s\tvisible=%s", cn, name(w), tostring(inv), tostring(vis))
+            if valid(cls) and cn:find("/Game/", 1, true) and not classes[cn] then
+                local fns = {}
+                pcall(function() cls:ForEachFunction(function(f) fns[#fns + 1] = name(f) end) end)
+                classes[cn] = fns
+                order[#order + 1] = cn
+            end
+        end
+    end
+    table.sort(rows)
+    local f = io.open(WIN64 .. "\\plugins\\CoopProbe.uidump.txt", "w")
+    if f then
+        f:write(table.concat(rows, "\n") .. "\n\n")
+        for _, cn in ipairs(order) do f:write("== " .. cn .. "\n  " .. table.concat(classes[cn], "\n  ") .. "\n") end
+        f:close()
+    end
+    log("test: uidump: " .. #rows .. " widgets, " .. #order .. " game widget classes -> CoopProbe.uidump.txt")
+end
+function testCommand(c)
+    if c == "uidump" then uiDump(); return end
+    local me, loc = tcMe()
+    local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+    if c == "t_status" then
+        local players, enemies, alive = 0, 0, 0
+        for _, p in ipairs(FindAllOf("BP_Player_C") or {}) do if valid(p) then players = players + 1 end end
+        for _, e in ipairs(FindAllOf("EnemyCommonBase") or {}) do
+            if valid(e) then enemies = enemies + 1; if try(function() return helper:IsDeath(e) end) ~= true then alive = alive + 1 end end
+        end
+        local hp = valid(me) and try(function() return helper:GetHealth(me) end)
+        local m, md = loc and tcNearest("CheckPointBase", loc) or nil, nil
+        if loc and m then md = tcDist(loc, try(function() return m:K2_GetActorLocation() end) or loc) end
+        log(string.format("test: status: %s at %s, health %s, %d player character(s), %d enemies (%d alive), nearest Mistle %s %s m",
+            valid(me) and name(me) or "no character", loc and string.format("%.0f,%.0f,%.0f", loc.X, loc.Y, loc.Z) or "?", tostring(hp),
+            players, enemies, alive, m and name(m) or "-", md and string.format("%.1f", md / 100) or "?"))
+    elseif c == "t_rest" then
+        if not loc then log("test: rest: no character"); return end
+        local m, d = tcNearest("CheckPointBase", loc)
+        if not m or d > 600 then log("test: rest: no Mistle within 6 m (" .. (d and string.format("%.0f m", d / 100) or "none") .. ")"); return end
+        local ok, e = pcall(function() m:ProcessInputButtonEvent(0, me, true) end)
+        log("test: rest: decide at " .. name(m) .. string.format(" (%.1f m) -> ", d / 100) .. (ok and "called" or ("ERROR " .. tostring(e):sub(1, 120))))
+    elseif c:find("^t_kill") then
+        local n = tonumber(c:match("^t_kill%s+(%d+)")) or 1
+        if not loc then log("test: kill: no character"); return end
+        local list = {}
+        for _, e in ipairs(FindAllOf("EnemyCommonBase") or {}) do
+            if valid(e) and try(function() return helper:IsDeath(e) end) ~= true then
+                local l = try(function() return e:K2_GetActorLocation() end)
+                if l then list[#list + 1] = { e = e, d = tcDist(loc, l) } end
+            end
+        end
+        table.sort(list, function(a, b) return a.d < b.d end)
+        local done = {}
+        for i = 1, math.min(n, #list) do
+            local e = list[i].e
+            local ok = pcall(function() helper:RequestTryExecuteDeath(me, e, 0, false, true) end)
+            done[#done + 1] = name(e) .. string.format(" %.0f m", list[i].d / 100) .. (ok and "" or " (ERROR)")
+        end
+        log("test: kill: " .. #done .. " of " .. #list .. " living enemies: " .. table.concat(done, ", "))
+    elseif c:find("^t_tp") then
+        local fid, pid = c:match("^t_tp%s+(%d+)%s+(%d+)")
+        fid, pid = tonumber(fid), tonumber(pid)
+        if not fid then log("test: tp: usage t_tp <fid> <pid>"); return end
+        local comp = FindFirstOf("BP_CheckpointUIComponent_C")
+        local ok, e = pcall(function() comp:RequestPlayerSpawnToCheckPoint(fid, pid) end)
+        log("test: tp: FieldID " .. fid .. ", PointIndex " .. pid .. " -> " .. (ok and "called" or ("ERROR " .. tostring(e):sub(1, 120))))
+    elseif c == "t_census" then
+        mcAt = -1000
+        pcall(mapCensusTick)
+        log("test: census done")
+    elseif c:find("^t_give ") then
+        local asset, n = c:match("^t_give%s+(%S+)%s*(%d*)")
+        n = tonumber(n) or 1
+        local path = asset
+        if not path:find("/", 1, true) then path = "/Game/Items/Category/BloodCrystal/" .. path end
+        if not path:find(".", 1, true) then path = path .. "." .. path:match("([^/]+)$") end
+        local art = StaticFindObject(path)
+        if not valid(art) then pcall(function() art = LoadAsset(path) end) end
+        local me = tcMe()
+        local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+        if not (valid(art) and valid(me) and valid(helper)) then
+            log("test: t_give " .. path .. " -> not possible (item " .. tostring(valid(art)) .. ", our character " .. tostring(valid(me)) .. ", helper " .. tostring(valid(helper)) .. ")")
+        else
+            local before = try(function() return helper:GetItemCount(me, art) end)
+            local ok, e = pcall(function() helper:GetItemOrWeaponOrJinkaku(me, art, n, 0, 0) end)
+            local after = try(function() return helper:GetItemCount(me, art) end)
+            log("test: t_give " .. path .. " x" .. n .. " -> " .. (ok and "given" or ("ERROR " .. tostring(e):sub(1, 120))) .. " (count " .. tostring(before) .. " -> " .. tostring(after) .. ")")
+        end
+    elseif c:find("^t_call ") then
+        local cls, fn = c:match("^t_call%s+(%S+)%s+(%S+)")
+        local o = cls and FindFirstOf(cls)
+        if not valid(o) then log("test: call: no " .. tostring(cls)); return end
+        local ok, r = pcall(function() return o[fn](o) end)
+        log("test: call " .. cls .. ":" .. fn .. " on " .. name(o) .. " -> " .. (ok and ("ok " .. tostring(r)) or ("ERROR " .. tostring(r):sub(1, 160))))
+    else
+        log("test: unknown command " .. c)
+    end
+end
+-- Auto continue (auto_continue=1, both PCs; owner 2026-11-22: "put on a few hooks to see what exactly happens on boot up and when i
+-- press on continue. then we can work on calling only the continue function from the getgo"). The boot trace of 11-22 22:19: the logo
+-- screen (BP_TitleCreditUIComponent) closes itself after ~6 s; Press Any Key resets the network mode and asks for the EULA; Online
+-- calls TitleMenuUIComponent:SetSelectedAppNetworkMode(Online = 0) + RequestAppNetworkModeDecision; the title menu checks the save
+-- infos; Continue calls the component's own Blueprint function RequestContinue -> ContinueGame -> AppSaveManager:Load(0) -> loading.
+-- At the first boot this runs the same calls without the screens: the logo screen is closed through its own Close(false, true) as
+-- soon as it is up; once the title menu component exists, Online is chosen and decided; when the game says Continue is possible
+-- (IsEnableContinue), RequestContinue is called once. If Continue is not possible 10 s after the network decision, the decision is
+-- made once more (in case a title screen reset it). Off for this run once our character is in the world, or after 90 s; every step
+-- is logged ("auto continue:").
+acState, acT0, acAt, acNetAt, acNetTries, acCreditDone = "boot", nil, -1000, nil, 0, false
+local function acLog(s) log("auto continue: " .. s) end
+function autoContinueTick()
+    if acState == "done" or not iniHas("auto_continue=1") then return end
+    local now = os.clock()
+    acT0 = acT0 or now
+    local apc = localPC()
+    local ame = valid(apc) and try(function() return apc.Pawn end) or nil
+    if valid(ame) and name(ame):find("BP_Player_C", 1, true) then
+        acLog(string.format("in the world %.1f s after the start -> off for this run", now - acT0))
+        acState = "done"
+        return
+    end
+    if now - acT0 > 90 then acLog("not in the world after 90 s (state " .. acState .. ") -> off"); acState = "done"; return end
+    if now - acAt < 0.5 then return end
+    acAt = now
+    if not acCreditDone then
+        local cr = FindFirstOf("BP_TitleCreditUIComponent_C") or FindFirstOf("TitleCreditUIComponent")
+        if valid(cr) then
+            acCreditDone = true
+            local ok, e = pcall(function() cr:Close(false, true) end)
+            acLog("logo screen " .. name(cr) .. " closed -> " .. (ok and "ok" or ("ERROR " .. tostring(e):sub(1, 100))))
+        end
+    end
+    local tm = FindFirstOf("BP_TitleMenuUIComponent_C") or FindFirstOf("TitleMenuUIComponent")
+    if not valid(tm) then return end
+    if acState == "boot" or (acState == "net" and acNetAt and now - acNetAt > 10 and acNetTries < 2) then
+        local ok1, e1 = pcall(function() tm:SetSelectedAppNetworkMode(0) end)
+        local ok2, e2 = pcall(function() tm:RequestAppNetworkModeDecision() end)
+        acNetAt, acNetTries, acState = now, acNetTries + 1, "net"
+        acLog("Online chosen on " .. name(tm) .. " (SetSelectedAppNetworkMode " .. (ok1 and "ok" or tostring(e1):sub(1, 60)) ..
+            ", RequestAppNetworkModeDecision " .. (ok2 and "ok" or tostring(e2):sub(1, 60)) .. ", try " .. acNetTries .. ")")
+        return
+    end
+    if acState == "net" then
+        local can = try(function() return tm:IsEnableContinue() end)
+        if can == true then
+            local ok, e = pcall(function() tm:RequestContinue() end)
+            acState = "continue"
+            acLog(string.format("Continue possible %.1f s after the start -> RequestContinue %s", now - acT0, ok and "called" or ("ERROR " .. tostring(e):sub(1, 100))))
+        end
+    end
+end
+-- Item mirror (item_mirror=1, both PCs; owner 2026-11-24 after the map icons: items on the ground "not mirrored/working yet"). The 11-24
+-- item census: host and guest have the same field items (AFieldTriggerItemBase), none taken (bGetItem false) on either side, but on the
+-- host they are shown (bHidden false, 24 of 25) and on the guest all hidden: the item's own SetVisibility(true) runs on the host only.
+-- The host sends the keys (<level world>:<actor>) of its shown, untaken items to the guests (ClientMessage "CoopItemShow:k;k;...", new
+-- ones only, everything again for a new guest) and the keys of items that stopped being shown or were taken ("CoopItemHide:..."); the
+-- guest calls the item's own SetVisibility(true/false) on his copy. With boot_trace=1 on his PC, coming within 3 m of a field item
+-- re-arms the native trace (CoopNative "tracereset"), so what his game calls when he tries to pick it up gets logged.
+imSent, imHostAt, imGuestKey, imLines = {}, -1000, nil, 0
+imShow, imHide, imGuestAt, imNearKey = {}, {}, -1000, nil
+function itemMirrorHostTick()
+    if not iniHas("item_mirror=1") then return end
+    local now = os.clock()
+    if now - imHostAt < 2 then return end
+    if not streamSettled(now) or tpfOnAt ~= nil then return end
+    imHostAt = now
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not (valid(gs) and try(function() return gs.Role end) == 3) then return end
+    local guests = voteGuests()
+    if #guests == 0 then imSent, imGuestKey = {}, nil; return end
+    local gk = {}
+    for _, c in ipairs(guests) do gk[#gk + 1] = tostring(try(function() return c:GetAddress() end)) end
+    gk = table.concat(gk, ",")
+    if gk ~= imGuestKey then imSent, imGuestKey = {}, gk end
+    local shown, new, gone = {}, {}, {}
+    for _, it in ipairs(FindAllOf("FieldTriggerItemBase") or {}) do
+        if valid(it) and try(function() return it.bHidden end) == false and try(function() return it.bGetItem end) ~= true then
+            local k = mmKey(it)
+            shown[k] = true
+            if not imSent[k] then new[#new + 1] = k end
+        end
+    end
+    for k in pairs(imSent) do if not shown[k] then gone[#gone + 1] = k; imSent[k] = nil end end
+    local function send(tag, list)
+        local chunk, len = {}, 0
+        for _, k in ipairs(list) do
+            if len + #k > 900 then voteSendAll(tag .. table.concat(chunk, ";")); chunk, len = {}, 0 end
+            chunk[#chunk + 1] = k
+            len = len + #k + 1
+        end
+        if #chunk > 0 then voteSendAll(tag .. table.concat(chunk, ";")) end
+    end
+    for _, k in ipairs(new) do imSent[k] = true end
+    if #new > 0 then send("CoopItemShow:", new) end
+    if #gone > 0 then send("CoopItemHide:", gone) end
+    if (#new > 0 or #gone > 0) and imLines < 80 then
+        imLines = imLines + 1
+        log("item mirror: " .. #new .. " item(s) shown and " .. #gone .. " gone on our side -> told " .. #guests .. " guest(s)")
+    end
+end
+function itemMirrorReceive(text, show)
+    local n = 0
+    for k in text:gmatch("[^;]+") do
+        if show then imShow[k], imHide[k] = true, nil else imShow[k], imHide[k] = nil, true end
+        n = n + 1
+    end
+    if imLines < 80 then imLines = imLines + 1; log("item mirror: the host " .. (show and "shows " or "no longer shows ") .. n .. " item(s)") end
+end
+function itemMirrorGuestTick()
+    if not iniHas("item_mirror=1") then return end
+    local now = os.clock()
+    if now - imGuestAt < 1 then return end
+    if not streamSettled(now) or tpfOnAt ~= nil then return end
+    imGuestAt = now
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if valid(gs) and try(function() return gs.Role end) == 3 then return end
+    local pc = localPC()
+    local me = valid(pc) and try(function() return pc.Pawn end) or nil
+    local ml = valid(me) and try(function() return me:K2_GetActorLocation() end) or nil
+    local on, off, near, nearD = 0, 0, nil, nil
+    for _, it in ipairs(FindAllOf("FieldTriggerItemBase") or {}) do
+        if valid(it) then
+            local k = mmKey(it)
+            local hid = try(function() return it.bHidden end)
+            if imShow[k] and hid == true then
+                if pcall(function() it:SetVisibility(true) end) then on = on + 1 end
+            elseif imHide[k] and hid == false then
+                if pcall(function() it:SetVisibility(false) end) then off = off + 1 end
+            end
+            if ml and hid == false then
+                local l = try(function() return it:K2_GetActorLocation() end)
+                if l then
+                    local d = math.sqrt((ml.X - l.X) ^ 2 + (ml.Y - l.Y) ^ 2 + (ml.Z - l.Z) ^ 2)
+                    if d < 300 and (not nearD or d < nearD) then near, nearD = k, d end
+                end
+            end
+        end
+    end
+    if (on > 0 or off > 0) and imLines < 80 then
+        imLines = imLines + 1
+        log("item mirror: SetVisibility " .. on .. " on, " .. off .. " off, like on the host")
+    end
+    if near ~= imNearKey then
+        imNearKey = near
+        if near and iniHas("boot_trace=1") then
+            tgCmd("tracereset")
+            log(string.format("item mirror: we are %.1f m from %s -> native trace re-armed for the pickup", nearD / 100, near))
+        end
+    end
+end
+-- Story-gated items (2026-11-24, owner: "cyllene already had the eous vestige dropped on her feet at the guest side (it wasnt supposed
+-- to be there until after the boss fight)"): BP_FieldTriggerItemKetsuei_88 (vestige DA_Item_BloodCrystal_BrokenNormal_88) is a level item
+-- the HOST's game keeps hidden until its story allows it; the guest's per-player copies only asked "picked up in his save?" and copied
+-- it. The world and its story are the host's: the host keeps a set of the level items it holds hidden although its save has not picked
+-- them up (added when seen so, removed when seen shown or picked up; kept while unloaded, so streaming never lets one through) and
+-- sends it whole ("CoopItemGate:k;k;...") when it changes, for a new guest and every 20 s. The guest copies none of them (an existing
+-- copy is removed), makes no copies before the first list, and copies a newly loaded item only after 4 s, so the host can report it.
+igSet, igSent, igGuestKey, igAt, igSentAt, igLines = {}, nil, nil, -1000, -1000, 0
+igGated, igGatedN, igGatedSeen = {}, 0, false
+function itemGateHostTick()
+    if not iniHas("item_own=1") then return end
+    local now = os.clock()
+    if now - igAt < 2 then return end
+    if not streamSettled(now) or tpfOnAt ~= nil then return end
+    igAt = now
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not (valid(gs) and try(function() return gs.Role end) == 3) then return end
+    local guests = voteGuests()
+    if #guests == 0 then igSent, igGuestKey = nil, nil; return end
+    local gk = {}
+    for _, c in ipairs(guests) do gk[#gk + 1] = tostring(try(function() return c:GetAddress() end)) end
+    gk = table.concat(gk, ",")
+    for _, it in ipairs(FindAllOf("FieldTriggerItemBase") or {}) do
+        if valid(it) and not name(it):find("LostExp", 1, true) then
+            local k = mmKey(it)
+            local hs = try(function() return it.HoldState end)
+            local fname = try(function() return it.HoldStateFlagName:ToString() end) or "State"
+            local bv = valid(hs) and try(function() return hs:GetBooldata(fname) end)
+            local iv = valid(hs) and try(function() return hs:GetInt32data(fname) end)
+            local picked = bv == true or (type(iv) == "number" and iv ~= 0) or try(function() return it.bGetItem end) == true
+            local hidden = try(function() return it.bHidden end)
+            if hidden == true and not picked then igSet[k] = true
+            elseif hidden == false or picked then igSet[k] = nil end
+        end
+    end
+    local list = {}
+    for k in pairs(igSet) do list[#list + 1] = k end
+    table.sort(list)
+    local msg = table.concat(list, ";")
+    if msg == igSent and gk == igGuestKey and now - igSentAt < 20 then return end
+    local changed = msg ~= igSent or gk ~= igGuestKey
+    igSent, igGuestKey, igSentAt = msg, gk, now
+    voteSendAll("CoopItemGate:" .. msg)
+    if changed and igLines < 60 then igLines = igLines + 1; log("item gate: " .. #list .. " level item(s) held back by our story sent to " .. #guests .. " guest(s)" .. (#list > 0 and (" (" .. list[1] .. (#list > 1 and " ..." or "") .. ")") or "")) end
+end
+function itemGateReceive(text)
+    local first = not igGatedSeen
+    igGatedSeen = true
+    local g, n = {}, 0
+    for k in text:gmatch("[^;]+") do g[k] = true; n = n + 1 end
+    local changed = n ~= igGatedN
+    if not changed then for k in pairs(g) do if not igGated[k] then changed = true; break end end end
+    igGated, igGatedN = g, n
+    if (first or changed) and igLines < 60 then igLines = igLines + 1; log("item gate: the host holds back " .. n .. " level item(s) for its story" .. (n > 0 and (" (" .. (text:match("^[^;]+") or "") .. (n > 1 and " ..." or "") .. ")") or "")) end
+end
+ioSeenAt = {}
+-- Items per player (item_own=1, guest; owner 2026-11-24: "ideally it works similar to the chests, where if the item has already been
+-- picked up in singleplayer, it doesnt show on his end. if i pick up an item, it should still be visible on his end"; then "can't we use
+-- the same function [as for enemy drops]?" -> "lets take the button override out and build the new approach").
+-- Findings 11-24: the level items exist on both PCs, but they belong to the host's game: on the guest they stay hidden, inactive and their
+-- button check ends in "is this the server" (greyed prompt). Enemy drops work for him because each game spawns its OWN drop
+-- (DropItemComponent:SpawnFieldTriggerItem). So for every level item that his own save has not picked up (HoldState bool/int under its
+-- HoldStateFlagName, or bGetItem), his game spawns its own drop-style copy of the same class at the same spot (GameplayStatics:
+-- BeginDeferredActorSpawnFromClass + FinishSpawningActor, with the item, count, grind and degeneration of the level item, SetDropItem(true)
+-- before it starts), shows and activates it, and keeps the level item hidden and inactive. When his copy is gone while its level item is
+-- still there (he picked it up), the level item is marked as picked up in his own save (HoldState bool true, persistent, + the save
+-- event), so it stays gone in his world. A copy whose level item unloaded is destroyed. Copies are tracked by address and matched
+-- against a fresh object list each pass (never a kept object reference). Only after his world has settled; every 2 s; logged.
+ioAt, ioLines, ioLast, ioCopies, ioByKey = -1000, 0, nil, {}, {}
+local function ioLog(s) if ioLines < 120 then ioLines = ioLines + 1; log("items (own save): " .. s) end end
+function itemOwnTick()
+    if not iniHas("item_own=1") then return end
+    local now = os.clock()
+    if now - ioAt < 2 then return end
+    if not streamSettled(now) or tpfOnAt ~= nil or not worldSettledAfterTravel(now) then return end
+    ioAt = now
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not valid(gs) or try(function() return gs.Role end) == 3 then return end
+    if not igGatedSeen then return end   -- no copies before the host's list of story-gated items
+    local gps = StaticFindObject("/Script/Engine.Default__GameplayStatics")
+    local level, objs = {}, {}
+    for _, it in ipairs(FindAllOf("FieldTriggerItemBase") or {}) do
+        local ad = valid(it) and try(function() return it:GetAddress() end)
+        if ad then
+            objs[ad] = it
+            if not ioCopies[ad] and not name(it):find("LostExp", 1, true) then level[#level + 1] = it end
+        end
+    end
+    local spawned, hiddenNow, picked, removed, freeN, pickedN, errs = 0, 0, 0, 0, 0, 0, nil
+    local gatedN = 0
+    local present = {}
+    for _, it in ipairs(level) do
+        local k = mmKey(it)
+        present[k] = true
+        local hs = try(function() return it.HoldState end)
+        local fname = try(function() return it.HoldStateFlagName:ToString() end) or "State"
+        local bv = valid(hs) and try(function() return hs:GetBooldata(fname) end)
+        local iv = valid(hs) and try(function() return hs:GetInt32data(fname) end)
+        local isPicked = bv == true or (type(iv) == "number" and iv ~= 0) or try(function() return it.bGetItem end) == true
+        local gated = igGated[k] == true
+        ioSeenAt[k] = ioSeenAt[k] or now
+        if try(function() return it.bHidden end) == false or try(function() return it.State end) ~= 0 then
+            pcall(function() it:SetVisibility(false) end)
+            pcall(function() it:SetState(0) end)
+            hiddenNow = hiddenNow + 1
+        end
+        local cad = ioByKey[k]
+        local copy = cad and objs[cad] or nil
+        if cad and not copy then
+            -- his copy is gone while the level item is still here: he picked it up
+            ioCopies[cad], ioByKey[k] = nil, nil
+            if not isPicked then
+                pcall(function() hs:SetBooldata(fname, true, true) end)
+                pcall(function() it:HoldStateEvent_OnNotifySave() end)
+                isPicked = true
+                picked = picked + 1
+                ioLog("picked up by us: " .. k .. " -> marked as picked up in our save (HoldState '" .. fname .. "')")
+            end
+        end
+        if isPicked or gated then
+            if isPicked then pickedN = pickedN + 1 else gatedN = gatedN + 1 end
+            if copy then pcall(function() copy:K2_DestroyActor() end); ioCopies[cad], ioByKey[k] = nil, nil; if gated then removed = removed + 1 end end
+        else
+            freeN = freeN + 1
+            if not copy and valid(gps) and now - ioSeenAt[k] >= 4 then
+                local loc = try(function() return it:K2_GetActorLocation() end)
+                local cls = try(function() return it:GetClass() end)
+                if loc and valid(cls) then
+                    local tf = { Rotation = { X = 0, Y = 0, Z = 0, W = 1 }, Translation = { X = loc.X, Y = loc.Y, Z = loc.Z }, Scale3D = { X = 1, Y = 1, Z = 1 } }
+                    local opc = localPC()
+                    local owner = valid(opc) and try(function() return opc.Pawn end) or nil
+                    local ok, c = pcall(function() return gps:BeginDeferredActorSpawnFromClass(it, cls, tf, 1, owner) end)
+                    if ok and valid(c) then
+                        pcall(function() c:SetItemArticle(it.ItemArticle) end)
+                        pcall(function() c.ItemCount = it.ItemCount end)
+                        pcall(function() c.Grind = it.Grind end)
+                        pcall(function() c.DegenerationType = it.DegenerationType end)
+                        pcall(function() c:SetDropItem(true) end)
+                        local okf, ef = pcall(function() gps:FinishSpawningActor(c, tf) end)
+                        pcall(function() c:SetVisibility(true) end)
+                        pcall(function() c:SetState(1) end)
+                        pcall(function() c:ActivateAndUpdateOverlaps() end)
+                        local nad = try(function() return c:GetAddress() end)
+                        if nad then ioCopies[nad], ioByKey[k] = k, nad end
+                        spawned = spawned + 1
+                        if not okf and not errs then errs = "FinishSpawningActor: " .. tostring(ef):sub(1, 100) end
+                    elseif not errs then
+                        errs = "spawn: " .. tostring(c):sub(1, 100)
+                    end
+                end
+            end
+        end
+    end
+    for k in pairs(ioSeenAt) do if not present[k] then ioSeenAt[k] = nil end end
+    for cad, k in pairs(ioCopies) do
+        if not present[k] then
+            local copy = objs[cad]
+            if copy then pcall(function() copy:K2_DestroyActor() end) end
+            ioCopies[cad], ioByKey[k] = nil, nil
+            removed = removed + 1
+        end
+    end
+    local sum = string.format("%d level items: his save %d picked up, %d not; %d held back by the host's story", #level, pickedN, freeN, gatedN)
+    if spawned > 0 or picked > 0 or removed > 0 or hiddenNow > 0 or errs or sum ~= ioLast then
+        ioLog(sum .. string.format("; own copies: %d spawned, %d removed; level items hidden: %d", spawned, removed, hiddenNow) .. (errs and (" | ERROR " .. errs) or ""))
+    end
+    ioLast = sum
+end
+-- Map per player (map_own=1, guest; owner 2026-11-24: "it would make the most sense if it just mirrors whatever his singleplayer state
+-- was, and if there is anything that gets added or changed (he interacts with a new mistle in my world), it just gets saved over on his
+-- world"). Replaces the host-driven map mirror. Every field trigger keeps "shown on the map" in AFieldTriggerBase.bShouldBeVisible; the
+-- game saves it per object under the HoldState name "VisibleOnRadar" (string in the exe next to "bShouldBeVisible"; the map census now
+-- counts both on both PCs to confirm). His game reads that flag from HIS save for every object (for his own item copies: from their level
+-- item) and switches the icon on. The discovery check itself runs on the host only, so his game does it for him: within the object's own
+-- RadarDistanceThreshold / RadarHeightThreshold of his character (50 m / 10 m when unset) the icon goes on and VisibleOnRadar is saved
+-- into his world (persistent, + the save event). Only after his world has settled; every 2 s; logged when something changes.
+MO_KEY = "VisibleOnRadar"
+moAt, moLines, moLast = -1000, 0, nil
+function mapOwnTick()
+    if not iniHas("map_own=1") then return end
+    local now = os.clock()
+    if now - moAt < 2 then return end
+    if not streamSettled(now) or tpfOnAt ~= nil or not worldSettledAfterTravel(now) then return end
+    moAt = now
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not valid(gs) or try(function() return gs.Role end) == 3 then return end
+    local pc = localPC()
+    local me = valid(pc) and try(function() return pc.Pawn end) or nil
+    local ml = valid(me) and try(function() return me:K2_GetActorLocation() end) or nil
+    local all, levelByKey = {}, {}
+    for _, o in ipairs(FindAllOf("FieldTriggerBase") or {}) do
+        local a = valid(o) and try(function() return o:GetAddress() end)
+        if a then
+            all[#all + 1] = { o = o, a = a }
+            if not (ioCopies and ioCopies[a]) then levelByKey[mmKey(o)] = o end
+        end
+    end
+    local total, saved, found, on, examples = 0, 0, 0, 0, {}
+    for _, r in ipairs(all) do
+        local o = r.o
+        total = total + 1
+        local ck = ioCopies and ioCopies[r.a]
+        local src = ck and levelByKey[ck] or o
+        local hs = valid(src) and try(function() return src.HoldState end) or nil
+        local vis = valid(hs) and try(function() return hs:GetBooldata(MO_KEY) end) == true
+        if not vis and ml and valid(hs) then
+            local l = try(function() return o:K2_GetActorLocation() end)
+            if l then
+                local rd = try(function() return o.RadarDistanceThreshold end) or 0
+                local rh = try(function() return o.RadarHeightThreshold end) or 0
+                if rd <= 0 then rd = 5000 end
+                if rh <= 0 then rh = 1000 end
+                local d2 = math.sqrt((ml.X - l.X) ^ 2 + (ml.Y - l.Y) ^ 2)
+                if d2 <= rd and math.abs(ml.Z - l.Z) <= rh then
+                    pcall(function() hs:SetBooldata(MO_KEY, true, true) end)
+                    pcall(function() src:HoldStateEvent_OnNotifySave() end)
+                    vis = true
+                    found = found + 1
+                    if #examples < 4 then examples[#examples + 1] = name(src) end
+                end
+            end
+        end
+        if vis then
+            saved = saved + 1
+            if try(function() return o.bShouldBeVisible end) ~= true and pcall(function() o.bShouldBeVisible = true end) then on = on + 1 end
+        end
+    end
+    local sum = string.format("%d objects, %d known on his own map", total, saved)
+    if (found > 0 or on > 0 or sum ~= moLast) and moLines < 120 then
+        moLines = moLines + 1
+        log("map (own save): " .. sum .. "; " .. on .. " icon(s) switched on" ..
+            (found > 0 and (", " .. found .. " newly discovered here and saved to his world (" .. table.concat(examples, ", ") .. ")") or ""))
+    end
+    moLast = sum
+end
+-- Vestige memories together (vestige_relay=1; owner 2026-11-24: "i'd prefer we do the memory together. and if i already did it, then
+-- i just wont get any blood code from it"). His restoration screen works on his PC (vestige_menu / vestige_keep there too) and gives
+-- him the blood code in his own save. Its memory cannot run on his PC alone (no memory ground on the host -> he falls), so CoopNative
+-- writes the memory's symbol to CoopNative.memreq when his PlayMemoryResidue follows his restoration screen; his CoopProbe sends it to
+-- the host as kind 21 (length) + kind 22 (3 ASCII characters each), and the host plays the same memory
+-- (ScenarioManager:PlayMemoryResidue(world, symbol)); the memory-start group teleport then brings him in next to the host, as after a
+-- boss. (The host's own restorations take the same memory path as before.)
+vrSent, vrLines, vrBuf, vrLen, vrPlayedAt = nil, 0, nil, 0, -1000
+local function vrLog(s) if vrLines < 60 then vrLines = vrLines + 1; log("vestige memory: " .. s) end end
+-- (kit 248) both directions: a memory needs its ground on BOTH PCs (post-boss both games play it). From the host's restoration the host
+-- sends the symbol to the guests ("CoopMemory:<symbol>") and their games play it too; from the guest's restoration his game plays it and
+-- sends it to the host (kinds 21/22), whose game plays it for everyone. CoopNative only reports memories from OUR restoration screen,
+-- so a memory the other game asked for is never sent back.
+function vestigeRelayGuestTick()
+    if not iniHas("vestige_relay=1") then return end
+    local path = WIN64 .. "\\plugins\\CoopNative.memreq"
+    local f = io.open(path, "r")
+    if not f then return end
+    local sym = (f:read("*l") or ""):gsub("%s+$", "")
+    local held = (f:read("*l") or ""):match("^hold (%x+)")
+    f:close(); os.remove(path)
+    if sym == "" then vrLog("our restoration started a memory, but its name was unreadable"); return end
+    local gsv = FindFirstOf("BP_AppGameState_C")
+    local isHost = valid(gsv) and try(function() return gsv.Role end) == 3
+    if held then
+        memHeld = { sym = sym, actor = tonumber(held, 16), at = os.clock() }
+        if isHost then
+            if voteState then
+                vrLog("our restoration starts memory '" .. sym .. "', but a vote is already running -> memory skipped")
+                memSkipHeld("another vote was running"); votePopup("Memory cancelled: another vote is running")
+            else memVoteStart(sym, false) end
+            return
+        end
+        voteMineAt = os.clock()
+        local okAll = pcall(fsToHost, 21, #sym + 1000)
+        for i = 1, #sym, 3 do
+            local a, b, c = sym:byte(i), sym:byte(i + 1) or 0, sym:byte(i + 2) or 0
+            okAll = pcall(fsToHost, 22, a * 65536 + b * 256 + c) and okAll
+        end
+        vrLog("our restoration starts memory '" .. sym .. "' -> held; the host runs the vote (" .. (okAll and "sent" or "send error") .. ")")
+        votePopup("Waiting for the others to agree to watch the memory")
+        return
+    end
+    if isHost then
+        local n = #voteGuests()
+        voteSendAll("CoopMemory:" .. sym)
+        vrLog("our restoration starts memory '" .. sym .. "' -> sent to " .. n .. " guest(s), their games play it too")
+        return
+    end
+    local okAll = pcall(fsToHost, 21, #sym)
+    for i = 1, #sym, 3 do
+        local a, b, c = sym:byte(i), sym:byte(i + 1) or 0, sym:byte(i + 2) or 0
+        okAll = pcall(fsToHost, 22, a * 65536 + b * 256 + c) and okAll
+    end
+    vrLog("our restoration starts memory '" .. sym .. "' -> sent to the host (" .. (okAll and "ok" or "send error") .. ")")
+end
+function vestigeRelayPlay(sym, who)
+    if os.clock() - vrPlayedAt < 30 then vrLog(who .. " asked for memory '" .. sym .. "' again within 30 s -> ignored"); return end
+    vrPlayedAt = os.clock()
+    local smc = StaticFindObject("/Script/Extensions.Default__ScenarioManager")
+    local gs = FindFirstOf("BP_AppGameState_C")
+    local ctx = valid(gs) and gs or localPC()
+    local ok, e = pcall(function() smc:PlayMemoryResidue(ctx, sym) end)
+    vrLog(who .. " restored a vestige: our game plays memory '" .. sym .. "' too -> " .. (ok and "started" or ("ERROR " .. tostring(e):sub(1, 120))))
+end
+function vestigeRelayHostIn(kind, data)
+    if kind == 21 then
+        vrBuf, vrLen, vrVote = "", data % 1000, data >= 1000
+        return
+    end
+    if not vrBuf then return end
+    for _, c in ipairs({ data // 65536, (data // 256) % 256, data % 256 }) do
+        if #vrBuf < vrLen and c > 0 then vrBuf = vrBuf .. string.char(c) end
+    end
+    if #vrBuf < vrLen then return end
+    local sym = vrBuf
+    vrBuf = nil
+    if vrVote then
+        if voteState then
+            vrLog("the guest wants to watch memory '" .. sym .. "', but a vote is already running -> refused")
+            voteSendAll("CoopVoteEnd:0,another vote is running")
+        else memVoteStart(sym, true) end
+        return
+    end
+    vestigeRelayPlay(sym, "the guest")
+end
+-- Memory vote (memory_vote=1; owner 2026-11-24: "can we also do something similar to the teleport vote where before the game starts the
+-- memory segment, it tells every other player that x player wants to watch a memory?"). Runs on the teleport vote's machinery (host-run
+-- state, the same yes/no dialog and answers, 30 s limit): the restorer's memory is held by CoopNative; everyone agreed -> the host sends
+-- "CoopMemGo:<symbol>" and every game starts it (the restorer with its held scenario actor, so its flow goes on after the memory); a no
+-- or no answer -> "CoopVoteEnd:0,..." and the restorer's flow goes on without the memory.
+memHeld = nil
+function memSkipHeld(why)
+    if not memHeld then return end
+    memHeld = nil
+    local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
+    if c then c:write("memskip\n"); c:close() end
+    vrLog("our held memory is not played (" .. tostring(why) .. ")")
+end
+function memVoteStart(sym, fromGuest)
+    local guests = voteGuests()
+    local need = #guests   -- host restores: every guest; a guest restores: the host + the other guests
+    voteState = { mem = sym, fromGuest = fromGuest, at = os.clock(), yes = 0, need = need }
+    log(string.format("memory vote: %s want(s) to watch memory '%s'; %d answer(s) needed", fromGuest and "the guest" or "we", sym, need))
+    if need <= 0 then votePass(); return end
+    local who = fromGuest and votePlayerName(guests[1]) or votePlayerName(localPC())
+    local text = (who or "Your partner") .. " restored a vestige and wants to watch its memory together."
+    voteSendAll(string.format("CoopVote:-1,-1,%d,%s", fromGuest and 1 or 0, text))
+    if fromGuest then voteOpenDialog(text)
+    else votePopup("Waiting for your partner to agree to watch the memory") end
+end
+function memPlayLocal(sym, who)
+    local h = memHeld
+    if h and h.sym == sym then
+        memHeld = nil
+        local act
+        for _, a in ipairs(FindAllOf("ScenarioActor") or {}) do
+            if not act and valid(a) and try(function() return a:GetAddress() end) == h.actor then act = a end
+        end
+        if act then
+            local smc = StaticFindObject("/Script/Extensions.Default__ScenarioManager")
+            local ok, e = pcall(function() smc:PlayMemoryResidue(act, sym) end)
+            vrLog("memory vote passed: our held memory '" .. sym .. "' starts -> " .. (ok and "started" or ("ERROR " .. tostring(e):sub(1, 120))))
+            if ok then vrPlayedAt = os.clock(); return end
+        else
+            vrLog(string.format("memory vote passed, but our memory's scenario actor 0x%X is gone -> played without it", h.actor or 0))
+        end
+        local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
+        if c then c:write("memskip\n"); c:close() end
+    end
+    vestigeRelayPlay(sym, who)
+end
+-- Restoration memory (kit 252; test 11-24 19:21: "the vote didn't go through, it just instantly started the loading screen for me", "at
+-- the start of the memory, he fell straight to his death", "at the end of the memory ... he straight up dies at the end of the loading
+-- screen"). A restoration's memory is no PlayMemoryResidue: the restoration screen sends the host through a deferred teleport
+-- (DeferredTeleportDriver) into the memory area (/Game/Cinematics/MemoryDen/...) with a new host character, and one back. CoopNative
+-- reports the restoration screen (CoopNative.restseen); within 90 s the start of OUR driver is the memory entry:
+--   "vmem start": the post-boss memory state (memstart: memory follow, respawn in the memory, his memory window) + a quiet group
+--   teleport (guests held in the air from the start, brought next to the host's new character).
+--   memory_vote=1 with guests: the driver is kept (DeferredTeleportDriver:BPKeep, the game's own pause token: the host stays behind
+--   its loading screen) while the teleport vote's dialog asks the others; agreed -> token withdrawn; no / no answer -> withdrawn too and
+--   the memory is skipped for everyone (the teleport cannot be taken back). Released after 35 s at the latest.
+-- Later starts of our driver while in the memory: a quiet group teleport ("vmem tp"); a destination outside MemoryDen = the way out
+-- ("vmem end": memory state off). Guest: his own restoration teleport is logged (destination) for the next step.
+vmRestAt, vmem, vmSeen, vmLines = nil, nil, {}, 0
+function vmLog(s) if vmLines < 100 then vmLines = vmLines + 1; log("vestige memory: " .. s) end end
+function vmCmd(line)
+    local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
+    if c then c:write(line .. "\n"); c:close() end
+end
+function vmOwnDriver(d, pcA, meA)
+    local own = try(function() return d:GetOwner() end)
+    local oa = valid(own) and try(function() return own:GetAddress() end)
+    if oa and (oa == pcA or oa == meA) then return true end
+    local l = try(function() return d.DriverListener:Get() end)
+    local la = valid(l) and try(function() return l:GetAddress() end)
+    return la ~= nil and (la == pcA or la == meA)
+end
+function vmDest(d)
+    local lvl = try(function() return d.WaitingStreamingLevel:Get() end)
+    local pkg = valid(lvl) and (try(function() return lvl.PackageNameToLoad:ToString() end) or try(function() return lvl:GetWorldAssetPackageName() end)) or nil
+    local dl = try(function() return d.DestinationLocation end)
+    return pkg, dl and string.format("%.0f,%.0f,%.0f", dl.X, dl.Y, dl.Z) or "?"
+end
+function vmObj(t)
+    if type(t) ~= "table" then return valid(t) and t or nil end
+    if valid(t.Token) then return t.Token end
+    for _, v in pairs(t) do if valid(v) then return v end end
+    return nil
+end
+function vmemRelease(why)
+    local v = vmem
+    if not v or not v.kept then return end
+    v.kept = false
+    local ok = false
+    if valid(v.tok) then ok = pcall(function() v.tok:BPWithdraw({}) end) end
+    if not ok and valid(v.drv) and valid(v.issuer) then
+        pcall(function()
+            local f2, t2 = {}, {}
+            v.drv:BPFindToken(v.issuer, f2, t2)
+            local tk = vmObj(t2)
+            if tk then tk:BPWithdraw({}); ok = true end
+        end)
+    end
+    if not ok then
+        local a = valid(v.issuer) and try(function() return v.issuer:GetAddress() end)
+        if a then vmCmd(string.format("tpfreeobj %X", a)) end
+    end
+    vmLog("our teleport released (" .. why .. ") -> " .. (ok and "pause token withdrawn" or "token not reachable: CoopNative frees its key"))
+end
+function vmemSkip()
+    local gs = FindFirstOf("BP_AppGameState_C")
+    local mm = StaticFindObject("/Script/Extensions.Default__MuseumUtilityManager")
+    local ok, e = false, "no MuseumUtilityManager"
+    if valid(mm) and valid(gs) then ok, e = pcall(function() mm:SkipCurrentMuseum(gs) end) end
+    if not ok then
+        local comp = FindFirstOf("SkipEventUIComponent")
+        if valid(comp) then ok, e = pcall(function() comp:RequestSkipEvent() end) end
+    end
+    vmLog("the vote did not pass -> memory skipped for everyone: " .. (ok and "done" or ("ERROR " .. tostring(e):sub(1, 120))))
+end
+function vmemVoteStart(d, pc)
+    local k, tk = {}, {}
+    local ok, e = pcall(function() d:BPKeep(pc, k, tk) end)
+    local tok = vmObj(tk)
+    if ok and not tok then pcall(function() local f2, t2 = {}, {}; d:BPFindToken(pc, f2, t2); tok = vmObj(t2) end) end
+    vmem.kept, vmem.keptAt, vmem.tok, vmem.issuer, vmem.drv = ok, os.clock(), tok, pc, d
+    vmLog("vote: our teleport into the memory kept until everyone agreed -> " .. (ok and ("kept (IsKept " .. tostring(k.IsKept) .. ", token " .. tostring(tok ~= nil) .. ")") or ("ERROR " .. tostring(e):sub(1, 120) .. " -> no vote")))
+    if not ok then return false end
+    local guests = voteGuests()
+    voteState = { vmem = true, fromGuest = false, at = os.clock(), yes = 0, need = #guests }
+    local who = votePlayerName(localPC())
+    local text = (who or "Your partner") .. " restored a vestige and wants to watch its memory together."
+    voteSendAll(string.format("CoopVote:-1,-1,0,%s", text))
+    votePopup("Waiting for your partner to agree to watch the memory")
+    log("memory vote: " .. #guests .. " answer(s) needed")
+    return true
+end
+function vmemTick()
+    if not iniHas("vestige_relay=1") then return end
+    local now = os.clock()
+    local rp = WIN64 .. "\\plugins\\CoopNative.restseen"
+    local rf = io.open(rp, "r")
+    if rf then
+        rf:close(); os.remove(rp)
+        if not vmRestAt or now - vmRestAt > 90 then vmLog("the restoration screen is in use -> watching our teleport driver for 90 s") end
+        vmRestAt = now
+    end
+    local v = vmem
+    if v and v.kept and now - v.keptAt > 35 then vmemRelease("35 s without a vote result") end
+    if v and v.skipAt and now >= v.skipAt then v.skipAt = nil; vmemSkip() end
+    if v and v.pend then
+        -- where does this teleport go? (known once the driver waits for its streaming level)
+        local p = v.pend
+        local pkg, at = vmDest(p.d)
+        local run = valid(p.d) and try(function() return p.d.IsRunning end) == true
+        if pkg or not run or now - p.at > 15 then
+            v.pend = nil
+            local inside = pkg and pkg:find("MemoryDen", 1, true) ~= nil
+            if p.entry then
+                if pkg and not inside then
+                    vmLog("our teleport goes to " .. pkg .. " (not a memory) -> memory state off again")
+                    vmCmd("vmem end"); vmemRelease("not a memory"); if voteState and voteState.vmem then voteEnd("not a memory") end
+                    vmem = nil
+                else vmLog("into the memory: " .. tostring(pkg or "level unknown") .. " at " .. at) end
+            elseif inside then
+                -- inside the memory the host may keep its character: no new one to wait for -> drop the hold, the memory follow
+                -- (host moved at once) brings the guests next to it
+                if pendingTp and pendingTp.quiet then pendingTp = nil end
+                vmLog("teleport inside the memory to " .. pkg .. " at " .. at .. " -> the memory follow brings the guests")
+            else
+                vmLog("teleport out of the memory to " .. tostring(pkg or "an unknown level") .. " at " .. at .. " -> memory state off")
+                vmCmd("vmem end")
+                vmem = nil
+            end
+        end
+    end
+    if not (vmem and vmem.on) and not (vmRestAt and now - vmRestAt < 90) then return end
+    local gs = FindFirstOf("BP_AppGameState_C")
+    local isHost = valid(gs) and try(function() return gs.Role end) == 3
+    local pc = localPC()
+    local me = valid(pc) and try(function() return pc.Pawn end) or nil
+    local pcA = valid(pc) and try(function() return pc:GetAddress() end)
+    local meA = valid(me) and try(function() return me:GetAddress() end)
+    for _, d in ipairs(FindAllOf("DeferredTeleportDriver") or {}) do
+        local da = valid(d) and try(function() return d:GetAddress() end)
+        if da then
+            local run = try(function() return d.IsRunning end) == true
+            if not run then vmSeen[da] = nil
+            elseif not vmSeen[da] and vmOwnDriver(d, pcA, meA) then
+                vmSeen[da] = true
+                local pkg, at = vmDest(d)
+                if not isHost then
+                    vmLog(string.format("our own restoration teleports us (driver %X) to %s at %s (guest: logged only)", da, tostring(pkg or "level unknown"), at))
+                    vmRestAt = nil
+                elseif not (vmem and vmem.on) then
+                    vmRestAt = nil
+                    vmem = { on = true, at = now, pend = { d = d, at = now, entry = true } }
+                    local guests = #voteGuests()
+                    local vote = iniHas("memory_vote=1") and guests > 0 and not voteState
+                    vmCmd(vote and "vmem start nofade" or "vmem start")
+                    vmLog(string.format("our restoration teleports us into the memory (driver %X, %d guest(s)) -> memory state on, guests follow", da, guests))
+                    if vote then pcall(vmemVoteStart, d, pc) end
+                else
+                    vmCmd("vmem tp")
+                    vmem.pend = { d = d, at = now }
+                    vmLog(string.format("we are teleported again during the memory (driver %X) -> guests follow", da))
+                end
+            end
+        end
     end
 end
 rcState = nil
@@ -2034,6 +3461,119 @@ function restCensusTick()
     end
     if dt >= 15 then rcState = nil end
 end
+tgSent = {}
+function tableGuardSend()
+    if not iniHas("table_guard=1") or tgSent.done then return end
+    local function send(o, what)
+        local a = valid(o) and try(function() return o:GetAddress() end)
+        if not a then return false end
+        local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
+        if not c then return false end
+        c:write(string.format("fcbcguard %X\n", a)); c:close()
+        log("table guard: " .. what .. " " .. name(o) .. " handed to CoopNative")
+        return true
+    end
+    local list = {
+        { "world", function() return FindFirstOf("WorldSettings") end },
+        { "cdo_char", function() return StaticFindObject("/Script/Engine.Default__Character") end },
+        { "cdo_app", function() return StaticFindObject("/Script/Extensions.Default__AppCharacter") end },
+        { "cdo_enemy", function() return StaticFindObject("/Script/Extensions.Default__EnemyCommonBase") end },
+        { "enemy", function() return FindFirstOf("EnemyCommonBase") end },
+        { "player", function() return FindFirstOf("BP_Player_C") end },
+        { "npc", function() return FindFirstOf("ScenarioCharacter") end },
+    }
+    local all = true
+    for _, e in ipairs(list) do
+        if not tgSent[e[1]] then
+            if send(try(e[2]), e[1]) then tgSent[e[1]] = true else all = false end
+        end
+    end
+    tgSent.done = all
+end
+cbAt, cbLast = -1000, nil
+function chestBtnTick()
+    if not iniHas("guest_chest=1") then return end
+    local now = os.clock()
+    if now - cbAt < 2 then return end
+    cbAt = now
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not valid(gs) or try(function() return gs.Role end) == 3 then return end
+    local pc = localPC()
+    local me = valid(pc) and try(function() return pc.Pawn end) or nil
+    local pl = valid(me) and try(function() return me:K2_GetActorLocation() end)
+    if not pl then return end
+    local rows = {}
+    for _, ch in ipairs(FindAllOf("ChestBase") or {}) do
+        if valid(ch) and try(function() return ch.ChestState end) == 0 then
+            local l = try(function() return ch:K2_GetActorLocation() end)
+            if l then
+                local dx, dy, dz = l.X - pl.X, l.Y - pl.Y, l.Z - pl.Z
+                local d = dx * dx + dy * dy + dz * dz
+                if d < 2500 * 2500 then rows[#rows + 1] = { a = try(function() return ch:GetAddress() end), d = d } end
+            end
+        end
+    end
+    table.sort(rows, function(x, y) return x.d < y.d end)
+    local parts = {}
+    for i = 1, math.min(8, #rows) do if rows[i].a then parts[#parts + 1] = string.format("%X", rows[i].a) end end
+    local line = "chestbtn " .. table.concat(parts, " ")
+    if line ~= cbLast then
+        cbLast = line
+        local c = io.open(WIN64 .. "\\plugins\\CoopNative.cmd", "a")
+        if c then c:write(line .. "\n"); c:close() end
+    end
+end
+function chestNear(actorName, range)
+    local pc = localPC()
+    local me = valid(pc) and try(function() return pc.Pawn end) or nil
+    local pl = valid(me) and try(function() return me:K2_GetActorLocation() end)
+    if not pl then return false, nil end
+    for _, ch in ipairs(FindAllOf("ChestBase") or {}) do
+        if valid(ch) and name(ch) == actorName then
+            local l = try(function() return ch:K2_GetActorLocation() end)
+            if not l then return false, nil end
+            local d = math.sqrt((l.X - pl.X) ^ 2 + (l.Y - pl.Y) ^ 2 + (l.Z - pl.Z) ^ 2)
+            return d < range, d
+        end
+    end
+    return false, nil
+end
+PM_KINDS = {
+    { cls = "ChestBase", field = "ChestState", done = 2, what = "chest" },
+    { cls = "CheckPointBase", field = "CheckPointState", done = 2, what = "Mistle" },
+}
+pmSeen, pmSaved, pmAt, pmLines = {}, {}, -1000, 0
+function progressMirrorTick()
+    if not iniHas("progress_mirror=1") then return end
+    local now = os.clock()
+    if now - pmAt < 1 then return end
+    pmAt = now
+    local players = 0
+    for _, p in ipairs(FindAllOf("BP_Player_C") or {}) do if valid(p) then players = players + 1 end end
+    if players < 2 then pmSeen = {}; return end
+    for _, k in ipairs(PM_KINDS) do
+        for _, o in ipairs(FindAllOf(k.cls) or {}) do
+            if valid(o) then
+                local n = name(o)
+                local st = try(function() return o[k.field] end)
+                if st ~= nil then
+                    local done = st == k.done
+                    local prev = pmSeen[n]
+                    pmSeen[n] = done
+                    if prev == false and done and not pmSaved[n] then
+                        pmSaved[n] = true
+                        local ok, er = pcall(function() o:HoldStateEvent_OnNotifySave() end)
+                        pmLines = pmLines + 1
+                        if pmLines <= 100 then
+                            log("progress mirror: " .. k.what .. " " .. n .. " opened during co-op -> saved here " .. (ok and "(HoldStateEvent_OnNotifySave)" or ("FAILED " .. tostring(er):sub(1, 100))) ..
+                                ", flag " .. tostring(try(function() return o.HoldStateFlagName:ToString() end)))
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
 function hpRefillTick()
     local r = hpRefill
     if not r then return end
@@ -2059,6 +3599,7 @@ function hpRefillTick()
     end
 end
 local function groupTeleport()
+    pcall(progressMirrorTick)
     pcall(fallVoiceTick)
     pcall(itemCensusTick)
     pcall(voteTick)
@@ -2076,9 +3617,12 @@ local function groupTeleport()
             -- 2026-11-02: after the memory the host lands in the final cutscene; a guest spawned next to it there fell and died (no
             -- ground at the cutscene spot). For the memory-end teleport ("start memend") the guests follow only once the host can
             -- move again (cutscene over: move input not ignored for 2 s), up to 3 minutes.
-            pendingTp = { at = os.clock(), oldHost = valid(m0) and try(function() return m0:GetAddress() end) or nil, memend = what:find("memend") ~= nil }
+            pendingTp = { at = os.clock(), oldHost = valid(m0) and try(function() return m0:GetAddress() end) or nil, memend = what:find("memend") ~= nil,
+                          quiet = what:find("quiet") ~= nil, nofade = what:find("nofade") ~= nil }
+            -- (kit 252) "quiet" = a restoration memory's teleport: no Mistle teleport animation and no loading-screen gate (the game's own
+            -- deferred teleport covers the host); "nofade" = a memory vote runs, his screen stays visible for the vote dialog
             log("group teleport: host teleports, guests follow once the host has arrived")
-            if iniHas("tp_gate=1") and not pendingTp.memend and not hbInBase() then
+            if iniHas("tp_gate=1") and not pendingTp.memend and not pendingTp.quiet and not hbInBase() then
                 tgCmd("fadehold 1 0")
                 tgHolding = true
                 log("teleport gate: the game's loading screen is kept until the destination is loaded and shown")
@@ -2090,9 +3634,9 @@ local function groupTeleport()
             -- item 8 v2: host -> guest message (PlayerController:ClientMessage is a client RPC): the guest fades now, at the start
             for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
                 if valid(c) and not try(function() return c:IsLocalController() end) then
-                    pcall(function() c:ClientMessage("CoopFadeMode:" .. (iniHas("tp_loading=1") and "64" or "48"), FName("None"), 0) end)
-                    if not pendingTp.memend then pcall(tpMontage, try(function() return c.Pawn end), "start", "group teleport") end
-                    local okm = pcall(function() c:ClientMessage("CoopTeleportFade", FName("None"), 0) end)
+                    if not pendingTp.nofade then pcall(function() c:ClientMessage("CoopFadeMode:" .. (iniHas("tp_loading=1") and "64" or "48"), FName("None"), 0) end) end
+                    if not pendingTp.memend and not pendingTp.quiet then pcall(tpMontage, try(function() return c.Pawn end), "start", "group teleport") end
+                    local okm = pendingTp.nofade and "skipped (vote)" or pcall(function() c:ClientMessage("CoopTeleportFade", FName("None"), 0) end)
                     log("group teleport: fade message to " .. name(c) .. " " .. tostring(okm))
                 end
             end
@@ -2124,9 +3668,22 @@ local function groupTeleport()
                 if valid(g) and name(g):find("BP_Player_C", 1, true) then pendingTp.held[#pendingTp.held + 1] = g end
             end
             tpHidden = tpHidden or {}
+            local heldSet = {}
             for _, g in ipairs(pendingTp.held) do
                 if pcall(function() g:SetActorHiddenInGame(true) end) then tpHidden[#tpHidden + 1] = g end
+                heldSet[name(g)] = true
             end
+            local eq = 0
+            for _, e in ipairs(FindAllOf("EquipmentBase") or {}) do
+                if valid(e) and try(function() return e.bHidden end) ~= true then
+                    local par = try(function() return e:GetAttachParentActor() end)
+                    if valid(par) and heldSet[name(par)] and pcall(function() e:SetActorHiddenInGame(true) end) then
+                        tpHidden[#tpHidden + 1] = e
+                        eq = eq + 1
+                    end
+                end
+            end
+            if eq > 0 then log("group teleport: " .. eq .. " equipment actor(s) of the held guests hidden too (weapons)") end
             log("group teleport: " .. #pendingTp.held .. " guest character(s) held in the air (hidden) until they are brought")
         end
         for _, g in ipairs(pendingTp.held) do
@@ -2696,9 +4253,24 @@ function memoryBaseLog()
         end
     end
 end
+memJumpLast = nil
 local function memoryFollow()
     local pc = localPC()
     local host = valid(pc) and try(function() return pc.Pawn end) or nil
+    -- (kit 252; owner 11-24: "ideally the game's call to teleport me elsewhere during the memory carries over to him as well (ofc not
+    -- exactly at where im standing, but beside me)") the host moved more than 15 m within one 0.2-s tick = moved by the game -> follow
+    if memHostOn and valid(host) then
+        local hp0 = try(function() return host:K2_GetActorLocation() end)
+        local ha = try(function() return host:GetAddress() end)
+        if hp0 and memJumpLast and memJumpLast.a == ha and not memFollowAt then
+            local jx, jy, jz = hp0.X - memJumpLast.X, hp0.Y - memJumpLast.Y, hp0.Z - memJumpLast.Z
+            if jx * jx + jy * jy + jz * jz > 1500 * 1500 then
+                memFollowAt = os.clock()
+                log(string.format("memory follow: the game moved the host %.0f m at once -> the guests follow once the host stands", math.sqrt(jx * jx + jy * jy + jz * jz) / 100))
+            end
+        end
+        memJumpLast = hp0 and { X = hp0.X, Y = hp0.Y, Z = hp0.Z, a = ha } or nil
+    else memJumpLast = nil end
     local hcm = valid(host) and try(function() return host.CharacterMovement end)
     local walking = valid(hcm) and try(function() return hcm.MovementMode end) == 1
     -- 2026-11-03: pulling him over 2.5 s after a skip put him next to the host while the host was still moving to the next memory
@@ -3885,6 +5457,15 @@ function fsHostIn()
             elseif kind == 15 then
                 hostGuestMenuAt = data == 1 and os.clock() or nil
                 log("level-up: the guest's Mistle menu is " .. (data == 1 and "open (his character goes first on our protect list for the level-up relay)" or "closed"))
+            elseif kind == 21 or kind == 22 then
+                pcall(vestigeRelayHostIn, kind, data)
+            elseif kind == 19 then
+                local prev = rrGuest
+                rrGuest = { done = data // 2, busy = data % 2 == 1, at = os.clock() }
+                if (not prev or prev.done ~= rrGuest.done or prev.busy ~= rrGuest.busy) and rrLines < 150 then
+                    rrLines = rrLines + 1
+                    log("rest reload: the guest's game reports " .. rrGuest.done .. " reset(s) done" .. (rrGuest.busy and ", characters still in setup" or ", ready"))
+                end
             elseif kind == 17 then
                 voteAnswer(data == 1, votePlayerName(voteGuests()[1]) or "your partner")
             elseif kind == 18 then
@@ -3896,6 +5477,11 @@ function fsHostIn()
                 local found
                 for _, ch in ipairs(FindAllOf("ChestBase") or {}) do
                     if valid(ch) and name(ch) == want then found = ch; break end
+                end
+                if found and iniHas("guest_chest=1") then
+                    chestHostCopy[want] = true
+                    chestSaveQueue[want] = { ch = found, at = os.clock() }
+                    if chestGranted[want] then pcall(chestCopyToHost, found, want) end
                 end
                 local st = found and try(function() return found.ChestState end)
                 if found and st == 0 then
@@ -4688,7 +6274,71 @@ local function chestGrant(ch, n, why)
     local dt = os.clock() - t0
     if dt > 0.03 then log(string.format("chest sync: granting %s took %.0f ms", n, dt * 1000)) end
 end
+chestHostCopy, chestHostGot, chestSaveQueue, chestWatch = {}, {}, {}, {}
+function chestWatchTick()
+    local now = os.clock()
+    for n, w in pairs(chestWatch) do
+        if not valid(w.ch) or not valid(w.hs) then
+            log("chest sync: " .. n .. " (watched) unloaded; last HoldState bool/int " .. tostring(w.last))
+            chestWatch[n] = nil
+        elseif now >= w.next then
+            w.next = now + 10
+            local cur = tostring(try(function() return w.hs:GetBooldata(w.fname) end)) .. "/" .. tostring(try(function() return w.hs:GetInt32data(w.fname) end))
+            local st = try(function() return w.ch.ChestState end)
+            if cur ~= w.last then log("chest sync: " .. n .. " HoldState changed " .. w.last .. " -> " .. cur .. " (ChestState " .. tostring(st) .. ")") end
+            w.last = cur
+            if now - w.at > 120 then chestWatch[n] = nil; log("chest sync: " .. n .. " HoldState after 2 min: " .. cur .. ", ChestState " .. tostring(st)) end
+        end
+    end
+end
+function chestSaveTick()
+    for n, e in pairs(chestSaveQueue) do
+        local st = valid(e.ch) and try(function() return e.ch.ChestState end)
+        if st == 2 then
+            chestSaveQueue[n] = nil
+            local hs = try(function() return e.ch.HoldState end)
+            local fname = try(function() return e.ch.HoldStateFlagName:ToString() end) or "State"
+            local function hsRead()
+                return tostring(try(function() return hs:GetBooldata(fname) end)) .. "/" .. tostring(try(function() return hs:GetInt32data(fname) end))
+            end
+            local before = valid(hs) and hsRead() or "no HoldState"
+            local okb = valid(hs) and pcall(function() hs:SetBooldata(fname, true, true) end)
+            local oki = valid(hs) and pcall(function() hs:SetInt32data(fname, 2, true) end)
+            log("chest sync: " .. n .. " HoldState '" .. fname .. "' bool/int " .. before .. " -> set opened (bool " .. tostring(okb) .. ", int " .. tostring(oki) .. ") -> " .. (valid(hs) and hsRead() or "?"))
+            chestWatch[n] = { ch = e.ch, hs = hs, fname = fname, at = os.clock(), next = os.clock() + 10, last = valid(hs) and hsRead() or "" }
+            local ok, er = pcall(function() e.ch:HoldStateEvent_OnNotifySave() end)
+            log("chest sync: " .. n .. " (opened by the guest) saved as opened on the host: HoldStateEvent_OnNotifySave " .. (ok and "called" or ("ERROR " .. tostring(er):sub(1, 100))) ..
+                " (flag " .. tostring(try(function() return e.ch.HoldStateFlagName:ToString() end)) .. ")")
+        elseif not valid(e.ch) or os.clock() - e.at > 30 then
+            chestSaveQueue[n] = nil
+            log("chest sync: " .. n .. " never reached the opened state here (" .. tostring(st) .. ") -> not saved")
+        end
+    end
+end
+function chestCopyToHost(ch, n)
+    if chestHostGot[n] then return end
+    chestHostGot[n] = true
+    local lines = 0
+    pcall(function()
+        ch.SpawnItemInfos:ForEach(function(_, x)
+            local r = x:get()
+            local art = try(function() return r.ItemArticle end)
+            local weight = try(function() return r.Weight end) or 0
+            local sym = try(function() return r.DropProgressSymbol:ToString() end) or ""
+            local pth = valid(art) and bcPath(art)
+            if pth and weight >= 100 and sym == "" then
+                chestIn[#chestIn + 1] = string.format("%s|%s|%s|%s|%s|%s", n .. "@host", tostring(try(function() return name(art:GetClass()) end)), pth,
+                    tostring(try(function() return r.ItemCount end) or 1), tostring(try(function() return r.DegenerationType end) or 0),
+                    tostring(try(function() return r.Grind end) or 0))
+                lines = lines + 1
+            end
+        end)
+    end)
+    log("chest sync: " .. n .. " was opened by the guest -> " .. lines .. " entr" .. (lines == 1 and "y" or "ies") .. " for the host too")
+    pcall(chestSyncGuest)
+end
 chestGrantInner = function(ch, n, why)
+    if chestHostCopy[n] then pcall(chestCopyToHost, ch, n) end
     local guests = {}
     for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
         if valid(c) and not try(function() return c:IsLocalController() end) then guests[#guests + 1] = c end
@@ -4716,6 +6366,8 @@ chestGrantInner = function(ch, n, why)
     log("chest sync: " .. n .. " opened (" .. why .. "): " .. sent .. " entries to " .. #guests .. " guest(s), " .. skipped .. " skipped")
 end
 function chestSyncHost()
+    pcall(chestSaveTick)
+    pcall(chestWatchTick)
     if os.clock() - chestAt < 2 then return end
     chestAt = os.clock()
     local gs = FindFirstOf("BP_AppGameState_C")
@@ -6184,6 +7836,11 @@ local function probeCommands()
     end
     if #probeQueue == 0 then return end
     local c = table.remove(probeQueue, 1)
+    if c == "uidump" or c:find("^t_") then
+        local okt, et = pcall(testCommand, c)
+        if not okt then log("test: command ERROR " .. tostring(et):sub(1, 200)) end
+        return
+    end
     if c == "openmenu" then openCheckpointMenu(1)
     elseif c == "openmenu2" then openCheckpointMenu(2)
     elseif c == "closemenu" then
@@ -6534,6 +8191,9 @@ end
 LoopAsync(200, function()
     if not coopEngineReady() then return false end
     ExecuteInGameThread(function()
+        pcall(autoContinueTick)
+        pcall(tableGuardSend)
+        pcall(chestBtnTick)
         local line = worldSettled() and (try(stateLine) or "state error") or last
         if line ~= last then log("STATE " .. line); last = line end
         local w = try(spectateWindow) or false
@@ -6541,14 +8201,28 @@ LoopAsync(200, function()
         pcall(spectateCam, w)
         pcall(unlockInput)
         local rested = try(restEdge) or false
-        if rested then pcall(restCensusStart) end
+        if rested then pcall(restCensusStart); pcall(levelResetProbe, true) end
+        pcall(levelResetProbe)
         pcall(restCensusTick)
+        pcall(restReloadTick)
+        pcall(mapCensusTick)
+        pcall(mapMirrorHostTick)
+        pcall(mapMirrorGuestTick)
+        pcall(itemMirrorHostTick)
+        pcall(itemGateHostTick)
+        pcall(itemMirrorGuestTick)
+        pcall(itemOwnTick)
+        pcall(mapOwnTick)
+        pcall(vestigeRelayGuestTick)
+        pcall(vmemTick)
+        pcall(enemyStateTick)
         local ok, e = pcall(groupRest, rested)
         if not ok and not groupRestErr then groupRestErr = true; log("group rest ERROR " .. tostring(e):sub(1, 160)) end
         local okc, ec = pcall(combatProbe)
         if not okc and not combatErr then combatErr = true; log("combat probe ERROR " .. tostring(ec):sub(1, 160)) end
         pcall(sendMenuClass)
         pcall(sendRestoreClass)
+        pcall(sendVestMenus)
         local okc2, ec2 = pcall(probeCommands)
         if not okc2 then log("probe command ERROR " .. tostring(ec2):sub(1, 160)) end
         whoTick = whoTick + 1; if whoTick % 50 == 1 then pcall(whoIsWho) end

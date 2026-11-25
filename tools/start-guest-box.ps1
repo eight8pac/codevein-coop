@@ -41,5 +41,34 @@ if ((Test-Path $gus) -and (Test-Path (Split-Path $boxGus))) { Copy-Item $gus $bo
 # Own network ports (11-17 16:25/16:30): Code Vein also starts a Steam game server (game port 7777 = Unreal's default, Steam port +1,
 # query port 27015). With the host copy running on the same PC those ports are taken, the guest's Steam init failed ("Steam server and
 # client running on the same machine") and it fell back to offline mode. Unreal's own switches move the guest's ports.
-Start-Process -FilePath $sb -ArgumentList '/box:CoopGuest', "`"$exe`"", '-port=7787', '-QueryPort=27025' -WorkingDirectory $g
+# 11-18: with local\onepc-guest-noasync.txt the guest also starts with -NoAsyncLoadingThread (test: the BitArrayIndex crashes all run
+# on FAsyncLoadingThread, same chain every time).
+$gargs = @('/box:CoopGuest', "`"$exe`"", '-port=7787', '-QueryPort=27025')
+if (Test-Path (Join-Path $Root 'local\onepc-guest-noasync.txt')) { $gargs += '-NoAsyncLoadingThread' }   # (an empty argument breaks Start-Process)
+Start-Process -FilePath $sb -ArgumentList $gargs -WorkingDirectory $g
 'guest copy starting (title in about 40 s)'
+
+# Window position (11-17): the game ignores the saved WindowPosX/Y and opens where it likes; the owner dragged it over every time. A
+# detached helper waits for the title screen, then moves the guest's window to the spot in local\onepc-guest-window.txt ("x,y").
+$wf = Join-Path $Root 'local\onepc-guest-window.txt'
+if (Test-Path $wf) {
+  $xy = (Get-Content $wf -Raw).Trim() -split ','
+  $mover = @"
+Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public struct GWR { public int L, T, R, B; } public static class GW { [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int cx, int cy, uint f); [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out GWR r); }'
+`$log = '$g\ue4ss\UE4SS.log'
+for (`$i = 0; `$i -lt 90; `$i++) { Start-Sleep -Seconds 2; if ((Test-Path `$log) -and (Select-String -Path `$log -Pattern 'title version' -Quiet)) { break } }
+# (11-17 19:42: one move right after the title was undone by the game, which places the window relative to the monitor it opened on)
+for (`$j = 0; `$j -lt 15; `$j++) {
+  Start-Sleep -Seconds 2
+  `$p = Get-Process CodeVein-Win64-Shipping -ErrorAction SilentlyContinue | Where-Object { `$_.Path -like '$g*' -and `$_.MainWindowHandle -ne 0 } | Select-Object -First 1
+  if (-not `$p) { continue }
+  `$r = New-Object GWR; [void][GW]::GetWindowRect(`$p.MainWindowHandle, [ref]`$r)
+  if (`$r.L -ne $($xy[0]) -or `$r.T -ne $($xy[1])) { [void][GW]::SetWindowPos(`$p.MainWindowHandle, [IntPtr]::Zero, $($xy[0]), $($xy[1]), 0, 0, 0x0015) }
+}
+"@
+  # (11-18: passed inline with -Command the multi-line script lost its quotes on the way and never moved anything; a file is safe)
+  $mf = Join-Path $Root 'local\onepc-guest-window-mover.ps1'
+  Set-Content -Path $mf -Value $mover -Encoding UTF8
+  Start-Process powershell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$mf`"" -WindowStyle Hidden
+  "the window is moved to $($xy[0]),$($xy[1]) once the title shows"
+}

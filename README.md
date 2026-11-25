@@ -4,11 +4,13 @@ Mods that turn Code Vein (2019) co-op into one continuous session. The guest sta
 kills that end a vanilla session: a dead guest spectates and comes back at the host's rest, the group teleports together, both
 play the boss, its outro and the memory, and the guest's story progress, world state and blood codes follow the host's. Co-op also
 works in areas whose boss is dead. Automatic re-hosting and re-joining remain as a fallback when a session does break.
-**Not a release**: tested by hand on two PCs (and on one PC, see below), one guest (vanilla cap). Cutscenes are still rough, and
-chests opened by the guest and ground items for the guest are in progress (see Status). Home Base works together, and leaving and
-returning together work most of the time (see Home Base below). Mistle teleports are voted on by everyone (Elden Ring style) and keep
-the loading screen up until the destination is really loaded; walking between stages streams the next one in for everyone (see Co-op
-fog and Teleport vote below). Known crash: the engine assert "BitArrayIndex" while an area loads (see Open).
+**Not a release**: tested by hand on two PCs (and on one PC, see below), one guest (vanilla cap). Cutscenes are still rough. Home
+Base works together, and leaving and returning together work most of the time (see Home Base below). Mistle teleports are voted on
+by everyone (Elden Ring style) and keep the loading screen up until the destination is really loaded; walking between stages streams
+the next one in for everyone (see Co-op fog and Teleport vote below). Resting resets the enemies as in single player, ground items
+are per player (each player sees what his own save has not picked up), the map shows the host's icons, and vestige memories are
+being made to play together (see Rest reset, Items per player and Vestige memories below). The loading crash "BitArrayIndex" is
+fixed (load guard).
 
 Findings, teardown table and QA live in the Co-op Anything write-up:
 <https://github.com/cranebeaker/coop-anything/tree/main/games/code-vein>
@@ -46,8 +48,18 @@ Everything goes into `<game dir>\CodeVein\Binaries\Win64`.
    guest_rest=1     guest only: E at a Mistle opens his own Mistle menu instead of the vanilla rest (which asserts on a guest);
                     switch partner is disabled there; level-up in progress (see Status)
    levelup_relay=1  host: apply a guest's level-up (sent as Server_AddExp(0) per level) to the host's copy of him
-   vestige_menu=1   host only, research: the Mistle menu sees "no signal" so its memory/vestige entries are enabled
-   vestige_keep=1   host only, untested: the vestige restoration screen sees "no session", so a memory keeps the session
+   vestige_menu=1   both PCs: the Mistle menu sees "no signal" so its memory/vestige entries are enabled
+   vestige_keep=1   both PCs: the companions' "Restore vestiges" is allowed in co-op and the restoration screen sees
+                    "no session", so a memory keeps the session
+   vestige_relay=1  both PCs: a restoration memory plays together (see Vestige memories)
+   memory_vote=1    both PCs: everyone is asked before a restoration memory starts (the teleport vote's dialog)
+   rest_reload=1    host: a rest at a Mistle resets the enemies as in single player (every guest within 40 m)
+   item_own=1       both PCs: ground items per player (the guest spawns his own copies; the host sends its story-gated items)
+   map_mirror=1     both PCs: the guest's map shows the icons shown on the host's map
+   vote_home_base=1 host: the teleport vote also covers Home Base
+   depths_block=1   host: teleports into the Depths are refused (a crash once; to be retested)
+   auto_continue=1  test copies: the title logos are closed and Continue is called directly (no simulated input)
+   load_guard=0     switches the load guard off (it is on by default: see Load crash)
    group_teleport=1 host only: after the host's Mistle teleport the guest is spawned next to him (also into another stage)
    teleport_skip_fields=<id>,<id>  host: teleport destinations (FieldID, logged on every teleport) that keep vanilla
                     behaviour; Home Base (FieldID 0) streams like a stage and goes together with the group when not listed here
@@ -247,17 +259,59 @@ Items (11-18): chest loot is shared when the host opens a chest, without the ear
 own `DropItemComponent` RPCs). The guest's own `Server_SetChestState` is dropped by his engine ("No owning connection"); CoopNative
 now catches that log line (FMsg::Logf_Internal through a stub that only looks at the format pointer) and the guest relays the chest
 to the host (`guest_chest=1`, untested). Ground items (`AFieldTriggerItemBase`) keep a per-player hold state and visibility; the
-guest does not see the host's ones yet (`item_census=1` logs both sides).
+guest did not see the host's ones (solved later, see Items per player; `item_census=1` logs both sides).
 
-Open: the engine assert "BitArrayIndex < NumBitArrayIndex" (Actor.cpp:88), on host and guest, while an area loads. Findings: every
-actor has a lazily built component index table cached at `AActor+0x2B0` (one byte per trait, 160 traits, at most 63 traits shared by
-two or more components); once loaded, enemies use at most 19 shared slots, the same alone and in co-op, but in every crash an enemy's
-table reached 64 while it was still being deserialized (`FAsyncPackage::EventDrivenSerializeExport`, the enemy's `KetsugiComponent`
-lookup builds the table). `-NoAsyncLoadingThread` did not help. `comp_census=1` logs every character's table fill and the
-assert watch dumps the half-built table (components and shared slots) when it happens.
-Enemy respawn at a rest works on the first rest but not on a second one (`rest_census=1` logs enemies and enemy levels around
-each rest). The fall-death scream (`UDeathComponent.FallDeathVoice`) is played only on the falling player's PC; `fall_voice=1`
-plays it on the other PCs too.
+Load crash (fixed 11-19, load guard, on by default): the engine assert "BitArrayIndex < NumBitArrayIndex" (Actor.cpp:88), on host
+and guest, while an area loads. Every actor has a lazily built component index table cached at `AActor+0x2B0` (one byte per trait,
+160 traits, at most 63 traits shared by two or more components); in every crash an enemy's table reached 64 while it was still
+being deserialized (`FAsyncPackage::EventDrivenSerializeExport`). The cause was our own game-thread probes: they touched enemies
+that were still being loaded. Every `FindAllOf` / `FindFirstOf` in the mods now leaves out objects the engine still builds or
+removes (`RF_NeedInitialization`, `RF_NeedLoad`, `RF_NeedPostLoad`, `RF_NeedPostLoadSubobjects`, `RF_BeginDestroyed`,
+`RF_FinishDestroyed` and the internal loading / unreachable / pending-kill flags); `load_guard=0` in `CoopNative.ini` switches it off.
+The fall-death scream (`UDeathComponent.FallDeathVoice`) is played only on the falling player's PC; `fall_voice=1` plays it on the
+other PCs too.
+
+Rest reset (11-21 to 11-22, `rest_reload=1`, host): alone, every rest reloads the area's `_Enemy` levels from disk, which is the
+complete reset (positions, aggro, the killed ones back). Online the zone streaming asks `IsOnlineMultiplay` (caller `0x146D36F21`)
+and skips it. At the rest (session event `0x16` from the Mistle's input) CoopNative answers "single player" to that one check until
+CoopProbe has seen the enemy levels unload and come back. The host allows it only when every guest is within 40 m and his game has
+finished the last reload (it reports done/busy), so two rests in a row work too. The earlier enemy-kill overrides are retired
+(`rest_reset_overrides=1` brings them back).
+
+Map icons (11-22 to 11-24, `map_mirror=1`): an icon is `AFieldTriggerBase.bShouldBeVisible`; icons follow the unlocked map areas
+(`RadarScene.RepAreaOpenedData`, replicated from the host) and the object's own state; there is no per-object "discovered" save
+flag. The host sends the keys of the icons shown on its map (`ClientMessage("CoopMapIcons:...")`) and the guest's game switches them
+on; his item copies (below) carry the icons of their level items. The guest's own map from his save is parked.
+The teleport vote also covers Home Base (`vote_home_base=1`); Depths destinations are refused while `depths_block=1`.
+
+Items per player (11-23 to 11-24, `item_own=1`): the level items belong to the host's game; on a guest they stay hidden and inactive
+and their button check asks "is this the server". Enemy drops always worked, because each game spawns its own drop. So each guest's
+game spawns its own drop-style copy of every level item his save has not picked up (`GameplayStatics:BeginDeferredActorSpawnFromClass`,
+`SetDropItem(true)`, `FinishSpawningActor`), keeps the level item hidden, and when his copy is taken marks the level item as picked up
+in his own save (`HoldState` flag + its save event). A player sees what his own save still has, and picking an item up does not take
+it from the other player. Items the host's story still keeps hidden (a vestige that appears after a boss) are sent by the host
+(`ClientMessage("CoopItemGate:...")`) and not copied until the host shows them.
+
+Quick start for tests (11-23, `auto_continue=1`): the title logos are closed (`BP_TitleCreditUIComponent:Close`), Online is chosen
+(`TitleMenuUIComponent:SetSelectedAppNetworkMode(0)` + `RequestAppNetworkModeDecision`) and Continue is called
+(`RequestContinue`); no simulated input. `boot_trace=1` logs the first calls of the exec functions listed in
+`plugins\CoopNative.tracelist` (object, calling script function, locals) to find such paths.
+
+Vestige memories (11-24, in progress, `vestige_menu`, `vestige_keep`, `vestige_relay`, `memory_vote`, both PCs):
+- "Restore vestiges" is an option of the companions' talk menus (`BP_Scenario_Base01_<Io|leda|cyllene|thebe|themisto|relics>_Menu`);
+  each asks `IsOnlineMultiplay` once and shows "This feature is unavailable when playing in multiplayer mode". CoopNative answers
+  false for those classes, matched by class name index (sent once at start; looking the classes up by path every few seconds crashed
+  a guest at his join while the classes of his old world were removed). The restoration screen sees no session.
+- A restoration's memory is no `PlayMemoryResidue`: the screen sends the restorer through a deferred teleport
+  (`DeferredTeleportDriver`) into the memory area (`/Game/Cinematics/MemoryDen/...`) with a new character, and through another one
+  back. The other PC loads the memory level through the streaming mirror, but his character stayed behind and fell at the start and
+  at the end (first test).
+- The host's game now treats its restoration teleport like the post-boss memory: the memory state for the guests (they follow on
+  skips, finished scenes and when the game moves the host more than 15 m at once; a guest who dies there respawns next to the host),
+  and on the way in and out the guests are held in the air and brought next to the host's new character. With `memory_vote=1` the
+  host's teleport waits behind its loading screen (the driver's own pause token, `DeferredTeleportDriver:BPKeep`) while the others
+  answer the teleport vote's dialog; no or no answer skips the memory (`MuseumUtilityManager:SkipCurrentMuseum`). Untested.
+- A guest's own restoration is logged only for now (its teleport destination); his memory has to be played by the host as well.
 
 Testing on one PC: a second Steam client runs in a Sandboxie-Plus box, logged in with a second Steam account that owns or borrows
 the game, and starts a second, hard-linked test copy as the guest (`tools/start-guest-box.ps1`). Each copy has its own Steam account
@@ -279,7 +333,11 @@ CoopProbe commands: `bosshp1` sets a running boss fight to 1 health (tests), `ls
 states, `montagewatch` logs the montages our character plays, `loadtest` shows and lifts the join loading screen, `wallsnear`
 lists every barrier and fog wall within 80 m, `bring` moves the guests next to the host, `rec` takes an NPC census, and
 `guest <command>` runs a command on every guest's PC (`guest native <command>` for CoopNative). The command file takes one
-command per line.
+command per line. Test commands (results logged with "test:"): `t_status` (our character, players, enemies, the nearest Mistle),
+`t_kill <n>` (host: the n nearest enemies die through the game's death path), `t_tp <fid> <pid>` (host: Mistle teleport, the vote
+runs), `t_census` (map census), `t_call <class> <function>` (a function without arguments on the first object of a class),
+`t_give <asset> [n]` (gives our character an item through `CharacterHelper:GetItemOrWeaponOrJinkaku`; test saves only),
+`tp` (our character to `test_mark=X,Y,Z` from `CoopNative.ini`), `uidump` (every widget and the game widget classes' functions).
 Guest progression and shared boss rewards: see issue #1 (CoopProgress).
 
 ## Contributing

@@ -24,6 +24,76 @@ local function log(s) print(TAG .. os.date("%H:%M:%S ") .. tostring(s) .. "\n") 
 local function valid(o) return o ~= nil and o:IsValid() end
 local function try(f, ...) local ok, v = pcall(f, ...); if ok then return v end return nil end
 
+-- Hands off while loading (2026-11-21; NOTES "11-21 crash review"). During every load, rest reset, join and teleport the game builds the
+-- new objects (enemies above all) on its loading thread, and FindAllOf / FindFirstOf already return them while they are half built.
+-- Calling into a half-built enemy from the game thread is the prime suspect for the BitArrayIndex load crash (first seen 10-28, the day
+-- after the first per-tick enemy search; the unmodded game survives the same steps). Every search in this mod therefore leaves out the
+-- objects the engine itself still marks as being loaded or destroyed: object flags NeedInitialization, NeedLoad, NeedPostLoad,
+-- NeedPostLoadSubobjects, BeginDestroyed, FinishDestroyed and internal flags Async, AsyncLoading, Unreachable, PendingKill (UE 4.18 bits).
+-- No timers: an object is used again as soon as the engine clears its flags. load_guard=0 in CoopNative.ini switches it off.
+do
+    local src = debug.getinfo(1, "S").source
+    local base = src:match("^@(.*)[/\\]ue4ss[/\\]Mods[/\\]") or "."
+    local who = src:match("[/\\]Mods[/\\]([^/\\]+)[/\\]") or "?"
+    local f = io.open(base .. "\\plugins\\CoopNative.ini", "r")
+    local s = f and f:read("*a") or ""
+    if f then f:close() end
+    local function glog(m) print("[LoadGuard:" .. who .. "] " .. os.date("%H:%M:%S") .. " " .. m .. "\n") end
+    if s:find("load_guard=0", 1, true) then
+        glog("off (load_guard=0)")
+    else
+        local RF_BUSY = 0x200 | 0x400 | 0x1000 | 0x2000 | 0x8000 | 0x10000
+        local IF_BUSY = (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29)
+        local rawAll, rawFirst = FindAllOf, FindFirstOf
+        local on, apiOk, firstSeen = true, false, false
+        local skipped, example, since = 0, "?", os.clock()
+        local function busy(o)
+            local okA, a = pcall(function() return o:HasAnyFlags(RF_BUSY) end)
+            local okB, b = pcall(function() return o:HasAnyInternalFlags(IF_BUSY) end)
+            if okA and okB then apiOk = true; return a == true or b == true end
+            if apiOk then return true end   -- the check works, this one object does not answer: leave it out
+            on = false
+            glog("flag check not usable here (" .. tostring(okA and b or a):sub(1, 120) .. ") -> off")
+            return false
+        end
+        local function note(o)
+            skipped = skipped + 1
+            local n = "?"
+            pcall(function() n = o:GetFName():ToString() end)
+            example = n
+            if not firstSeen then firstSeen = true; glog("first object left out while the engine still builds or removes it: " .. n) end
+            local now = os.clock()
+            if now - since >= 30 then
+                glog("left out " .. skipped .. " still-loading / being-removed object(s) in the last " .. math.floor(now - since) .. " s (e.g. " .. example .. ")")
+                skipped, since = 0, now
+            end
+        end
+        FindAllOf = function(cls)
+            local all = rawAll(cls)
+            if not on or type(all) ~= "table" then return all end
+            local out = {}
+            for _, o in ipairs(all) do
+                if on and busy(o) then note(o) else out[#out + 1] = o end
+            end
+            if #out == 0 then return nil end
+            return out
+        end
+        FindFirstOf = function(cls)
+            local o = rawFirst(cls)
+            if not on or o == nil then return o end
+            local okv, v = pcall(function() return o:IsValid() end)
+            if not (okv and v) then return o end
+            if not busy(o) or not on then return o end
+            note(o)
+            for _, x in ipairs(rawAll(cls) or {}) do
+                if not busy(x) then return x end
+            end
+            return nil
+        end
+        glog("on: searches leave out objects the engine still builds or removes (load_guard=0 in CoopNative.ini switches it off)")
+    end
+end
+
 local cfg = {enabled = "1", host = "auto", guest = "auto", sessiondiag = "0", remember = "0", versioncheck = "0"}
 local function readConfig()
     local f = io.open(MOD_DIR .. "\\config.txt", "r")
