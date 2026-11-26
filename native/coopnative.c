@@ -99,6 +99,8 @@ static int restui_fresh(void) { return g_restui_on && GetTickCount64() - g_restu
 static volatile LONG g_coop_on;
 static volatile LONG g_coop_host;
 static volatile ULONGLONG g_coop_at, g_vest_menu_at;
+static volatile LONG g_partner_vote;   // partner vote (defined again with its code further down)
+static volatile ULONGLONG g_window_processed_at, g_buddymenu_at, g_partner_hold_at;
 static int coop_fresh(void) { return g_coop_on && GetTickCount64() - g_coop_at < 6000; }
 static char g_dir[MAX_PATH];   // tentative definition (also further down)
 static int memvote_pass_fresh(int consume) {
@@ -2077,20 +2079,26 @@ static btn_fn const g_trig_detours[TRIG_SLOTS] = { detour_trig0, detour_trig1, d
 typedef uint64_t (*trig_input_fn)(void *self, uint64_t type, void *inputter, uint64_t bound);
 static trig_input_fn g_orig_tin[TRIG_SLOTS];
 static volatile uintptr_t g_tin_fn[TRIG_SLOTS];
-static void tin_note(void *self, uint64_t type, void *inputter) {
-    if (!trig_listed((uintptr_t)self)) return;
+// 11-26 18:32 test: the guest's own door input crashed his game (pull door, exe+0x694AB5C reading 0x170 on his client), and the
+// host's run of the door's input for his character opened nothing. With guest_doors=1 on a guest the door's input no longer runs on
+// his PC for a listed door: the press is only noted (the host opens the door) and the interaction ends with Cancel (2).
+static volatile LONG g_guest_doors, g_guest_releasers;   // guest_releasers=1: the same for rotten Mistles (RadarMapReleaser), 11-26
+static int tin_note(void *self, uint64_t type, void *inputter) {
+    if (!trig_listed((uintptr_t)self)) return 0;
     char path[MAX_PATH];
     snprintf(path, sizeof path, "%sCoopNative.triginput", g_dir);
     FILE *f = _fsopen(path, "a", _SH_DENYNO);
     if (f) { fprintf(f, "%llX %u %llX\n", (unsigned long long)(uintptr_t)self, (unsigned)(type & 0xFF), (unsigned long long)(uintptr_t)inputter); fclose(f); }
     static volatile LONG n;
-    if (InterlockedIncrement(&n) <= 60) logf_("trigger: input %u on 0x%llX by 0x%llX (listed for the guest) -> noted for the host", (unsigned)(type & 0xFF),
-                                             (unsigned long long)(uintptr_t)self, (unsigned long long)(uintptr_t)inputter);
+    if (InterlockedIncrement(&n) <= 60) logf_("trigger: input %u on 0x%llX by 0x%llX (listed for the guest) -> noted for the host%s", (unsigned)(type & 0xFF),
+                                             (unsigned long long)(uintptr_t)self, (unsigned long long)(uintptr_t)inputter,
+                                             (g_guest_doors || g_guest_releasers) ? ", not run here" : "");
+    return (g_guest_doors || g_guest_releasers) ? 1 : 0;
 }
-static uint64_t detour_tin0(void *s, uint64_t ty, void *i, uint64_t b) { tin_note(s, ty, i); return g_orig_tin[0](s, ty, i, b); }
-static uint64_t detour_tin1(void *s, uint64_t ty, void *i, uint64_t b) { tin_note(s, ty, i); return g_orig_tin[1](s, ty, i, b); }
-static uint64_t detour_tin2(void *s, uint64_t ty, void *i, uint64_t b) { tin_note(s, ty, i); return g_orig_tin[2](s, ty, i, b); }
-static uint64_t detour_tin3(void *s, uint64_t ty, void *i, uint64_t b) { tin_note(s, ty, i); return g_orig_tin[3](s, ty, i, b); }
+static uint64_t detour_tin0(void *s, uint64_t ty, void *i, uint64_t b) { if (tin_note(s, ty, i)) return 2; return g_orig_tin[0](s, ty, i, b); }
+static uint64_t detour_tin1(void *s, uint64_t ty, void *i, uint64_t b) { if (tin_note(s, ty, i)) return 2; return g_orig_tin[1](s, ty, i, b); }
+static uint64_t detour_tin2(void *s, uint64_t ty, void *i, uint64_t b) { if (tin_note(s, ty, i)) return 2; return g_orig_tin[2](s, ty, i, b); }
+static uint64_t detour_tin3(void *s, uint64_t ty, void *i, uint64_t b) { if (tin_note(s, ty, i)) return 2; return g_orig_tin[3](s, ty, i, b); }
 static trig_input_fn const g_tin_detours[TRIG_SLOTS] = { detour_tin0, detour_tin1, detour_tin2, detour_tin3 };
 static void trig_input_hook_for(uintptr_t obj) {
     if (!obj || !readable(obj, 8)) return;
@@ -2549,6 +2557,9 @@ static void run_command(char *buf) {
         itembtn_cmd(buf + 7);
     } else if (strncmp(buf, "chestbtn", 8) == 0) {
         chestbtn_cmd(buf + 8);
+    } else if (strncmp(buf, "buddymenu", 9) == 0) {
+        if (!g_buddymenu_at || GetTickCount64() - g_buddymenu_at > 3000) logf_("partner: the partner menu is open (a change there is a choice)");
+        g_buddymenu_at = GetTickCount64();
     } else if (strncmp(buf, "trigbtn", 7) == 0) {
         trigbtn_cmd(buf + 7);
     } else if (strncmp(buf, "fcbcguard ", 10) == 0) {
@@ -2703,6 +2714,12 @@ static void read_settings(void) {
     if (InterlockedExchange(&g_fog_free, ffree) != ffree) logf_("setting fog_free = %ld", ffree);
     LONG grest = have_ini && as_guest && strstr(buf, "guest_rest=1") != NULL;
     if (InterlockedExchange(&g_guest_rest, grest) != grest) logf_("setting guest_rest = %ld", grest);
+    LONG gdoor = have_ini && as_guest && strstr(buf, "guest_doors=1") != NULL;
+    if (InterlockedExchange(&g_guest_doors, gdoor) != gdoor) logf_("setting guest_doors = %ld", gdoor);
+    LONG pvote = have_ini && strstr(buf, "partner_vote=1") != NULL;
+    if (InterlockedExchange(&g_partner_vote, pvote) != pvote) logf_("setting partner_vote = %ld", pvote);
+    LONG grel = have_ini && as_guest && strstr(buf, "guest_releasers=1") != NULL;
+    if (InterlockedExchange(&g_guest_releasers, grel) != grel) logf_("setting guest_releasers = %ld", grel);
     LONG gmis = have_ini && as_guest && strstr(buf, "guest_mistles=1") != NULL;
     if (InterlockedExchange(&g_guest_mistles, gmis) != gmis) logf_("setting guest_mistles = %ld", gmis);
     LONG rest = have_ini && strstr(buf, "rest_in_coop=1") != NULL;
@@ -3549,10 +3566,10 @@ static void *g_sync_det[SYNC_N] = {(void *)sync_det_0, (void *)sync_det_1, (void
 // replicated equip RPCs (KetsugiComponent Server_/Multicast_Equip*Directly), so one equip attempt shows where it stops. Outro and
 // memory sequence: the ScenarioActor WaitFor* steps, LargePoly/MemoryResidue and deferred teleport calls, so a boss kill with the
 // guest kept shows which wait the host hangs on (session 3: loading screen at the outro start).
-#define GIFT_N 27
-static const char *g_gift_name[GIFT_N] = {"CharacterHelper:EquipActiveKetsugi", "CharacterHelper:EquipPassiveKetsugi", "CharacterHelper:AcquireKetsugi", "KetsugiComponent:Server_EquipKetsugiDirectly", "KetsugiComponent:Server_EquipPassiveKetsugiDirectly", "KetsugiComponent:Multicast_EquipKetsugiDirectly", "KetsugiComponent:Multicast_EquipPassiveKetsugiDirectly", "ScenarioActor:WaitForDeferredTeleportFinished", "ScenarioActor:WaitForLargePolyFinished", "ScenarioActor:WaitForMemoryResidueFinished", "ScenarioActor:WaitForPreparePolyFinished", "ScenarioActor:WaitForOnlineMultiplaySynced", "ScenarioActor:WaitForFadeFinished", "ScenarioManager:PlayMemoryResidue", "ScenarioManager:PlayLargePolySequence", "ScenarioManager:PrepareLargePolySequence", "ScenarioManager:StartLargePolyLoad", "LIBDeferredTeleportManager:BeginDeferredTeleport", "DeferredTeleportDriver:NotifyReadyToBeginTeleport", "DeferredTeleportDriver:NotifyReadyToEndTeleport", "CharacterHelper:RequestPlayerTeleportToHost", "ArticleAccessUIComponentBase:EquipActiveKetsugi", "ArticleAccessUIComponentBase:EquipPassiveKetsugi", "ArticleAccessUIComponentBase:EquipBloodCode", "CharacterHelper:EquipBloodCode", "BloodCodeComponent:Server_EquipBloodCode", "CheckPointUIComponent:MasterKetsugi"};
-static const uint64_t g_gift_addr[GIFT_N] = {0x140A5E650ULL, 0x140A5E800ULL, 0x140A5B330ULL, 0x140AF0CD0ULL, 0x140AF0DD0ULL, 0x140AEFD90ULL, 0x140AEFE90ULL, 0x140B41190ULL, 0x140B41470ULL, 0x140B41550ULL, 0x140B41710ULL, 0x140B41630ULL, 0x140B41270ULL, 0x140B4B1D0ULL, 0x140B4B150ULL, 0x140B4B500ULL, 0x140B4CD80ULL, 0x140AA28F0ULL, 0x140AA3E00ULL, 0x140AA3E20ULL, 0x140A76B90ULL, 0x140A121C0ULL, 0x140A12310ULL, 0x140A12280ULL, 0x140A5E740ULL, 0x140A45360ULL, 0x140A84350ULL};
-static const char *g_gift_expect[GIFT_N] = {"\xE9\x4B\xFD\x2D\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xDB\x04\x2E\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x3B\x58\x2D\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xCB\x35\xBB\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x5B\x38\xBB\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x3B\x14\xBB\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x3B\x15\xBB\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x3B\x3C\x23\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x5B\x41\x23\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x0B\x43\x23\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xCB\x44\x23\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x0B\x44\x23\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xEB\x3D\x23\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x5B\xEC\x28\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x9B\xE8\x28\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x4B\xEE\x28\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x5B\x43\x29\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x5B\x2D\x64\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xDB\x63\x64\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x6B\x66\x64\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x1B\x27\x33\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x2B\xE6\xD0\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x5B\xE9\xD0\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xBB\xE7\xD0\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x2B\xFE\x2D\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xDB\x74\x14\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xAB\xA3\x3A\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC"};
+#define GIFT_N 36   // 11-26: + the partner (buddy) functions and UIHelper:RequestLoadingFade, log only (Louis / partner change on a guest -> black screen)
+static const char *g_gift_name[GIFT_N] = {"CharacterHelper:EquipActiveKetsugi", "CharacterHelper:EquipPassiveKetsugi", "CharacterHelper:AcquireKetsugi", "KetsugiComponent:Server_EquipKetsugiDirectly", "KetsugiComponent:Server_EquipPassiveKetsugiDirectly", "KetsugiComponent:Multicast_EquipKetsugiDirectly", "KetsugiComponent:Multicast_EquipPassiveKetsugiDirectly", "ScenarioActor:WaitForDeferredTeleportFinished", "ScenarioActor:WaitForLargePolyFinished", "ScenarioActor:WaitForMemoryResidueFinished", "ScenarioActor:WaitForPreparePolyFinished", "ScenarioActor:WaitForOnlineMultiplaySynced", "ScenarioActor:WaitForFadeFinished", "ScenarioManager:PlayMemoryResidue", "ScenarioManager:PlayLargePolySequence", "ScenarioManager:PrepareLargePolySequence", "ScenarioManager:StartLargePolyLoad", "LIBDeferredTeleportManager:BeginDeferredTeleport", "DeferredTeleportDriver:NotifyReadyToBeginTeleport", "DeferredTeleportDriver:NotifyReadyToEndTeleport", "CharacterHelper:RequestPlayerTeleportToHost", "ArticleAccessUIComponentBase:EquipActiveKetsugi", "ArticleAccessUIComponentBase:EquipPassiveKetsugi", "ArticleAccessUIComponentBase:EquipBloodCode", "CharacterHelper:EquipBloodCode", "BloodCodeComponent:Server_EquipBloodCode", "CheckPointUIComponent:MasterKetsugi", "CharacterHelper:SetBuddy", "CharacterHelper:BuddySpawn", "CharacterHelper:ResetBuddy", "CharacterHelper:BuddyInstanceDestroy", "CharacterHelper:RemoveBuddyVolatileSave", "ScenarioActor:RegisterBuddyByte", "ScenarioActor:RegisterBuddyName", "ScenarioActor:ReleaseBuddy", "UIHelper:RequestLoadingFade"};
+static const uint64_t g_gift_addr[GIFT_N] = {0x140A5E650ULL, 0x140A5E800ULL, 0x140A5B330ULL, 0x140AF0CD0ULL, 0x140AF0DD0ULL, 0x140AEFD90ULL, 0x140AEFE90ULL, 0x140B41190ULL, 0x140B41470ULL, 0x140B41550ULL, 0x140B41710ULL, 0x140B41630ULL, 0x140B41270ULL, 0x140B4B1D0ULL, 0x140B4B150ULL, 0x140B4B500ULL, 0x140B4CD80ULL, 0x140AA28F0ULL, 0x140AA3E00ULL, 0x140AA3E20ULL, 0x140A76B90ULL, 0x140A121C0ULL, 0x140A12310ULL, 0x140A12280ULL, 0x140A5E740ULL, 0x140A45360ULL, 0x140A84350ULL, 0x140A77D40ULL, 0x140A5B9B0ULL, 0x140A77010ULL, 0x140A5B940ULL, 0x140A75BF0ULL, 0x140B3E8F0ULL, 0x140B3E9A0ULL, 0x140B3EA50ULL, 0x140B6EE30ULL};
+static const char *g_gift_expect[GIFT_N] = {"\xE9\x4B\xFD\x2D\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xDB\x04\x2E\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x3B\x58\x2D\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xCB\x35\xBB\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x5B\x38\xBB\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x3B\x14\xBB\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x3B\x15\xBB\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x3B\x3C\x23\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x5B\x41\x23\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x0B\x43\x23\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xCB\x44\x23\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x0B\x44\x23\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xEB\x3D\x23\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x5B\xEC\x28\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x9B\xE8\x28\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x4B\xEE\x28\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x5B\x43\x29\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x5B\x2D\x64\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xDB\x63\x64\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x6B\x66\x64\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x1B\x27\x33\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x2B\xE6\xD0\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x5B\xE9\xD0\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xBB\xE7\xD0\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x2B\xFE\x2D\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xDB\x74\x14\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xAB\xA3\x3A\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xCB\x58\x33\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xDB\x67\x2D\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x5B\x33\x33\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xDB\x66\x2D\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xAB\xFB\x32\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x4B\xD2\x22\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xDB\xD2\x22\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xFB\xD4\x22\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xDB\x81\x52\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC"};
 static exec_fn g_gift_orig[GIFT_N];
 static volatile LONG g_gift_count[GIFT_N];
 static volatile uintptr_t g_museum_actor;   // (declared here so the memory start can clear it; set by the late scenario hooks)
@@ -3579,7 +3596,61 @@ static void gift_note(int i, void *c, void *st) {
     if (st && readable((uintptr_t)st + 0x18, 8)) obj = *(uintptr_t *)((uintptr_t)st + 0x18);
     logf_("TRACE %s ctx=0x%llX caller=0x%llX", g_gift_name[i], (unsigned long long)(uintptr_t)c, (unsigned long long)obj);
 }
-#define GIFT_DETOUR(i) static void gift_det_##i(void *c, void *st, void *r) { gift_note(i, c, st); g_gift_orig[i](c, st, r); }
+
+// Partner vote (partner_vote=1; owner 11-26: one shared partner; "x player wants to switch to x partner" and the others accept like the
+// teleport vote, asked whenever a dialog choice makes someone the partner and the player said yes, or the partner is changed at the
+// Mistle; forced story changes need no vote). The 11-26 recording: a guest's yes to Louis made HIS game call CharacterHelper:SetBuddy
+// (his screen stayed black, nothing followed); the host's own yes ran SetBuddy -> BuddyInstanceDestroy -> RemoveBuddyVolatileSave ->
+// BuddySpawn from its ScenarioActor. So, in co-op, for Blueprint calls (FFrame Code set):
+//   guest: SetBuddy and the three that follow do not run on his PC (the partner lives in the host's world); when it was a choice (a
+//          choice window was processed in the last 15 s, or the partner menu is open) the type goes to CoopNative.partnerreq.
+//   host:  a choice is held the same way and goes to the vote; a forced story change (no choice just before) runs as always.
+// The call's parameters are consumed with FFrame::Step + P_FINISH, as the game's own thunk would, so the script continues normally.
+// Calls through ProcessEvent (Code empty: our own replay after a passed vote) always run.
+static volatile LONG g_partner_vote;
+static volatile ULONGLONG g_window_processed_at, g_buddymenu_at, g_partner_hold_at;
+static int partner_hold(int i, void *ctx, void *st) {
+    (void)ctx;
+    const char *n = g_gift_name[i];
+    int is_set = strcmp(n, "CharacterHelper:SetBuddy") == 0;
+    int is_follow = strcmp(n, "CharacterHelper:BuddyInstanceDestroy") == 0 || strcmp(n, "CharacterHelper:RemoveBuddyVolatileSave") == 0 ||
+                    strcmp(n, "CharacterHelper:BuddySpawn") == 0;
+    // a guest's change never runs on his PC in co-op (it hangs there); partner_vote only decides whether the host asks everyone first
+    if ((!is_set && !is_follow) || !coop_fresh() || (g_coop_host && !g_partner_vote)) return 0;
+    uintptr_t s = (uintptr_t)st;
+    if (!s || !readable(s + 0x18, 0x18) || *(uintptr_t *)(s + 0x20) == 0) return 0;   // not a Blueprint call: runs
+    ULONGLONG now = GetTickCount64();
+    int guest = !g_coop_host;
+    int choice = (g_window_processed_at && now - g_window_processed_at < 15000) || (g_buddymenu_at && now - g_buddymenu_at < 3000);
+    void *obj = *(void **)(s + 0x18);
+    if (is_set) {
+        if (!guest && !choice) { logf_("partner: SetBuddy on the host without a choice just before (story) -> runs as always"); return 0; }
+        uintptr_t target = 0; uint64_t type = 0;
+        ((frame_step_fn)ADDR_FRAME_STEP)(st, obj, &target);
+        ((frame_step_fn)ADDR_FRAME_STEP)(st, obj, &type);
+        *(uintptr_t *)(s + 0x20) += 1;   // P_FINISH
+        g_partner_hold_at = now;
+        unsigned ty = (unsigned)(type & 0xFF);
+        if (choice) {
+            char path[MAX_PATH + 32];
+            snprintf(path, sizeof path, "%sCoopNative.partnerreq", g_dir);
+            FILE *f = fopen(path, "w");
+            if (f) { fprintf(f, "%u %d\n", ty, guest); fclose(f); }
+        }
+        logf_("partner: SetBuddy(0x%llX, type %u) on the %s, %s -> not run here%s", (unsigned long long)target, ty, guest ? "guest" : "host",
+              choice ? "a choice" : "no choice just before (story)", choice ? ", everyone is asked (CoopNative.partnerreq)" : " (the host's world changes it)");
+        return 1;
+    }
+    if (g_partner_hold_at && now - g_partner_hold_at < 10000) {
+        uintptr_t target = 0;
+        ((frame_step_fn)ADDR_FRAME_STEP)(st, obj, &target);
+        *(uintptr_t *)(s + 0x20) += 1;
+        logf_("partner: %s(0x%llX) after a held SetBuddy -> not run here", n, (unsigned long long)target);
+        return 1;
+    }
+    return 0;
+}
+#define GIFT_DETOUR(i) static void gift_det_##i(void *c, void *st, void *r) { gift_note(i, c, st); if (partner_hold(i, c, st)) return; g_gift_orig[i](c, st, r); }
 GIFT_DETOUR(0)
 GIFT_DETOUR(1)
 GIFT_DETOUR(2)
@@ -3607,7 +3678,74 @@ GIFT_DETOUR(23)
 GIFT_DETOUR(24)
 GIFT_DETOUR(25)
 GIFT_DETOUR(26)
-static void *g_gift_det[GIFT_N] = {(void *)gift_det_0, (void *)gift_det_1, (void *)gift_det_2, (void *)gift_det_3, (void *)gift_det_4, (void *)gift_det_5, (void *)gift_det_6, (void *)gift_det_7, (void *)gift_det_8, (void *)gift_det_9, (void *)gift_det_10, (void *)gift_det_11, (void *)gift_det_12, (void *)gift_det_13, (void *)gift_det_14, (void *)gift_det_15, (void *)gift_det_16, (void *)gift_det_17, (void *)gift_det_18, (void *)gift_det_19, (void *)gift_det_20, (void *)gift_det_21, (void *)gift_det_22, (void *)gift_det_23, (void *)gift_det_24, (void *)gift_det_25, (void *)gift_det_26};
+GIFT_DETOUR(27)
+GIFT_DETOUR(28)
+GIFT_DETOUR(29)
+GIFT_DETOUR(30)
+GIFT_DETOUR(31)
+GIFT_DETOUR(32)
+GIFT_DETOUR(33)
+GIFT_DETOUR(34)
+GIFT_DETOUR(35)
+static void *g_gift_det[GIFT_N] = {(void *)gift_det_0, (void *)gift_det_1, (void *)gift_det_2, (void *)gift_det_3, (void *)gift_det_4, (void *)gift_det_5, (void *)gift_det_6, (void *)gift_det_7, (void *)gift_det_8, (void *)gift_det_9, (void *)gift_det_10, (void *)gift_det_11, (void *)gift_det_12, (void *)gift_det_13, (void *)gift_det_14, (void *)gift_det_15, (void *)gift_det_16, (void *)gift_det_17, (void *)gift_det_18, (void *)gift_det_19, (void *)gift_det_20, (void *)gift_det_21, (void *)gift_det_22, (void *)gift_det_23, (void *)gift_det_24, (void *)gift_det_25, (void *)gift_det_26, (void *)gift_det_27, (void *)gift_det_28, (void *)gift_det_29, (void *)gift_det_30, (void *)gift_det_31, (void *)gift_det_32, (void *)gift_det_33, (void *)gift_det_34, (void *)gift_det_35};
+
+// Trigger trace (trigger_trace=1, log only; 2026-11-26, owner: "i'd prefer that it really does copy the whole sequence of activating a
+// mistle - from the animation, effects and text. if you need me to record it as the host, we can do that"). The exec functions of the
+// interaction chain (the character's FieldTriggerActionComponent, FieldTriggerBase, Mistle, door, rotten Mistle, messages, montages):
+// every call (300 per function) is logged and its object, the object's class, its owner and the calling script function go to
+// CoopNative.names as FName indices, so CoopProbe logs them as text ("trace: <function> on <object> (<class>) of <owner> from <fn>").
+// Only entry stubs (E9 jump + CC) are hooked: 11-26 19:05 the host crashed 23 s after start with hooks in shared compiled exec
+// bodies (other code jumps into their middle); those (ClearBindTrigger, OnAnimNotifyGetItem, ProcessFinish, CheckPointBase
+// OpenImmediate, DoorBase OnRep_DoorState / DoorAnimationTimelineFinished / OpenImmediate, RadarMapReleaser MulticastReleaseMap /
+// OnRepMapReleased) are left out.
+#define TT_N 23
+static const char *g_tt_name[TT_N] = {"FieldTriggerActionComponent:SetBindCharacter", "FieldTriggerActionComponent:Server_SetBindTrigger", "FieldTriggerActionComponent:RPCServer_SetBindCharacter", "FieldTriggerActionComponent:RequestPlayAnimation", "FieldTriggerActionComponent:ProcessFieldTriggerEvent", "FieldTriggerActionComponent:OnInputActionButton", "FieldTriggerActionComponent:Multicast_SetBindTrigger", "FieldTriggerBase:ProcessInputButtonEvent", "FieldTriggerBase:OnNotifyFieldTriggerExecution", "FieldTriggerBase:SetInputEventParam", "FieldTriggerBase:SetState", "FieldTriggerBase:OnInputEventTriggered", "FieldTriggerBase:PlayFieldTriggerSound", "FieldTriggerBase:SetGimmickVisibility", "CheckPointBase:Multicast_InitState", "CheckPointBase:OnStartedAnimation", "CheckPointBase:OnEndedAnimation", "CheckPointBase:OnPreStartAnimation", "DoorBase:Multicast_InitState", "UIHelper:ShowPopupMessage", "UIHelper:ShowNetworkMessage", "UIHelper:ShowTutorialMessage", "Character:PlayAnimMontage"};
+static const uint64_t g_tt_addr[TT_N] = {0x140ACEB10ULL, 0x140ACEA50ULL, 0x140ACE600ULL, 0x140ACE700ULL, 0x140ACE3A0ULL, 0x140ACE190ULL, 0x140ACDBF0ULL, 0x140AD48B0ULL, 0x140AD4740ULL, 0x140AD4F40ULL, 0x140AD50F0ULL, 0x140AD46C0ULL, 0x140AD4830ULL, 0x140AD4D80ULL, 0x140A8BEC0ULL, 0x140B83680ULL, 0x140A843E0ULL, 0x140A84470ULL, 0x140B68370ULL, 0x140B703F0ULL, 0x140B702B0ULL, 0x140B70590ULL, 0x14230E2B0ULL};
+static const char *g_tt_expect[TT_N] = {"\xE9\xEB\xDA\x93\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x6B\xDA\x93\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x9B\xD3\x93\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x4B\xD5\x93\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x0B\xCF\x93\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x5B\xC9\x93\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x2B\xC4\x93\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x4B\x90\x9C\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x2B\x87\x9C\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x2B\xC2\x9C\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xEB\xC6\x9C\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x8B\x7B\x9C\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x1B\x8C\x9C\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x0B\xA4\x9C\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x3B\x92\x3E\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x3B\x28\x5E\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x4B\xA5\x3A\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x3B\xA6\x3A\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x4B\xB5\x4F\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x9B\xAE\x52\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xAB\xAD\x52\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\xAB\xAF\x52\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", "\xE9\x6B\xAF\x18\x0E\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC"};
+static exec_fn g_tt_orig[TT_N];
+static volatile LONG g_tt_count[TT_N];
+static void tt_note(int i, void *c, void *st) {
+    if (InterlockedIncrement(&g_tt_count[i]) > 300) return;
+    uintptr_t o = (uintptr_t)c, s = (uintptr_t)st;
+    int oi = 0, on = 0, ci = 0, fi = 0, ui = 0, un = 0;
+    if (o && readable(o + 0x10, 0x18)) {
+        oi = *(int *)(o + 0x18); on = *(int *)(o + 0x1C);
+        uintptr_t cl = *(uintptr_t *)(o + 0x10), ou = *(uintptr_t *)(o + 0x20);
+        if (cl && readable(cl + 0x18, 4)) ci = *(int *)(cl + 0x18);
+        if (ou && readable(ou + 0x18, 8)) { ui = *(int *)(ou + 0x18); un = *(int *)(ou + 0x1C); }
+    }
+    if (s && readable(s + 0x10, 8)) { uintptr_t node = *(uintptr_t *)(s + 0x10); if (node && readable(node + 0x18, 4)) fi = *(int *)(node + 0x18); }
+    logf_("TT %s ctx=0x%llX", g_tt_name[i], (unsigned long long)o);
+    char p[MAX_PATH + 32];
+    snprintf(p, sizeof p, "%sCoopNative.names", g_dir);
+    FILE *f = fopen(p, "a");
+    if (f) { fprintf(f, "%s %d %d %d %d %d %d\n", g_tt_name[i], oi, on, ci, fi, ui, un); fclose(f); }
+}
+#define TT_DETOUR(i) static void tt_det_##i(void *c, void *st, void *r) { tt_note(i, c, st); g_tt_orig[i](c, st, r); }
+TT_DETOUR(0)
+TT_DETOUR(1)
+TT_DETOUR(2)
+TT_DETOUR(3)
+TT_DETOUR(4)
+TT_DETOUR(5)
+TT_DETOUR(6)
+TT_DETOUR(7)
+TT_DETOUR(8)
+TT_DETOUR(9)
+TT_DETOUR(10)
+TT_DETOUR(11)
+TT_DETOUR(12)
+TT_DETOUR(13)
+TT_DETOUR(14)
+TT_DETOUR(15)
+TT_DETOUR(16)
+TT_DETOUR(17)
+TT_DETOUR(18)
+TT_DETOUR(19)
+TT_DETOUR(20)
+TT_DETOUR(21)
+TT_DETOUR(22)
+static void *g_tt_det[TT_N] = {(void *)tt_det_0, (void *)tt_det_1, (void *)tt_det_2, (void *)tt_det_3, (void *)tt_det_4, (void *)tt_det_5, (void *)tt_det_6, (void *)tt_det_7, (void *)tt_det_8, (void *)tt_det_9, (void *)tt_det_10, (void *)tt_det_11, (void *)tt_det_12, (void *)tt_det_13, (void *)tt_det_14, (void *)tt_det_15, (void *)tt_det_16, (void *)tt_det_17, (void *)tt_det_18, (void *)tt_det_19, (void *)tt_det_20, (void *)tt_det_21, (void *)tt_det_22};
 
 // Late scenario trace (session 10): the memory waits for the guest and the wait is unknown. Tracing every ScenarioActor wait
 // from the start hung the boss intro (10-29), so these are installed only after a boss kill with keep_outro (worker thread,
@@ -3628,6 +3766,7 @@ static void late_note(int i, void *c, void *st) {
         if (locals && readable(locals, 8)) p0 = *(uintptr_t *)locals;
     }
     if (strstr(g_late_name[i], "OnMemoryResidueFinished") && p0) { g_museum_actor = p0; g_museum_at = GetTickCount64(); }
+    if (strcmp(g_late_name[i], "ScenarioActor:WaitForWindowProcessed") == 0) g_window_processed_at = GetTickCount64();   // partner vote: a choice
     // memory polish (1)+(2): the memory ends with FinishMuseum: stop v5/v4 there (back in the field many characters are in setup and
     // must not be reset), and treat the return to the field like a group teleport so the guest is spawned next to the host instead
     // of being left out of bounds (same "start"/"arrived" markers as a Mistle teleport).
@@ -4592,24 +4731,28 @@ static DWORD WINAPI worker(LPVOID unused) {
     {
         // Session 9: with these traced, entering a boss area hung both PCs in the intro (WaitForPreparePolyFinished); the cutscene
         // and deferred-teleport ones are installed only with scenario_trace=1 now
-        char ini[2048];
+        char ini[4096];
         int scen = read_small_file("CoopNative.ini", ini, sizeof ini) && strstr(ini, "scenario_trace=1");
         for (int i = 0; i < GIFT_N; i++) {
             const char *n = g_gift_name[i];
             // the two memory-residue calls stay traced (not used by the boss intro; the post-boss memory is what hangs)
-            int memory = strstr(n, "MemoryResidue") != NULL;
+            int memory = strstr(n, "MemoryResidue") != NULL || strstr(n, "Buddy") != NULL;
             // session 10: single cutscene waits can be traced by name (scenario_trace_names=A,B in the ini) to find the outro wait
             const char *fn = strchr(n, ':');
             if (fn && strstr(ini, "scenario_trace_names=") && strstr(strstr(ini, "scenario_trace_names="), fn + 1)) memory = 1;
             if (!scen && !memory && (strncmp(n, "Scenario", 8) == 0 || strstr(n, "DeferredTeleport"))) { logf_("%s: not traced (scenario_trace=0)", n); continue; }
             install(n, g_gift_addr[i], g_gift_expect[i], g_gift_det[i], (void **)&g_gift_orig[i]);
         }
+        if (strstr(ini, "trigger_trace=1")) {
+            logf_("trigger trace: installing %d hooks (log only)", TT_N);
+            for (int i = 0; i < TT_N; i++) install(g_tt_name[i], g_tt_addr[i], g_tt_expect[i], g_tt_det[i], (void **)&g_tt_orig[i]);
+        }
     }
     // Cleanup (2026-10-30, item 4): the pure log hooks (fade trace, GetPlayerController and the
     // IsPlayerPlayable logger) are installed only with diag_hooks=1; hooks that also fix something stay on (the late scenario hooks
     // find the museum actor and the memory end, the loading check holds v3)
     {
-        char ini[2048];
+        char ini[4096];
         g_diag_hooks = read_small_file("CoopNative.ini", ini, sizeof ini) && strstr(ini, "diag_hooks=1");
         logf_("diag_hooks = %d", g_diag_hooks);
     }
@@ -4922,8 +5065,11 @@ static DWORD WINAPI worker(LPVOID unused) {
         // session 10: after any boss kill (solo too), for a solo baseline of the memory
         // (the late hooks also find the museum actor and the memory end: always installed; only the IsPlayerPlayable logger is diag)
         // item 10 (2026-10-30): a vestige restoration plays a memory without a boss kill: also install them at a memory start
-        if ((g_bosskill_at || g_memory_at || g_restore_seen_at || restui_fresh() || g_vest_menu_at) && !g_late_installed && InterlockedExchange(&g_late_installed, 1) == 0) {
-            logf_("late scenario trace: installing %d hooks (%s)", LATE_N, g_bosskill_at ? "after the boss kill" : g_memory_at ? "memory start" : "restoration chosen in a talk menu");
+        // 11-26: also at a guest's first talk with an NPC (the talk override answered): the Louis follower offer left his screen black,
+        // and these show what his scenario waits for
+        if ((g_bosskill_at || g_memory_at || g_restore_seen_at || restui_fresh() || g_vest_menu_at || g_talk_answers > 0) && !g_late_installed && InterlockedExchange(&g_late_installed, 1) == 0) {
+            logf_("late scenario trace: installing %d hooks (%s)", LATE_N, g_bosskill_at ? "after the boss kill" : g_memory_at ? "memory start" :
+                  (g_talk_answers > 0 && !g_vest_menu_at && !g_restore_seen_at) ? "a talk with an NPC" : "restoration chosen in a talk menu");
             for (int i = 0; i < LATE_N; i++) install(g_late_name[i], g_late_addr[i], g_late_expect[i], g_late_det[i], (void **)&g_late_orig[i]);
             if (g_diag_hooks) install("MuseumUtilityActor:IsPlayerPlayable", ADDR_EXEC_PLAYER_PLAYABLE,
                     "\xE9\x1B\xA1\xCF\x07\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_playable, (void **)&g_orig_playable);
@@ -5168,6 +5314,9 @@ static void settings_apply(void) {
         } else if (!_stricmp(key, "memory_vote")) {
             ST_NEED_ONOFF();
             changed += st_set(ini, "CoopNative.ini", "memory_vote", b ? "1" : "0", key);
+        } else if (!_stricmp(key, "partner_vote")) {
+            ST_NEED_ONOFF();
+            changed += st_set(ini, "CoopNative.ini", "partner_vote", b ? "1" : "0", key);
         } else if (!_stricmp(key, "shared_boss_rewards")) {
             ST_NEED_ONOFF();
             changed += st_set(pr, "CoopProgress config.txt", "guest_rewards", b ? "1" : "0", key);

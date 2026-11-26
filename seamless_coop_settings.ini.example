@@ -32,6 +32,11 @@ teleport_vote = on
 ; off = the memory starts for everyone at once.
 memory_vote = on
 
+; Everyone is asked before the AI partner changes, when someone picks a partner in a dialog or at a Mistle (on).
+; off = a partner picked by anyone becomes everyone's partner without asking. Story scenes that change the
+; partner are never asked.
+partner_vote = on
+
 [Rewards]
 ; Guests also get the rewards of a boss you killed together (on / off).
 shared_boss_rewards = on
