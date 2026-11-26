@@ -328,6 +328,12 @@ static volatile float g_unfade_time = 0.3f;
 #define ADDR_UI_REQUEST_UNFADE 0x1409CC650ULL
 typedef void (*uiunfade_fn)(void *ctx, void *caller, uint8_t usage, uint8_t down_count, float time);
 static volatile LONG g_memunfade_pending, g_memunfade_usage = 106;
+// Partner change (11-26 20:22): the chooser's scene raised a loading screen before SetBuddy and lifts it only after the partner has
+// spawned; with the change held (and the scene ended) nobody lifted it, the guest stayed on a black loading screen. "partnerunfade
+// <pawn> <scene>" lifts the loading-screen usages on the game thread with the game's own RequestUnfade: Invalid 0 (the host's unfade
+// after its own Louis spawn, 18:48:18), LongLoading 64, ResetField 32, Application 100; caller = the scene and the pawn.
+static volatile uintptr_t g_punfade_ctx, g_punfade_caller;
+static volatile LONG g_punfade_pending;
 // Item 8 (2026-10-30): on a group teleport the guest saw his world unload around him ("going through nothingness"). CoopProbe on the
 // guest sends "tpfade <pawn> 1" when the host's character is replaced (teleport) and "tpfade <pawn> 0" once his own new character
 // stands next to the host (or after 25 s); the game thread then runs the game's own teleport fade (usage 48, as the vanilla
@@ -809,6 +815,17 @@ static void game_thread_work(void) {
             logf_("tpfade: %s, usage %u (context 0x%llX)", tf ? (u == 64 ? "loading screen requested" : "teleport fade requested") : "unfade requested", u,
                   (unsigned long long)c);
         } else if (tf >= 0) logf_("tpfade: no valid context");
+    }
+    if (g_punfade_pending && InterlockedExchange(&g_punfade_pending, 0)) {
+        uintptr_t c = g_punfade_ctx, sc = g_punfade_caller;
+        static const uint8_t us[4] = {0, 64, 32, 100};
+        if (c && readable(c, 8)) {
+            for (int i = 0; i < 4; i++) {
+                if (sc && readable(sc, 8)) ((uiunfade_fn)ADDR_UI_REQUEST_UNFADE)((void *)c, (void *)sc, us[i], 0, 0.5f);
+                ((uiunfade_fn)ADDR_UI_REQUEST_UNFADE)((void *)c, (void *)c, us[i], 0, 0.5f);
+            }
+            logf_("partner: loading screen lifted (usages 0/64/32/100, caller the scene 0x%llX and the character 0x%llX)", (unsigned long long)sc, (unsigned long long)c);
+        } else logf_("partner: unfade dropped (no valid character)");
     }
     if (g_tpf_step && GetTickCount64() >= g_tpf_step_at) {
         LONG st = InterlockedExchange(&g_tpf_step, 0);
@@ -2557,6 +2574,9 @@ static void run_command(char *buf) {
         itembtn_cmd(buf + 7);
     } else if (strncmp(buf, "chestbtn", 8) == 0) {
         chestbtn_cmd(buf + 8);
+    } else if (strncmp(buf, "partnerunfade ", 14) == 0) {
+        unsigned long long pw = 0, sc = 0;
+        if (sscanf(buf + 14, "%llx %llx", &pw, &sc) >= 1) { g_punfade_ctx = (uintptr_t)pw; g_punfade_caller = (uintptr_t)sc; InterlockedExchange(&g_punfade_pending, 1); }
     } else if (strncmp(buf, "buddymenu", 9) == 0) {
         if (!g_buddymenu_at || GetTickCount64() - g_buddymenu_at > 3000) logf_("partner: the partner menu is open (a change there is a choice)");
         g_buddymenu_at = GetTickCount64();
@@ -4724,7 +4744,7 @@ static DWORD WINAPI worker(LPVOID unused) {
     install("EndCooperativeMode", ADDR_END_COOP_BODY,
             "\x40\x53\x48\x83\xEC\x20\x48\x89\xCB\xE8\x82\x03\x99\xF9\x48\x85", (void *)detour_end_coop, (void **)&g_orig_end_coop);
     {
-        char ini[2048];
+        char ini[4096];
         if (read_small_file("CoopNative.ini", ini, sizeof ini) && strstr(ini, "trace_death=1"))
             for (int i = 0; i < TRACE_N; i++)
                 install(g_trace_name[i], g_trace_addr[i], g_trace_expect[i], g_trace_det[i], (void **)&g_trace_orig[i]);

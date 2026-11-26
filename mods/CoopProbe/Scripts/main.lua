@@ -3556,7 +3556,7 @@ function pvAbortScene(addr)
     local sa = findByAddress("ScenarioActor", addr)
     if not sa then return false end
     local ok, e = pcall(function() sa:SetAbortOnce(0) end)
-    pvScene = { sa = sa, at = os.clock() }
+    pvScene = { sa = sa, addr = addr, at = os.clock() }
     log("partner vote: the scene that asked (" .. name(sa) .. ") ended with SetAbortOnce(CancelButton) " .. (ok and "ok" or tostring(e):sub(1, 60)))
     return true
 end
@@ -3564,6 +3564,10 @@ function pvSceneTick()
     local s = pvScene
     if not s or os.clock() - s.at < 2 then return end
     pvScene = nil
+    -- (11-26 20:22) the scene raised a loading screen before SetBuddy that only its own end (after the spawn) lifts: lift it
+    local me = try(function() return localPC().Pawn end)
+    local ma = valid(me) and try(function() return me:GetAddress() end)
+    if ma then vmCmd(string.format("partnerunfade %X %X", ma, s.addr or 0)); log("partner vote: our loading screen is lifted (the scene that raised it was ended)") end
     if not valid(s.sa) then log("partner vote: the scene is gone"); return end
     local ab = try(function() return s.sa:IsAborted() end)
     if ab == true then log("partner vote: the scene reports aborted"); return end
@@ -3580,6 +3584,25 @@ function pvStoryOutcome(me)
     for _, l in ipairs(FindAllOf("ScenarioProgressLoader") or {}) do if valid(l) and pcall(function() l:ReloadProgress() end) then n = n + 1 end end
     log("partner vote: story outcome in our world: DecideBuddy " .. (was == true and "was already set" or (ok and "set" or "FAILED")) .. ", " .. n .. " story loader(s) reloaded")
 end
+-- (11-26 20:22: "two louis") the host's own scene hides the NPC who joins (BP_ScenarioChara_St02_Louis_172 went to V0 at 18:48:17, its
+-- progress visibility); the same here for the visible story characters named like the new partner within 60 m of a player. The
+-- visibility mirror passes it to the guests.
+function pvHideJoiner(ty)
+    local pn = partnerName(ty)
+    local pls = {}
+    for _, p in ipairs(FindAllOf("BP_Player_C") or {}) do local l = valid(p) and try(function() return p:K2_GetActorLocation() end); if l then pls[#pls + 1] = l end end
+    local hid = {}
+    for _, q in ipairs(FindAllOf("Character") or {}) do
+        local n = valid(q) and name(q) or ""
+        if n:find("ScenarioChara", 1, true) and n:find(pn, 1, true) and try(function() return q.bProgressVisibility end) == true then
+            local l = try(function() return q:K2_GetActorLocation() end)
+            local near = false
+            for _, pl in ipairs(pls) do if l and (l.X - pl.X) ^ 2 + (l.Y - pl.Y) ^ 2 + (l.Z - pl.Z) ^ 2 < 6000 * 6000 then near = true end end
+            if near and pcall(function() q:SetProgressVisibility(false) end) then hid[#hid + 1] = n end
+        end
+    end
+    log("partner vote: " .. pn .. "'s story character in our world hidden as its scene does: " .. (#hid > 0 and table.concat(hid, ", ") or "none found near"))
+end
 function pvApply(ty, story)
     local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
     local me = try(function() return localPC().Pawn end)
@@ -3591,7 +3614,7 @@ function pvApply(ty, story)
     local function r(ok, e) return ok and "ok" or ("FAILED " .. tostring(e):sub(1, 60)) end
     log("partner vote: " .. partnerName(ty) .. " becomes the partner: SetBuddy " .. r(a, ea) .. ", BuddyInstanceDestroy " .. r(b, eb) ..
         ", RemoveBuddyVolatileSave " .. r(c, ec) .. ", BuddySpawn " .. r(d, ed) .. ", now " .. tostring(try(function() return helper:GetBuddy(me) end)))
-    if story then pcall(pvStoryOutcome, me) end
+    if story then pcall(pvStoryOutcome, me); pcall(pvHideJoiner, ty) end
     votePopup(partnerName(ty) .. " is the partner now")
 end
 function partnerTick()
