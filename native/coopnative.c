@@ -3644,7 +3644,9 @@ static int partner_hold(int i, void *ctx, void *st) {
     int choice = (g_window_processed_at && now - g_window_processed_at < 15000) || (g_buddymenu_at && now - g_buddymenu_at < 3000);
     void *obj = *(void **)(s + 0x18);
     if (is_set) {
-        if (!guest && !choice) { logf_("partner: SetBuddy on the host without a choice just before (story) -> runs as always"); return 0; }
+        // (11-26 20:37) forced story changes run on every PC, guests included: skipping one inside the memory scene after the first
+        // boss left the guest's memory inconsistent (it ended at once) and his game crashed on the memory's first player check
+        if (!choice) { logf_("partner: SetBuddy on the %s without a choice just before (story) -> runs as always", guest ? "guest" : "host"); return 0; }
         uintptr_t target = 0; uint64_t type = 0;
         ((frame_step_fn)ADDR_FRAME_STEP)(st, obj, &target);
         ((frame_step_fn)ADDR_FRAME_STEP)(st, obj, &type);

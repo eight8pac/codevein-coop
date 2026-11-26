@@ -3568,6 +3568,10 @@ function pvSceneTick()
     local me = try(function() return localPC().Pawn end)
     local ma = valid(me) and try(function() return me:GetAddress() end)
     if ma then vmCmd(string.format("partnerunfade %X %X", ma, s.addr or 0)); log("partner vote: our loading screen is lifted (the scene that raised it was ended)") end
+    -- (11-26 20:32) the scene had also locked our input right before SetBuddy (SetTemporaryInputMask); its own end would have cleared it
+    local pc = localPC()
+    local okm, em = pcall(function() pc:ClearAllTemporaryInputMask() end)
+    log("partner vote: the scene's input lock cleared (ClearAllTemporaryInputMask) " .. (okm and "ok" or tostring(em):sub(1, 80)))
     if not valid(s.sa) then log("partner vote: the scene is gone"); return end
     local ab = try(function() return s.sa:IsAborted() end)
     if ab == true then log("partner vote: the scene reports aborted"); return end
@@ -4111,6 +4115,27 @@ function hostVestigeTick()
         hvLast = line
         vmCmd(line)
         log("vestige (host): story starter(s) open for us in co-op: " .. (#names > 0 and table.concat(names, ", ") or "none"))
+    end
+end
+-- (11-26 20:36) the guest's rotten Mistle: his animation played on the host's copy of him, but the host was far away and the engine
+-- does not tick a character nobody sees, so the animation's cue (which releases the map) never fired until the host came near. On the
+-- host the guests' character meshes therefore always tick their pose (MeshComponentUpdateFlag AlwaysTickPose 1; the cues fire).
+hgmAt, hgmDone = -1000, {}
+function hostGuestMeshTick()
+    local now = os.clock()
+    if now - hgmAt < 5 then return end
+    hgmAt = now
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not valid(gs) or try(function() return gs.Role end) ~= 3 then return end
+    for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+        local g = valid(c) and not try(function() return c:IsLocalController() end) and try(function() return c.Pawn end) or nil
+        local m = valid(g) and try(function() return g.Mesh end)
+        if valid(m) and try(function() return m.MeshComponentUpdateFlag end) ~= 1 then
+            local before = try(function() return m.MeshComponentUpdateFlag end)
+            local ok = pcall(function() m.MeshComponentUpdateFlag = 1 end)
+            local n = name(g)
+            if not hgmDone[n] then hgmDone[n] = true; log("guest animation: " .. n .. "'s mesh ticks its pose also when we do not see it (update flag " .. tostring(before) .. " -> 1) " .. tostring(ok)) end
+        end
     end
 end
 hdPending, hdLines = {}, 0
@@ -9132,6 +9157,7 @@ LoopAsync(200, function()
         end
         pcall(hostDoorTick)
         pcall(hostVestigeTick)
+        pcall(hostGuestMeshTick)
         pcall(trigCensusTick)
         local line = worldSettled() and (try(stateLine) or "state error") or last
         if line ~= last then log("STATE " .. line); last = line end
