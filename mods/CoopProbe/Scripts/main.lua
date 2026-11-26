@@ -2002,7 +2002,7 @@ function votePass()
         if c then c:write("votepass\n"); c:close() end
     end
     if v.vmem then vmemRelease("everyone agreed") end
-    if v.pvote then pcall(pvApply, v.ptype) end
+    if v.pvote then pcall(pvApply, v.ptype, v.pstory) end
     voteSendAll("CoopVoteEnd:1")
     if v.rvote and not v.fromGuest and rvMine then local a = rvMine.addr; rvMine = nil; rvDecide(a, true) end
     log(v.pvote and "partner vote: everyone agreed" or (v.mem or v.vmem or v.rvote) and "memory vote: everyone agreed -> the memory starts in a moment" or "teleport vote: everyone agreed -> teleport in a moment")
@@ -3536,9 +3536,9 @@ end
 PARTNER_NAMES = { [0] = "Louis", "Yakumo", "Io", "Mia", "Jack", "Eva", "Oliver", "Mia", "Jack", "Louis", "Louis", "Louis" }
 pvAt, pvMenuAt = -1000, -1000
 function partnerName(ty) return PARTNER_NAMES[ty] or ("partner " .. tostring(ty)) end
-function pvStart(ty, fromGuest)
+function pvStart(ty, fromGuest, story)
     local guests = voteGuests()
-    voteState = { pvote = true, ptype = ty, fromGuest = fromGuest, at = os.clock(), yes = 0, need = #guests }
+    voteState = { pvote = true, ptype = ty, pstory = story, fromGuest = fromGuest, at = os.clock(), yes = 0, need = #guests }
     local who = fromGuest and votePlayerName(guests[1]) or votePlayerName(localPC())
     local text = (who or "Your partner") .. " wants " .. partnerName(ty) .. " as the partner."
     log("partner vote: " .. (fromGuest and "the guest wants " or "we want ") .. partnerName(ty) .. " (type " .. ty .. "); " .. #guests .. " answer(s) needed")
@@ -3546,7 +3546,41 @@ function pvStart(ty, fromGuest)
     voteSendAll(string.format("CoopVote:-1,-1,%d,%s", fromGuest and 1 or 0, text))
     if fromGuest then voteOpenDialog(text) else votePopup("Waiting for your partner to agree to " .. partnerName(ty) .. " as the partner") end
 end
-function pvApply(ty)
+-- (11-26 19:43) the chooser's own scene stops right after SetBuddy (the guest's screen stayed black; on the host it would go on and set
+-- the story flag even when the others say no). So the scene that asked is ended with the game's own abort (ScenarioActor:SetAbortOnce
+-- CancelButton; ScenarioManager:FinishScenario 2 s later if it still runs), and on yes the host's world gets the whole outcome: the
+-- swap, the scene's flag DecideBuddy (the only flag the host's own Louis scene changed, 19:44:10) and a story reload, so the
+-- "Stranger" leaves too. On no nothing changes and the offer stays.
+pvScene = nil
+function pvAbortScene(addr)
+    local sa = findByAddress("ScenarioActor", addr)
+    if not sa then return false end
+    local ok, e = pcall(function() sa:SetAbortOnce(0) end)
+    pvScene = { sa = sa, at = os.clock() }
+    log("partner vote: the scene that asked (" .. name(sa) .. ") ended with SetAbortOnce(CancelButton) " .. (ok and "ok" or tostring(e):sub(1, 60)))
+    return true
+end
+function pvSceneTick()
+    local s = pvScene
+    if not s or os.clock() - s.at < 2 then return end
+    pvScene = nil
+    if not valid(s.sa) then log("partner vote: the scene is gone"); return end
+    local ab = try(function() return s.sa:IsAborted() end)
+    if ab == true then log("partner vote: the scene reports aborted"); return end
+    local sm = StaticFindObject("/Script/Extensions.Default__ScenarioManager")
+    local gs = FindFirstOf("BP_AppGameState_C")
+    local ok, r = pcall(function() return sm:FinishScenario(gs) end)
+    log("partner vote: the scene still runs 2 s after the abort (aborted " .. tostring(ab) .. ") -> FinishScenario " .. (ok and tostring(r) or tostring(r):sub(1, 60)))
+end
+function pvStoryOutcome(me)
+    local sm = StaticFindObject("/Script/Extensions.Default__AppSaveManager")
+    local was = try(function() return sm:CheckGameProgress("DecideBuddy", me) end)
+    local ok = was == true or pcall(function() sm:SetGameProgress("DecideBuddy", me, true) end)
+    local n = 0
+    for _, l in ipairs(FindAllOf("ScenarioProgressLoader") or {}) do if valid(l) and pcall(function() l:ReloadProgress() end) then n = n + 1 end end
+    log("partner vote: story outcome in our world: DecideBuddy " .. (was == true and "was already set" or (ok and "set" or "FAILED")) .. ", " .. n .. " story loader(s) reloaded")
+end
+function pvApply(ty, story)
     local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
     local me = try(function() return localPC().Pawn end)
     if not valid(me) or not valid(helper) then log("partner vote: no character, nothing changed"); return end
@@ -3557,10 +3591,12 @@ function pvApply(ty)
     local function r(ok, e) return ok and "ok" or ("FAILED " .. tostring(e):sub(1, 60)) end
     log("partner vote: " .. partnerName(ty) .. " becomes the partner: SetBuddy " .. r(a, ea) .. ", BuddyInstanceDestroy " .. r(b, eb) ..
         ", RemoveBuddyVolatileSave " .. r(c, ec) .. ", BuddySpawn " .. r(d, ed) .. ", now " .. tostring(try(function() return helper:GetBuddy(me) end)))
+    if story then pcall(pvStoryOutcome, me) end
     votePopup(partnerName(ty) .. " is the partner now")
 end
 function partnerTick()
     local now = os.clock()
+    pcall(pvSceneTick)
     -- the Mistle's partner menu: a change there is a choice (CoopNative holds it for the vote)
     if iniHas("partner_vote=1") and now - pvMenuAt > 1 then
         pvMenuAt = now
@@ -3571,16 +3607,18 @@ function partnerTick()
     local f = io.open(path, "r")
     if not f then return end
     local s = f:read("*a") or ""; f:close(); os.remove(path)
-    local ty = tonumber(s:match("^(%d+)"))
+    local ty, _, caller = s:match("^(%d+)%s+(%d+)%s*(%x*)")
+    ty = tonumber(ty)
     if not ty then return end
+    local story = caller and caller ~= "" and pvAbortScene(tonumber(caller, 16)) or false
     local gs = FindFirstOf("BP_AppGameState_C")
     local isHost = valid(gs) and try(function() return gs.Role end) == 3
     if isHost then
         if voteState then log("partner vote: " .. partnerName(ty) .. " chosen while another vote runs -> not now"); votePopup("Changing the partner is not possible now: another vote is running"); return end
-        pvStart(ty, false)
+        pvStart(ty, false, story)
     else
         voteMineAt = os.clock()
-        log("partner vote: we chose " .. partnerName(ty) .. " -> the host asks everyone (" .. tostring(fsToHost(28, ty)) .. ")")
+        log("partner vote: we chose " .. partnerName(ty) .. (story and " in a scene" or "") .. " -> the host asks everyone (" .. tostring(fsToHost(28, ty + (story and 256 or 0))) .. ")")
         votePopup("Waiting for the others to agree to " .. partnerName(ty) .. " as the partner")
     end
 end
@@ -3798,6 +3836,28 @@ function guestBindOnHost(trigger, me)
     local b, eb = pcall(function() comp:Server_SetBindTrigger(trigger) end)
     return "RPCServer_SetBindCharacter " .. (a and "sent" or ("FAILED " .. tostring(ea):sub(1, 60))) .. ", Server_SetBindTrigger " .. (b and "sent" or ("FAILED " .. tostring(eb):sub(1, 60)))
 end
+-- (11-26 19:42) the Mistle opened as far as "opening" on the host after the binding calls, then stalled: the activation finishes on the
+-- character's interaction animation (its cues), and his own input, which would play it, no longer runs on his PC. So the trigger's own
+-- montage (TriggerActionMontage) is requested through his FieldTriggerActionComponent:RequestPlayAnimation - on his PC, and by the host on
+-- its copy of his character (kind 29: name hash + class 0 door / 1 Mistle / 2 rotten Mistle), so the cues fire on both PCs.
+-- (In this game Character:PlayAnimMontage has a 4th parameter, BlendInTime: the old 3-argument call could never work.)
+function playInteraction(trigger, ch)
+    local mont = try(function() return trigger.TriggerActionMontage end)
+    if not valid(mont) then return "no TriggerActionMontage" end
+    local cls = StaticFindObject("/Script/Extensions.FieldTriggerActionComponent")
+    local comp = valid(cls) and valid(ch) and try(function() return ch:GetComponentByClass(cls) end) or nil
+    local ok, r = false, nil
+    if valid(comp) then ok, r = pcall(function() return comp:RequestPlayAnimation(mont) end) end
+    if ok and r then return name(mont) .. " via RequestPlayAnimation" end
+    local ok2, r2 = pcall(function() return ch:PlayAnimMontage(mont, 1.0, FName("None"), 0.2) end)
+    return name(mont) .. ": RequestPlayAnimation " .. (ok and tostring(r) or ("FAILED " .. tostring(r):sub(1, 50))) .. ", PlayAnimMontage " .. (ok2 and ("length " .. tostring(r2)) or ("FAILED " .. tostring(r2):sub(1, 50)))
+end
+TRIG_CLASSES = { [0] = "DoorBase", "CheckPointBase", "RadarMapReleaser" }
+function guestInteract(trigger, me, clsCode)
+    local s = guestBindOnHost(trigger, me) .. "; our animation: " .. playInteraction(trigger, me)
+    s = s .. "; host's copy asked " .. tostring(fsToHost(29, nameHash22(name(trigger)) + clsCode * 4194304))
+    return s
+end
 tgFallback, tgFbLines = {}, 0
 function guestFallbackTick(now)
     for n, f in pairs(tgFallback) do
@@ -3838,7 +3898,7 @@ function trigGuestTick()
                 local rn = name(rel)
                 if not tgSent[rn] or now - tgSent[rn] > 3 then
                     tgSent[rn] = now
-                    say("rotten Mistle: we purified " .. rn .. " (input " .. ty .. ", released " .. tostring(try(function() return rel.bMapReleased end)) .. ") -> the game's own path on the host: " .. guestBindOnHost(rel, me))
+                    say("rotten Mistle: we purified " .. rn .. " (input " .. ty .. ", released " .. tostring(try(function() return rel.bMapReleased end)) .. ") -> the game's own path on the host: " .. guestInteract(rel, me, 2))
                     local relRef = rel
                     tgFallback[rn] = { what = "rotten Mistle", at = now, wait = 12, kind = 27, data = nameHash22(rn), done = function() return relRef.bMapReleased == true end }
                 end
@@ -3863,7 +3923,7 @@ function trigGuestTick()
                         if not tgSent[n] or now - tgSent[n] > 1.5 then
                             tgSent[n] = now
                             say("door: we pressed " .. n .. " (input " .. ty .. ", state " .. tostring(try(function() return d.DoorState end)) .. ", " ..
-                                (nkeys > 0 and (nkeys .. " key(s), all ours") or "no key needed") .. ") -> the game's own path on the host: " .. guestBindOnHost(d, me))
+                                (nkeys > 0 and (nkeys .. " key(s), all ours") or "no key needed") .. ") -> the game's own path on the host: " .. guestInteract(d, me, 0))
                             local dRef = d
                             tgFallback[n] = { what = "door", at = now, wait = 10, kind = 24, data = nameHash22(n) + (tonumber(ty) % 4) * 4194304,
                                               done = function() local s0 = dRef.DoorState; return s0 == 1 or s0 == 2 end }
@@ -3881,7 +3941,10 @@ function trigGuestTick()
         local a, st = s:match("(%x+) (%d+)")
         local m = a and asGuest and findByAddress("CheckPointBase", tonumber(a, 16)) or nil
         if m then
-            say("Mistle: we activated " .. name(m) .. " (state " .. tostring(st) .. ") -> the game's own path on the host: " .. guestBindOnHost(m, me))
+            if not (tgSent[name(m)] and now - tgSent[name(m)] < 5) then
+                tgSent[name(m)] = now
+                say("Mistle: we activated " .. name(m) .. " (state " .. tostring(st) .. ") -> the game's own path on the host: " .. guestInteract(m, me, 1))
+            end
             local mRef = m
             tgFallback[name(m)] = { what = "Mistle", at = now, wait = 12, kind = 25, data = nameHash22(name(m)), done = function() return mRef.CheckPointState == 2 end }
         elseif a then
@@ -4077,6 +4140,13 @@ function hostDoorIn(kind, data)
         hdPending[n] = hdPending[n] or { d = d, at = os.clock() }
         hdPending[n].localAt = os.clock()
         hostSay("door: " .. n .. " opened on the guest's side (state here " .. tostring(try(function() return d.DoorState end)) .. ")")
+    elseif kind == 29 then
+        local hash, clsCode = data % 4194304, data // 4194304
+        local tr = findByHash(TRIG_CLASSES[clsCode] or "DoorBase", hash)
+        if not tr then hostSay("interaction: the guest used a " .. tostring(TRIG_CLASSES[clsCode]) .. " that is not here (hash " .. hash .. ")"); return end
+        local g, dist = hostGuestPawnNear(try(function() return tr:K2_GetActorLocation() end))
+        if not valid(g) then hostSay("interaction: the guest's character is not here"); return end
+        hostSay(string.format("interaction: the guest uses %s (%.1f m away) -> his animation on our copy of him: %s", name(tr), dist or -1, playInteraction(tr, g)))
     elseif kind == 27 then
         -- (11-26) the guest purified a rotten Mistle: released here as the game does it after its animation (MulticastReleaseMap runs
         -- on every PC; bMapReleased is replicated), then its save event; the guest's own world gets it through the progress mirror
@@ -6236,12 +6306,13 @@ function fsHostIn()
             elseif kind == 21 or kind == 22 then
                 pcall(vestigeRelayHostIn, kind, data)
             elseif kind == 28 then
+                local pty, pstory = data % 256, data >= 256
                 if not iniHas("partner_vote=1") then
-                    log("partner vote: off -> the guest's choice " .. partnerName(data) .. " is applied without asking")
-                    pcall(pvApply, data)
+                    log("partner vote: off -> the guest's choice " .. partnerName(pty) .. " is applied without asking")
+                    pcall(pvApply, pty, pstory)
                 elseif voteState then voteSendAll("CoopVoteEnd:0,another vote is running")
-                else pcall(pvStart, data, true) end
-            elseif kind == 24 or kind == 25 or kind == 26 or kind == 27 then
+                else pcall(pvStart, pty, true, pstory) end
+            elseif kind == 24 or kind == 25 or kind == 26 or kind == 27 or kind == 29 then
                 local okd, ed = pcall(hostDoorIn, kind, data)
                 if not okd then log("door/Mistle relay ERROR " .. tostring(ed):sub(1, 160)) end
             elseif kind == 19 then

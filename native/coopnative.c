@@ -3635,7 +3635,8 @@ static int partner_hold(int i, void *ctx, void *st) {
             char path[MAX_PATH + 32];
             snprintf(path, sizeof path, "%sCoopNative.partnerreq", g_dir);
             FILE *f = fopen(path, "w");
-            if (f) { fprintf(f, "%u %d\n", ty, guest); fclose(f); }
+            // (11-26 19:44) + the calling object (the scene's ScenarioActor, or a menu widget): CoopProbe ends that scene cleanly
+            if (f) { fprintf(f, "%u %d %llX\n", ty, guest, (unsigned long long)(uintptr_t)obj); fclose(f); }
         }
         logf_("partner: SetBuddy(0x%llX, type %u) on the %s, %s -> not run here%s", (unsigned long long)target, ty, guest ? "guest" : "host",
               choice ? "a choice" : "no choice just before (story)", choice ? ", everyone is asked (CoopNative.partnerreq)" : " (the host's world changes it)");
