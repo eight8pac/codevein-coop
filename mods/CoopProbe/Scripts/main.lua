@@ -3692,7 +3692,38 @@ function findByAddress(cls, addr)
     end
     return nil
 end
-tgAt, tgLast, tgPressAt, tgDoorSt, tgSent, tgLines = -1000, nil, {}, {}, {}, 0
+-- Keys (owner 11-26: "can you guarantee that doors that cant be opened by the host (because of having no keys) can't be opened by
+-- the guest who has no keys either?"): a door's keys are its own fields KeyItem + AdditionalKeyItems (FieldTriggerBase). Before a
+-- press goes to the host, the guest's own inventory must hold every one of them (CharacterHelper:GetItemCount on his character);
+-- otherwise nothing is sent (his own game shows its key message) and the fallback cannot fire either (it needs a sent press).
+-- Interlocked doors (opened by a lever elsewhere) and story-locked doors (bChangeInLockProgress) are not offered to the guest at all.
+function doorKeys(d)
+    local keys = {}
+    local k = try(function() return d.KeyItem end)
+    if valid(k) then keys[#keys + 1] = k end
+    pcall(function()
+        d.AdditionalKeyItems:ForEach(function(_, e)
+            local o = try(function() return e:get() end)
+            if valid(o) then keys[#keys + 1] = o end
+        end)
+    end)
+    return keys
+end
+function doorKeysMissing(d, me)
+    local helper = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+    local missing = {}
+    for _, k in ipairs(doorKeys(d)) do
+        local n = try(function() return helper:GetItemCount(me, k) end)
+        if type(n) ~= "number" or n < 1 then missing[#missing + 1] = name(k) .. "=" .. tostring(n) end
+    end
+    return missing, #doorKeys(d)
+end
+function doorLeftToHost(d)
+    if try(function() return d.bInterlocked end) == true then return "interlocked" end
+    if try(function() return d.bChangeInLockProgress end) == true then return "story lock " .. tostring(try(function() return d.CheckSymbolInLockProgress:ToString() end)) end
+    return nil
+end
+tgAt, tgLast, tgPressAt, tgDoorSt, tgSent, tgLines, tgLeft = -1000, nil, {}, {}, {}, 0, {}
 function trigGuestTick()
     local wantDoors, wantMistles = iniHas("guest_doors=1"), iniHas("guest_mistles=1")
     if not wantDoors and not wantMistles then return end
@@ -3717,9 +3748,18 @@ function trigGuestTick()
                 local key = n .. ":" .. ty
                 if not tgSent[key] or now - tgSent[key] > 1.5 then
                     tgSent[key] = now
-                    tgPressAt[n] = now
-                    local ok = fsToHost(24, nameHash22(n) + (tonumber(ty) % 4) * 4194304)
-                    say("door: we pressed " .. n .. " (input " .. ty .. ", state " .. tostring(try(function() return d.DoorState end)) .. ") -> sent to the host " .. tostring(ok))
+                    local missing, nkeys = doorKeysMissing(d, me)
+                    local left = doorLeftToHost(d)
+                    if left then
+                        say("door: we pressed " .. n .. ", but it is " .. left .. " -> not sent (the host opens it)")
+                    elseif #missing > 0 then
+                        say("door: we pressed " .. n .. ", but we do not have its key(s) " .. table.concat(missing, ", ") .. " -> not sent (our game shows its own key message)")
+                    else
+                        tgPressAt[n] = now
+                        local ok = fsToHost(24, nameHash22(n) + (tonumber(ty) % 4) * 4194304)
+                        say("door: we pressed " .. n .. " (input " .. ty .. ", state " .. tostring(try(function() return d.DoorState end)) .. ", " ..
+                            (nkeys > 0 and (nkeys .. " key(s), all ours") or "no key needed") .. ") -> sent to the host " .. tostring(ok))
+                    end
                 end
             end
         end
@@ -3734,6 +3774,14 @@ function trigGuestTick()
         if m then
             local ok = fsToHost(25, nameHash22(name(m)))
             say("Mistle: we activated " .. name(m) .. " (state " .. tostring(st) .. ") -> the host opens it in its world " .. tostring(ok))
+            -- owner 11-26: "without the animation of course. maybe the guest can do the animation instead": the Mistle's own
+            -- activation montage plays on our character here (the host's character does nothing). Off with guest_mistle_anim=0.
+            if not iniHas("guest_mistle_anim=0") and valid(me) then
+                local mont = try(function() return m.TriggerActionMontage end)
+                local okm, em = false, "no montage on the Mistle"
+                if valid(mont) then okm, em = pcall(function() return me:PlayAnimMontage(mont, 1.0, FName("None")) end) end
+                say("Mistle: activation animation " .. (valid(mont) and name(mont) or "-") .. " on our character -> " .. (okm and ("played, length " .. tostring(em)) or tostring(em):sub(1, 80)))
+            end
         elseif a then
             say("Mistle: activation press at 0x" .. a .. ", but no Mistle with that address (or not in a host's world)")
         end
@@ -3764,7 +3812,9 @@ function trigGuestTick()
                     tgPressAt[n] = nil
                     say("door: " .. n .. " opened on our side after our press (state " .. tostring(prev) .. " -> " .. tostring(st) .. ") -> told the host " .. tostring(fsToHost(26, nameHash22(n))))
                 end
-                if st == 0 or st == 4 then consider(d, true) end
+                local left = (st == 0 or st == 4) and doorLeftToHost(d) or nil
+                if left and not tgLeft[n] then tgLeft[n] = true; say("door: " .. n .. " is " .. left .. " -> its prompt stays the game's own for us") end
+                if (st == 0 or st == 4) and not left then consider(d, true) end
             end
         end
     end
@@ -3814,9 +3864,9 @@ function trigCensusTick()
     for i = 1, math.min(6, #rows) do
         local t = rows[i].t
         local cls = try(function() return t:GetClass():GetFName():ToString() end) or "?"
-        parts[#parts + 1] = string.format("%s (%s) state %s visible %s button %s auth %s", name(t), cls, tostring(try(function() return t.State end)),
+        parts[#parts + 1] = string.format("%s (%s) state %s visible %s button %s auth %s mistle %s door %s", name(t), cls, tostring(try(function() return t.State end)),
             tostring(try(function() return t.bGimmickVisibility end)), tostring(try(function() return t:IsActionButtonActive(me) end)),
-            tostring(try(function() return t:IsAuthorization(me) end)))
+            tostring(try(function() return t:IsAuthorization(me) end)), tostring(try(function() return t.CheckPointState end)), tostring(try(function() return t.DoorState end)))
     end
     local line = table.concat(parts, " | ")
     if line ~= tcLast then
