@@ -3896,6 +3896,9 @@ function hostDoorIn(kind, data)
         if not d then hostSay("door: the guest pressed a door that is not here (hash " .. hash .. ")"); return end
         local n, st = name(d), try(function() return d.DoorState end)
         if st == 1 or st == 2 then hostSay("door: the guest pressed " .. n .. ", already opening/open here (state " .. tostring(st) .. ")"); return end
+        -- (11-26) a lever door or a story-locked door is never opened from a guest's press, also checked here on the host
+        local left = doorLeftToHost(d)
+        if left then hostSay("door: the guest pressed " .. n .. ", but it is " .. left .. " -> refused (its lever / the story opens it)"); return end
         local g, dist = hostGuestPawnNear(try(function() return d:K2_GetActorLocation() end))
         if not valid(g) then hostSay("door: the guest pressed " .. n .. ", but his character is not here"); return end
         local act = try(function() return d:IsActionButtonActive(g) end)
