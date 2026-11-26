@@ -3663,9 +3663,243 @@ function chestNear(actorName, range)
     end
     return false, nil
 end
+-- Doors and Mistles for the guest (2026-11-26; owner 11-25: "guest should be able to open the doors. the prompt to open was greyed
+-- out for me"; "the guest should be able to activate mistles for the host's world just like it was his").
+-- Guest (guest_doors=1 / guest_mistles=1, only while in a host's world): every second the closed doors (DoorState Wait 0 / Closed 4)
+-- and the Mistles that are not open (CheckPointState != Opened 2) within 25 m go to CoopNative ("trigbtn"), which switches their
+-- greyed prompt on and notes his presses on those doors (CoopNative.triginput). A press goes to the host (kind 24: name hash +
+-- input type); when his own game opened the door after his press, that goes too (kind 26). A press at a Mistle that is not open is
+-- not run on his PC (CoopNative.mistlereq) and goes to the host as kind 25.
+-- Host: kind 24 -> the door's own input for his character (ProcessInputButtonEvent(type, his character, true)), so the game's own
+-- checks, animation, sound and save run; the answers of its checks for him are logged. Kind 26 while the host's door is still closed
+-- 2 s later -> OpenImmediate. Once the door is open here, its save event runs (HoldStateEvent_OnNotifySave, as for chests). Kind 25 ->
+-- the Mistle is opened in the host's world (OpenImmediate, Multicast_InitState(true) for every PC, its save event). The guest's own
+-- world gets doors and Mistles opened in co-op through the progress mirror below.
+function nameHash22(s)
+    local h = 2166136261
+    for i = 1, #s do h = ((h ~ s:byte(i)) * 16777619) & 0xFFFFFFFF end
+    return h & 0x3FFFFF
+end
+function findByHash(cls, hash)
+    for _, o in ipairs(FindAllOf(cls) or {}) do
+        if valid(o) and nameHash22(name(o)) == hash then return o end
+    end
+    return nil
+end
+function findByAddress(cls, addr)
+    for _, o in ipairs(FindAllOf(cls) or {}) do
+        if valid(o) and try(function() return o:GetAddress() end) == addr then return o end
+    end
+    return nil
+end
+tgAt, tgLast, tgPressAt, tgDoorSt, tgSent, tgLines = -1000, nil, {}, {}, {}, 0
+function trigGuestTick()
+    local wantDoors, wantMistles = iniHas("guest_doors=1"), iniHas("guest_mistles=1")
+    if not wantDoors and not wantMistles then return end
+    local now = os.clock()
+    -- nothing is read from a world that is still loading or being torn down (the 11-24 join crash came from such reads)
+    if not streamSettled(now) or not worldSettledAfterTravel(now) then return end
+    local gs = FindFirstOf("BP_AppGameState_C")
+    local asGuest = valid(gs) and tostring(try(function() return gs.Role end)) == "1"
+    local pc = localPC()
+    local me = valid(pc) and try(function() return pc.Pawn end) or nil
+    local meA = valid(me) and try(function() return me:GetAddress() end)
+    local function say(s) tgLines = tgLines + 1; if tgLines <= 120 then log(s) end end
+    -- presses noted by CoopNative
+    local f = io.open(WIN64 .. "\\plugins\\CoopNative.triginput", "r")
+    if f then
+        local s = f:read("*a") or ""
+        f:close(); os.remove(WIN64 .. "\\plugins\\CoopNative.triginput")
+        for a, ty, who in s:gmatch("(%x+) (%d+) (%x+)") do
+            local d = asGuest and findByAddress("DoorBase", tonumber(a, 16)) or nil
+            if d and meA and tonumber(who, 16) == meA then
+                local n = name(d)
+                local key = n .. ":" .. ty
+                if not tgSent[key] or now - tgSent[key] > 1.5 then
+                    tgSent[key] = now
+                    tgPressAt[n] = now
+                    local ok = fsToHost(24, nameHash22(n) + (tonumber(ty) % 4) * 4194304)
+                    say("door: we pressed " .. n .. " (input " .. ty .. ", state " .. tostring(try(function() return d.DoorState end)) .. ") -> sent to the host " .. tostring(ok))
+                end
+            end
+        end
+    end
+    -- a Mistle press that CoopNative kept from running here
+    local mf = io.open(WIN64 .. "\\plugins\\CoopNative.mistlereq", "r")
+    if mf then
+        local s = mf:read("*a") or ""
+        mf:close(); os.remove(WIN64 .. "\\plugins\\CoopNative.mistlereq")
+        local a, st = s:match("(%x+) (%d+)")
+        local m = a and asGuest and findByAddress("CheckPointBase", tonumber(a, 16)) or nil
+        if m then
+            local ok = fsToHost(25, nameHash22(name(m)))
+            say("Mistle: we activated " .. name(m) .. " (state " .. tostring(st) .. ") -> the host opens it in its world " .. tostring(ok))
+        elseif a then
+            say("Mistle: activation press at 0x" .. a .. ", but no Mistle with that address (or not in a host's world)")
+        end
+    end
+    if now - tgAt < 0.5 then return end
+    tgAt = now
+    if not asGuest or not valid(me) then
+        if tgLast ~= "trigbtn" then tgLast = "trigbtn"; vmCmd("trigbtn") end
+        return
+    end
+    local pl = try(function() return me:K2_GetActorLocation() end)
+    if not pl then return end
+    local rows = {}
+    local function consider(o, isDoor)
+        local l = try(function() return o:K2_GetActorLocation() end)
+        if not l then return end
+        local d2 = (l.X - pl.X) ^ 2 + (l.Y - pl.Y) ^ 2 + (l.Z - pl.Z) ^ 2
+        if d2 < 2500 * 2500 then rows[#rows + 1] = { o = o, d2 = d2, door = isDoor } end
+    end
+    if wantDoors then
+        for _, d in ipairs(FindAllOf("DoorBase") or {}) do
+            if valid(d) then
+                local n, st = name(d), try(function() return d.DoorState end)
+                -- his own game opened the door after his press (seen within 8 m, up to 5 s after the press)
+                local prev = tgDoorSt[n]
+                tgDoorSt[n] = st
+                if (prev == 0 or prev == 4) and (st == 1 or st == 2) and tgPressAt[n] and now - tgPressAt[n] < 5 then
+                    tgPressAt[n] = nil
+                    say("door: " .. n .. " opened on our side after our press (state " .. tostring(prev) .. " -> " .. tostring(st) .. ") -> told the host " .. tostring(fsToHost(26, nameHash22(n))))
+                end
+                if st == 0 or st == 4 then consider(d, true) end
+            end
+        end
+    end
+    if wantMistles then
+        for _, m in ipairs(FindAllOf("CheckPointBase") or {}) do
+            if valid(m) and try(function() return m.CheckPointState end) ~= 2 then consider(m, false) end
+        end
+    end
+    table.sort(rows, function(x, y) return x.d2 < y.d2 end)
+    local parts = {}
+    for i = 1, math.min(16, #rows) do
+        local a = try(function() return rows[i].o:GetAddress() end)
+        if a then parts[#parts + 1] = string.format("%X", a) end
+    end
+    local line = "trigbtn " .. table.concat(parts, " ")
+    if line ~= tgLast then
+        tgLast = line
+        vmCmd(line)
+    end
+end
+-- Log only (trig_census=1; 2026-11-26, for the vestige after the first boss: on the guest his press started his own scene, which
+-- waited for the host; the host could use it only after the guest left). In co-op, every 2 s: the interactable triggers within 4 m of
+-- our character with class, state, visibility and the game's own button / authorization answer for us; a line when that changes.
+tcAt, tcLast, tcLines = -1000, nil, 0
+function trigCensusTick()
+    if not iniHas("trig_census=1") then return end
+    local now = os.clock()
+    if now - tcAt < 2 then return end
+    tcAt = now
+    if not streamSettled(now) or not worldSettledAfterTravel(now) then return end
+    local players = 0
+    for _, p in ipairs(FindAllOf("BP_Player_C") or {}) do if valid(p) then players = players + 1 end end
+    if players < 2 then tcLast = nil; return end
+    local me = try(function() return localPC().Pawn end)
+    local pl = valid(me) and try(function() return me:K2_GetActorLocation() end)
+    if not pl then return end
+    local rows = {}
+    for _, t in ipairs(FindAllOf("FieldTriggerBase") or {}) do
+        local l = valid(t) and try(function() return t:K2_GetActorLocation() end)
+        if l then
+            local d = math.sqrt((l.X - pl.X) ^ 2 + (l.Y - pl.Y) ^ 2 + (l.Z - pl.Z) ^ 2) / 100
+            if d < 4 then rows[#rows + 1] = { t = t, d = d } end
+        end
+    end
+    table.sort(rows, function(a, b) return a.d < b.d end)
+    local parts = {}
+    for i = 1, math.min(6, #rows) do
+        local t = rows[i].t
+        local cls = try(function() return t:GetClass():GetFName():ToString() end) or "?"
+        parts[#parts + 1] = string.format("%s (%s) state %s visible %s button %s auth %s", name(t), cls, tostring(try(function() return t.State end)),
+            tostring(try(function() return t.bGimmickVisibility end)), tostring(try(function() return t:IsActionButtonActive(me) end)),
+            tostring(try(function() return t:IsAuthorization(me) end)))
+    end
+    local line = table.concat(parts, " | ")
+    if line ~= tcLast then
+        tcLast = line
+        tcLines = tcLines + 1
+        if tcLines <= 200 then log("trigger census: " .. (line ~= "" and line or "none within 4 m")) end
+    end
+end
+hdPending, hdLines = {}, 0
+function hostGuestPawnNear(l)
+    local best, bd
+    for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+        local g = valid(c) and not try(function() return c:IsLocalController() end) and try(function() return c.Pawn end) or nil
+        local gl = valid(g) and try(function() return g:K2_GetActorLocation() end)
+        if gl then
+            local d2 = l and ((gl.X - l.X) ^ 2 + (gl.Y - l.Y) ^ 2 + (gl.Z - l.Z) ^ 2) or 0
+            if not bd or d2 < bd then best, bd = g, d2 end
+        end
+    end
+    return best, bd and math.sqrt(bd) / 100 or nil
+end
+function hostSay(s) hdLines = hdLines + 1; if hdLines <= 150 then log(s) end end
+function hostDoorIn(kind, data)
+    if kind == 24 then
+        local hash, ty = data % 4194304, data // 4194304
+        local d = findByHash("DoorBase", hash)
+        if not d then hostSay("door: the guest pressed a door that is not here (hash " .. hash .. ")"); return end
+        local n, st = name(d), try(function() return d.DoorState end)
+        if st == 1 or st == 2 then hostSay("door: the guest pressed " .. n .. ", already opening/open here (state " .. tostring(st) .. ")"); return end
+        local g, dist = hostGuestPawnNear(try(function() return d:K2_GetActorLocation() end))
+        if not valid(g) then hostSay("door: the guest pressed " .. n .. ", but his character is not here"); return end
+        local act = try(function() return d:IsActionButtonActive(g) end)
+        local auth = try(function() return d:IsAuthorization(g) end)
+        local cond = try(function() return d:CheckExecuteCondition(d, g) end)
+        local ok, er = pcall(function() d:ProcessInputButtonEvent(ty, g, true) end)
+        hdPending[n] = hdPending[n] or { d = d, at = os.clock() }
+        hdPending[n].at = os.clock()
+        hostSay(string.format("door: the guest pressed %s (input %d, %.1f m away; for him: button %s, authorization %s, condition %s) -> the door's input for his character %s, state %s -> %s",
+            n, ty, dist or -1, tostring(act), tostring(auth), tostring(cond), ok and "ran" or ("FAILED " .. tostring(er):sub(1, 80)), tostring(st), tostring(try(function() return d.DoorState end))))
+    elseif kind == 26 then
+        local d = findByHash("DoorBase", data)
+        if not d then return end
+        local n = name(d)
+        hdPending[n] = hdPending[n] or { d = d, at = os.clock() }
+        hdPending[n].localAt = os.clock()
+        hostSay("door: " .. n .. " opened on the guest's side (state here " .. tostring(try(function() return d.DoorState end)) .. ")")
+    elseif kind == 25 then
+        local m = findByHash("CheckPointBase", data)
+        if not m then hostSay("Mistle: the guest activated a Mistle that is not here (hash " .. data .. ")"); return end
+        local n, st = name(m), try(function() return m.CheckPointState end)
+        if st == 2 then hostSay("Mistle: the guest activated " .. n .. ", already open here"); return end
+        local a, ea = pcall(function() m:OpenImmediate() end)
+        local st2 = try(function() return m.CheckPointState end)
+        local b, eb = pcall(function() m:Multicast_InitState(true) end)
+        local c, ec = pcall(function() m:HoldStateEvent_OnNotifySave() end)
+        hostSay(string.format("Mistle: the guest activated %s -> opened in our world: OpenImmediate %s (state %s -> %s), every PC %s, saved %s (flag %s)", n,
+            a and "ok" or tostring(ea):sub(1, 60), tostring(st), tostring(st2), b and "ok" or tostring(eb):sub(1, 60), c and "ok" or tostring(ec):sub(1, 60),
+            tostring(try(function() return m.HoldStateFlagName:ToString() end))))
+    end
+end
+function hostDoorTick()
+    local now = os.clock()
+    for n, p in pairs(hdPending) do
+        local st = valid(p.d) and try(function() return p.d.DoorState end)
+        if st == 2 then
+            local ok = pcall(function() p.d:HoldStateEvent_OnNotifySave() end)
+            hostSay("door: " .. n .. " is open in our world -> saved " .. tostring(ok) .. " (flag " .. tostring(try(function() return p.d.HoldStateFlagName:ToString() end)) .. ")")
+            hdPending[n] = nil
+        elseif (st == 0 or st == 4) and p.localAt and now - p.localAt > 2 and not p.forced then
+            p.forced = true
+            local ok, er = pcall(function() p.d:OpenImmediate() end)
+            hostSay("door: " .. n .. " still closed here 2 s after the guest's game opened it -> OpenImmediate " .. (ok and "ok" or tostring(er):sub(1, 80)) ..
+                ", state " .. tostring(try(function() return p.d.DoorState end)))
+        elseif not valid(p.d) or now - p.at > 20 then
+            if valid(p.d) then hostSay("door: " .. n .. " not opened within 20 s of the guest's press (state " .. tostring(st) .. ")") end
+            hdPending[n] = nil
+        end
+    end
+end
 PM_KINDS = {
     { cls = "ChestBase", field = "ChestState", done = 2, what = "chest" },
     { cls = "CheckPointBase", field = "CheckPointState", done = 2, what = "Mistle" },
+    { cls = "DoorBase", field = "DoorState", done = 2, what = "door" },
 }
 pmSeen, pmSaved, pmAt, pmLines = {}, {}, -1000, 0
 function progressMirrorTick()
@@ -5768,6 +6002,9 @@ function fsHostIn()
                 else pcall(rvStart, nil, true) end
             elseif kind == 21 or kind == 22 then
                 pcall(vestigeRelayHostIn, kind, data)
+            elseif kind == 24 or kind == 25 or kind == 26 then
+                local okd, ed = pcall(hostDoorIn, kind, data)
+                if not okd then log("door/Mistle relay ERROR " .. tostring(ed):sub(1, 160)) end
             elseif kind == 19 then
                 local prev = rrGuest
                 rrGuest = { done = data // 2, busy = data % 2 == 1, at = os.clock() }
@@ -8556,6 +8793,12 @@ LoopAsync(200, function()
         pcall(autoContinueTick)
         pcall(tableGuardSend)
         pcall(chestBtnTick)
+        do
+            local okt, et = pcall(trigGuestTick)
+            if not okt and not trigErr then trigErr = true; log("door/Mistle list ERROR " .. tostring(et):sub(1, 160)) end
+        end
+        pcall(hostDoorTick)
+        pcall(trigCensusTick)
         local line = worldSettled() and (try(stateLine) or "state error") or last
         if line ~= last then log("STATE " .. line); last = line end
         local w = try(spectateWindow) or false

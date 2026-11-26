@@ -1400,7 +1400,22 @@ static uint64_t detour_close_session(void *ctx, uint8_t bits) {
 static char g_dir[MAX_PATH];   // defined (tentatively) again further down
 typedef void (*mistleinput_fn)(void *mistle, uint8_t pressed, void *character);
 static mistleinput_fn g_orig_mistle_input;
+// Guest activates a Mistle (2026-11-26; owner 11-25: "the guest should be able to activate mistles for the host's world just like it
+// was his"). With guest_mistles=1 a guest's press at a Mistle that is not open yet (CheckPointState +0x660: Wait 0 / Opening 1) does
+// not run the Mistle's own input (the activation has host-only parts like the rest, which asserted on a guest); CoopNative writes
+// CoopNative.mistlereq "<mistle> <state>" and CoopProbe asks the host to open it in the host's world (his own save follows through
+// the progress mirror). Its prompt is switched on by the trigger list ("trigbtn").
+static volatile LONG g_guest_mistles;
 static void detour_mistle_input(void *mistle, uint8_t pressed, void *character) {
+    if (g_guest_mistles && pressed == 1 && mistle && readable((uintptr_t)mistle + 0x660, 1) && *((uint8_t *)mistle + 0x660) != 2) {
+        char path[MAX_PATH];
+        snprintf(path, sizeof path, "%sCoopNative.mistlereq", g_dir);
+        FILE *f = _fsopen(path, "w", _SH_DENYNO);
+        if (f) { fprintf(f, "%llX %u\n", (unsigned long long)(uintptr_t)mistle, (unsigned)*((uint8_t *)mistle + 0x660)); fclose(f); }
+        logf_("Mistle input at 0x%llX (state %u, not open)  *** activation asked from the host (guest_mistles) ***", (unsigned long long)(uintptr_t)mistle,
+              (unsigned)*((uint8_t *)mistle + 0x660));
+        return;
+    }
     if (g_guest_rest && pressed == 1 && mistle && readable((uintptr_t)mistle + 0x660, 1) && *((uint8_t *)mistle + 0x660) == 2) {
         // item 7 (2026-10-30 20:51): his game crashed (inside UE4SS, null read) opening the menu while the host sat at the Mistle.
         // ACheckPointBase.InputterHolder (+0x6C0) = the character using it; while that is someone else, open nothing
@@ -1926,10 +1941,26 @@ static int chest_listed(uintptr_t self) {
     for (LONG i = 0; i < g_chest_nbtn && i < 16; i++) if (g_chest_btns[i] == self) return 1;
     return 0;
 }
+// Doors and Mistles for the guest (2026-11-26; owner 11-25: "guest should be able to open the doors. the prompt to open was greyed
+// out for me"; "the guest should be able to activate mistles"). CoopProbe lists the closed doors and the Mistles that are not open
+// near the guest ("trigbtn <hex> ...", up to 16); their button check (vtable +0x660, hooked at run time per class, up to 4 different
+// checks) answers yes for them, as for chests. Only a "no" is turned into a yes: whatever else the game checks first (the side of a
+// one-way door, a key item) still decides in the door's own input.
+static volatile uintptr_t g_trig_btns[16];
+static volatile LONG g_trig_nbtn;
+static int trig_listed(uintptr_t self) {
+    for (LONG i = 0; i < g_trig_nbtn && i < 16; i++) if (g_trig_btns[i] == self) return 1;
+    return 0;
+}
 static char chest_answer(char r, void *self) {
     if (!r && chest_listed((uintptr_t)self)) {
         static uintptr_t last;
         if (last != (uintptr_t)self) { last = (uintptr_t)self; logf_("chest: button of 0x%llX turned on for the guest", (unsigned long long)(uintptr_t)self); }
+        return 1;
+    }
+    if (!r && trig_listed((uintptr_t)self)) {
+        static uintptr_t lastt;
+        if (lastt != (uintptr_t)self) { lastt = (uintptr_t)self; logf_("trigger: button of 0x%llX (door / Mistle) turned on for the guest", (unsigned long long)(uintptr_t)self); }
         return 1;
     }
     return r;
@@ -2030,6 +2061,92 @@ static void chestbtn_cmd(const char *args) {
     MH_STATUS e = c == MH_OK ? MH_EnableHook((void *)fn) : c;
     g_btn_chest_at = fn;
     logf_("chest: button check 0x%llX hooked for the guest's chests -> %s / %s", (unsigned long long)fn, MH_StatusToString(c), MH_StatusToString(e));
+}
+#define TRIG_SLOTS 4
+static btn_fn g_orig_trig[TRIG_SLOTS];
+static volatile uintptr_t g_trig_fn[TRIG_SLOTS];
+static char detour_trig0(void *s, void *i) { return btn_answer(g_orig_trig[0](s, i), s); }
+static char detour_trig1(void *s, void *i) { return btn_answer(g_orig_trig[1](s, i), s); }
+static char detour_trig2(void *s, void *i) { return btn_answer(g_orig_trig[2](s, i), s); }
+static char detour_trig3(void *s, void *i) { return btn_answer(g_orig_trig[3](s, i), s); }
+static btn_fn const g_trig_detours[TRIG_SLOTS] = { detour_trig0, detour_trig1, detour_trig2, detour_trig3 };
+// The press: a door's own input (vtable +0x618, ProcessInputButtonEvent: this, input type, inputter) is hooked per class too; for a
+// listed trigger every call is noted in CoopNative.triginput "<trigger> <type> <inputter>" and the original runs as always (his own
+// animation and whatever his game does locally). CoopProbe relays it to the host, whose game runs the door's input for his character.
+// The Mistles' input has its own hook (MistleInput) and is left out here.
+typedef uint64_t (*trig_input_fn)(void *self, uint64_t type, void *inputter, uint64_t bound);
+static trig_input_fn g_orig_tin[TRIG_SLOTS];
+static volatile uintptr_t g_tin_fn[TRIG_SLOTS];
+static void tin_note(void *self, uint64_t type, void *inputter) {
+    if (!trig_listed((uintptr_t)self)) return;
+    char path[MAX_PATH];
+    snprintf(path, sizeof path, "%sCoopNative.triginput", g_dir);
+    FILE *f = _fsopen(path, "a", _SH_DENYNO);
+    if (f) { fprintf(f, "%llX %u %llX\n", (unsigned long long)(uintptr_t)self, (unsigned)(type & 0xFF), (unsigned long long)(uintptr_t)inputter); fclose(f); }
+    static volatile LONG n;
+    if (InterlockedIncrement(&n) <= 60) logf_("trigger: input %u on 0x%llX by 0x%llX (listed for the guest) -> noted for the host", (unsigned)(type & 0xFF),
+                                             (unsigned long long)(uintptr_t)self, (unsigned long long)(uintptr_t)inputter);
+}
+static uint64_t detour_tin0(void *s, uint64_t ty, void *i, uint64_t b) { tin_note(s, ty, i); return g_orig_tin[0](s, ty, i, b); }
+static uint64_t detour_tin1(void *s, uint64_t ty, void *i, uint64_t b) { tin_note(s, ty, i); return g_orig_tin[1](s, ty, i, b); }
+static uint64_t detour_tin2(void *s, uint64_t ty, void *i, uint64_t b) { tin_note(s, ty, i); return g_orig_tin[2](s, ty, i, b); }
+static uint64_t detour_tin3(void *s, uint64_t ty, void *i, uint64_t b) { tin_note(s, ty, i); return g_orig_tin[3](s, ty, i, b); }
+static trig_input_fn const g_tin_detours[TRIG_SLOTS] = { detour_tin0, detour_tin1, detour_tin2, detour_tin3 };
+static void trig_input_hook_for(uintptr_t obj) {
+    if (!obj || !readable(obj, 8)) return;
+    uintptr_t vt = *(uintptr_t *)obj;
+    if (!vt || !readable(vt + 0x618, 8)) return;
+    uintptr_t fn = *(uintptr_t *)(vt + 0x618);
+    if (!fn || fn == ADDR_MISTLE_INPUT) return;
+    int freeslot = -1;
+    for (int k = 0; k < TRIG_SLOTS; k++) {
+        if (g_tin_fn[k] == fn) return;
+        if (!g_tin_fn[k] && freeslot < 0) freeslot = k;
+    }
+    if (freeslot < 0 || !readable(fn, 16)) return;
+    MH_STATUS c = MH_CreateHook((void *)fn, (void *)g_tin_detours[freeslot], (void **)&g_orig_tin[freeslot]);
+    MH_STATUS e = c == MH_OK ? MH_EnableHook((void *)fn) : c;
+    g_tin_fn[freeslot] = fn;
+    logf_("trigger: input 0x%llX (vtable 0x%llX, trigger 0x%llX) hooked to note the guest's presses -> %s / %s", (unsigned long long)fn,
+          (unsigned long long)vt, (unsigned long long)obj, MH_StatusToString(c), MH_StatusToString(e));
+}
+static void trig_hook_for(uintptr_t obj) {
+    if (!obj || !readable(obj, 8)) return;
+    trig_input_hook_for(obj);
+    uintptr_t vt = *(uintptr_t *)obj;
+    if (!vt || !readable(vt + 0x660, 8)) return;
+    uintptr_t fn = *(uintptr_t *)(vt + 0x660);
+    // already answered by a hook that asks chest_answer: the seats' checks (when guest_seats installed them) and the chests' one
+    if ((fn == ADDR_BTN_BASE && g_orig_btn_base) || (fn == ADDR_BTN_ITEM && g_orig_btn_item) || (fn && fn == g_btn_dyn_at) || (fn && fn == g_btn_chest_at)) return;
+    int freeslot = -1;
+    for (int k = 0; k < TRIG_SLOTS; k++) {
+        if (g_trig_fn[k] == fn) return;
+        if (!g_trig_fn[k] && freeslot < 0) freeslot = k;
+    }
+    if (freeslot < 0) { static int full; if (!full) { full = 1; logf_("trigger: no hook slot left for button check 0x%llX (trigger 0x%llX)", (unsigned long long)fn, (unsigned long long)obj); } return; }
+    if (!readable(fn, 16)) return;
+    MH_STATUS c = MH_CreateHook((void *)fn, (void *)g_trig_detours[freeslot], (void **)&g_orig_trig[freeslot]);
+    MH_STATUS e = c == MH_OK ? MH_EnableHook((void *)fn) : c;
+    g_trig_fn[freeslot] = fn;
+    logf_("trigger: button check 0x%llX (vtable 0x%llX, trigger 0x%llX) hooked for the guest's doors / Mistles -> %s / %s", (unsigned long long)fn,
+          (unsigned long long)vt, (unsigned long long)obj, MH_StatusToString(c), MH_StatusToString(e));
+}
+static void trigbtn_cmd(const char *args) {
+    uintptr_t v[16];
+    int n = 0;
+    const char *q = args;
+    while (n < 16 && q && *q) {
+        char *end; unsigned long long x = strtoull(q, &end, 16);
+        if (end == q) break;
+        if (x) v[n++] = (uintptr_t)x;
+        q = end;
+    }
+    g_trig_nbtn = 0;
+    for (int i = 0; i < n; i++) g_trig_btns[i] = v[i];
+    g_trig_nbtn = n;
+    static int logged;
+    if (logged < 40) { logged++; logf_("trigger: %d door(s) / Mistle(s) near the guest open for him%s", n, n ? "" : " (none)"); }
+    for (int i = 0; i < n; i++) trig_hook_for(v[i]);
 }
 static void btn_dyn_check(void) {
     for (LONG i = 0; i < g_seat_nbtn && i < 64; i++) btn_dyn_one(g_seat_btns[i]);
@@ -2432,6 +2549,8 @@ static void run_command(char *buf) {
         itembtn_cmd(buf + 7);
     } else if (strncmp(buf, "chestbtn", 8) == 0) {
         chestbtn_cmd(buf + 8);
+    } else if (strncmp(buf, "trigbtn", 7) == 0) {
+        trigbtn_cmd(buf + 7);
     } else if (strncmp(buf, "fcbcguard ", 10) == 0) {
         unsigned long long a = strtoull(buf + 10, NULL, 16);
         if (g_tg_ini) fcbcguard_cmd((uintptr_t)a);
@@ -2584,6 +2703,8 @@ static void read_settings(void) {
     if (InterlockedExchange(&g_fog_free, ffree) != ffree) logf_("setting fog_free = %ld", ffree);
     LONG grest = have_ini && as_guest && strstr(buf, "guest_rest=1") != NULL;
     if (InterlockedExchange(&g_guest_rest, grest) != grest) logf_("setting guest_rest = %ld", grest);
+    LONG gmis = have_ini && as_guest && strstr(buf, "guest_mistles=1") != NULL;
+    if (InterlockedExchange(&g_guest_mistles, gmis) != gmis) logf_("setting guest_mistles = %ld", gmis);
     LONG rest = have_ini && strstr(buf, "rest_in_coop=1") != NULL;
     if (InterlockedExchange(&g_rest_in_coop, rest) != rest) logf_("setting rest_in_coop = %ld", rest);
     LONG win = read_small_file("CoopNative.flags", buf, sizeof buf) && buf[0] == '1';

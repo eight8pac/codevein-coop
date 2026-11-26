@@ -60,6 +60,9 @@ Everything goes into `<game dir>\CodeVein\Binaries\Win64`.
    warp_coop=1      host: the purple Mistles (BP_WarpPortal) work with guests; the group teleport starts at the dialog's Yes
    guest_rest_full=0  switches off the full guest rest (Ichor, Regen, status effects, items; see Playthrough fixes)
    weapon_reshow=0  switches off showing the other player's weapon again after a cutscene
+   guest_doors=1    both PCs: a guest can open doors (his press runs on the host's game for his character; untested)
+   guest_mistles=1  both PCs: a guest can activate a Mistle; the host opens it in its world (untested)
+   trig_census=1    log only: the interactable triggers near you in co-op and their button state
    test_commands=1  test copies: CoopProbe reads plugins\CoopProbe.cmd and the CoopCmd relay (off in a release kit)
    diag_trace=1     log only: callers of LIBDeferredTeleportManager:BeginDeferredTeleport
    rest_reload=1    host: a rest at a Mistle resets the enemies as in single player (every guest within 40 m)
@@ -356,8 +359,15 @@ Playthrough fixes (11-25; the first New Game run with a friend, to the first bos
 - A guest who said yes to Louis's follower offer was left on a black screen: two shared talk/menu checks were answered "not
   multiplayer" by the vestige override at any time. They are answered only while a restoration runs now; other talks get the game's
   own co-op answer.
-- Open: doors and inactive Mistles are greyed out for a guest; the vestige after the first boss waits on the guest's PC for the
-  host's side (`WaitForOnlineMultiplaySynced`).
+- Doors and Mistles for a guest (`guest_doors`, `guest_mistles`, 11-26, untested): his greyed prompt at a closed door or a Mistle
+  that is not open is switched on (their button checks are hooked at run time per class and answer yes for the triggers near
+  him). A door press is noted by a hook on the door's own input and sent to the host, whose game runs the door's input for the
+  guest's character (`ProcessInputButtonEvent`), so the door's own checks, animation and save run there; if only the guest's game
+  opened it, the host opens it 2 s later (`OpenImmediate`). A press at a Mistle that is not open does not run on the guest's PC
+  (its activation has host-only parts, like the rest); the host opens it in its world (`OpenImmediate`, `Multicast_InitState` for
+  every PC, its save event). Doors and Mistles opened in co-op are saved in the guest's own world by the progress mirror.
+- Open: the vestige after the first boss waits on the guest's PC for the host's side (`WaitForOnlineMultiplaySynced`), and the
+  host could use it only after the guest left.
 
 Player settings (11-25, first version): `seamless_coop_settings.ini` in `Win64`, sections `[Session]` (`cooperative_password`, set as
 the game's own matchmaking password through `ConfigurationManager`; `auto_host` / `auto_join` = auto, always or off;
