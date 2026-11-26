@@ -3621,9 +3621,25 @@ function pvApply(ty, story)
     if story then pcall(pvStoryOutcome, me); pcall(pvHideJoiner, ty) end
     votePopup(partnerName(ty) .. " is the partner now")
 end
+ptsAt, ptsLast = -1000, nil
+function partnerTalkScenes(now)
+    if now - ptsAt < 0.5 then return end
+    ptsAt = now
+    local parts = {}
+    for _, sa in ipairs(FindAllOf("ScenarioActor") or {}) do
+        local cls = valid(sa) and try(function() return sa:GetClass():GetFName():ToString() end) or ""
+        local lc = cls:lower()
+        if (lc:find("_talk", 1, true) or lc:find("_menu", 1, true)) and #parts < 16 then
+            parts[#parts + 1] = string.format("%X", try(function() return sa:GetAddress() end) or 0)
+        end
+    end
+    local line = "talkscenes " .. table.concat(parts, " ")
+    if line ~= ptsLast then ptsLast = line; vmCmd(line) end
+end
 function partnerTick()
     local now = os.clock()
     pcall(pvSceneTick)
+    pcall(partnerTalkScenes, now)
     -- the Mistle's partner menu: a change there is a choice (CoopNative holds it for the vote)
     if iniHas("partner_vote=1") and now - pvMenuAt > 1 then
         pvMenuAt = now
@@ -3927,7 +3943,9 @@ function trigGuestTick()
                     tgSent[rn] = now
                     say("rotten Mistle: we purified " .. rn .. " (input " .. ty .. ", released " .. tostring(try(function() return rel.bMapReleased end)) .. ") -> the game's own path on the host: " .. guestInteract(rel, me, 2))
                     local relRef = rel
-                    tgFallback[rn] = { what = "rotten Mistle", at = now, wait = 12, kind = 27, data = nameHash22(rn), done = function() return relRef.bMapReleased == true end }
+                    -- (11-26 20:52) his animation plays on both PCs, but in co-op its cue does not release the map: the host releases it
+                    -- with the game's own MulticastReleaseMap right after the animation (3.7 s)
+                    tgFallback[rn] = { what = "rotten Mistle", at = now, wait = 4, kind = 27, data = nameHash22(rn), done = function() return relRef.bMapReleased == true end }
                 end
             end
             local d = (not rel) and asGuest and findByAddress("DoorBase", tonumber(a, 16)) or nil
@@ -4861,7 +4879,18 @@ local function guestTeleportFade()
         log("teleport fade: the host dropped its teleport -> our screen comes back (" .. tostring(lifted) .. ")")
         tpfOnAt, tpfMineAt, tpfMessageAt, tpHoldOn = nil, nil, nil, nil
     end
-    if tpHoldOn and not tpfOnAt then
+    if tpHoldOn and not tpfOnAt and memEndHoldUntil and os.clock() < memEndHoldUntil then
+        local hl = valid(host) and try(function() return host:K2_GetActorLocation() end)
+        local ml = valid(mine) and try(function() return mine:K2_GetActorLocation() end)
+        local near = hl and ml and ((hl.X - ml.X) ^ 2 + (hl.Y - ml.Y) ^ 2 + (hl.Z - ml.Z) ^ 2) < 1500 * 1500
+        if not near then
+            if not memEndHoldLogged then memEndHoldLogged = true; log("teleport hold: memory end -> kept in the air until the host brings us (it does that after its scene)") end
+        else
+            memEndHoldUntil, memEndHoldLogged = nil, nil
+            log("teleport hold: memory end -> we are next to the host, let go")
+        end
+    end
+    if tpHoldOn and not tpfOnAt and not (memEndHoldUntil and os.clock() < memEndHoldUntil) then
         if mineName == tpHoldOn then
             local cmr = valid(mine) and try(function() return mine.CharacterMovement end) or nil
             if valid(cmr) and try(function() return cmr.MovementMode end) == 5 then pcall(function() cmr:SetMovementMode(3, 0) end) end
@@ -5304,6 +5333,9 @@ local function sceneRelay()
             local mf = io.open(WIN64 .. "\\plugins\\CoopNative.guestmem", "w")
             if mf then mf:write(text == "CoopMemoryStart" and "1" or "0"); mf:close() end
             log("scene relay: host says " .. text)
+            -- (11-26 20:56) after the memory our character was let go in the air when our screen came back for the final scene (the
+            -- host brings us only after it), fell and died: until we stand next to the host (3 minutes at most) the hold stays
+            if text == "CoopMemoryEnd" then memEndHoldUntil = os.clock() + 180 end
         elseif text == "CoopSkip" then
             local comp = FindFirstOf("SkipEventUIComponent")
             if on and valid(comp) then local af = io.open(WIN64 .. "\\plugins\\CoopNative.allowskip", "w"); if af then af:write("1"); af:close() end end

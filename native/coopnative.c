@@ -101,6 +101,8 @@ static volatile LONG g_coop_host;
 static volatile ULONGLONG g_coop_at, g_vest_menu_at;
 static volatile LONG g_partner_vote;   // partner vote (defined again with its code further down)
 static volatile ULONGLONG g_window_processed_at, g_buddymenu_at, g_partner_hold_at;
+static volatile uintptr_t g_talk_scenes[16];   // talk/menu scenes for the partner vote (defined again further down)
+static volatile LONG g_talk_scene_n;
 static int coop_fresh(void) { return g_coop_on && GetTickCount64() - g_coop_at < 6000; }
 static char g_dir[MAX_PATH];   // tentative definition (also further down)
 static int memvote_pass_fresh(int consume) {
@@ -2577,6 +2579,12 @@ static void run_command(char *buf) {
     } else if (strncmp(buf, "partnerunfade ", 14) == 0) {
         unsigned long long pw = 0, sc = 0;
         if (sscanf(buf + 14, "%llx %llx", &pw, &sc) >= 1) { g_punfade_ctx = (uintptr_t)pw; g_punfade_caller = (uintptr_t)sc; InterlockedExchange(&g_punfade_pending, 1); }
+    } else if (strncmp(buf, "talkscenes", 10) == 0) {
+        uintptr_t v[16]; int n = 0; const char *q = buf + 10;
+        while (n < 16 && q && *q) { char *end; unsigned long long x = strtoull(q, &end, 16); if (end == q) break; if (x) v[n++] = (uintptr_t)x; q = end; }
+        g_talk_scene_n = 0;
+        for (int i = 0; i < n; i++) g_talk_scenes[i] = v[i];
+        g_talk_scene_n = n;
     } else if (strncmp(buf, "buddymenu", 9) == 0) {
         if (!g_buddymenu_at || GetTickCount64() - g_buddymenu_at > 3000) logf_("partner: the partner menu is open (a change there is a choice)");
         g_buddymenu_at = GetTickCount64();
@@ -3607,8 +3615,10 @@ static void gift_note(int i, void *c, void *st) {
         if (g_host_pc) relay_append("memstart");
     }
     if (g_keep_outro && g_group_teleport && g_memstart_tp && strstr(g_gift_name[i], "PlayMemoryResidue")) {
-        logf_("memory start: guest follows like a group teleport");
-        write_teleport_marker("start");
+        // (11-26 20:53) with the loading-screen gate (added for Mistle teleports, after the Ridge memory tests) the host waited 60 s
+        // on its loading screen for a "level ready" that a guest never reports for a memory, and the guest hung in the air
+        logf_("memory start: guest follows like a group teleport (quiet: no loading-screen gate)");
+        write_teleport_marker("start quiet");
         InterlockedExchange(&g_tp_pending, 1);
     }
     if (InterlockedIncrement(&g_gift_count[i]) > 200) return;
@@ -3629,6 +3639,15 @@ static void gift_note(int i, void *c, void *st) {
 // Calls through ProcessEvent (Code empty: our own replay after a passed vote) always run.
 static volatile LONG g_partner_vote;
 static volatile ULONGLONG g_window_processed_at, g_buddymenu_at, g_partner_hold_at;
+// (11-26 20:49) the guest's yes to Louis was not seen as a choice: the window hook was installed during his first talk, after the
+// window. A choice is now a SetBuddy from a talk or menu scene: CoopProbe lists the open ScenarioActors whose class is a talk
+// ("_talk") or a companion menu ("_Menu") ("talkscenes <hex> ...", up to 16), and the caller (FFrame Object) must be one of them.
+static volatile uintptr_t g_talk_scenes[16];
+static volatile LONG g_talk_scene_n;
+static int talk_scene_listed(uintptr_t o) {
+    for (LONG i = 0; i < g_talk_scene_n && i < 16; i++) if (g_talk_scenes[i] == o) return 1;
+    return 0;
+}
 static int partner_hold(int i, void *ctx, void *st) {
     (void)ctx;
     const char *n = g_gift_name[i];
@@ -3641,8 +3660,8 @@ static int partner_hold(int i, void *ctx, void *st) {
     if (!s || !readable(s + 0x18, 0x18) || *(uintptr_t *)(s + 0x20) == 0) return 0;   // not a Blueprint call: runs
     ULONGLONG now = GetTickCount64();
     int guest = !g_coop_host;
-    int choice = (g_window_processed_at && now - g_window_processed_at < 15000) || (g_buddymenu_at && now - g_buddymenu_at < 3000);
     void *obj = *(void **)(s + 0x18);
+    int choice = talk_scene_listed((uintptr_t)obj) || (g_buddymenu_at && now - g_buddymenu_at < 3000);
     if (is_set) {
         // (11-26 20:37) forced story changes run on every PC, guests included: skipping one inside the memory scene after the first
         // boss left the guest's memory inconsistent (it ended at once) and his game crashed on the memory's first player check
