@@ -3795,7 +3795,7 @@ function namesTick()
         -- (11-27) story trace lines: as the trigger trace, plus the call's first literal argument (an FName index or a string)
         local sl, soi, son, sci, sfi, sui, sun, sni, sarg = l:match("^STORY:(%S+) (%-?%d+) (%-?%d+) (%-?%d+) (%-?%d+) (%-?%d+) (%-?%d+) (%-?%d+) (.*)$")
         if sl then
-            log("story: " .. sl .. " on " .. nm(soi, son) .. " (" .. nm(sci) .. ") of " .. nm(sui, sun) .. " from " .. nm(sfi) ..
+            log("story: " .. sl .. " on " .. nm(soi, son) .. " (" .. nm(sci) .. ") of " .. nm(sui, sun) .. (sfi ~= "0" and (" from " .. nm(sfi)) or "") ..
                 (sarg ~= "-" and (' arg "' .. sarg .. '"') or ""))   -- (11-27) no FName(index) for the guessed name argument: an invalid index asserts
             goto continue
         end

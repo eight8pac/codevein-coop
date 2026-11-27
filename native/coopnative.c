@@ -3900,7 +3900,9 @@ static void st_note(int i, void *c, void *st) {
         if (cl && readable(cl + 0x18, 4)) ci = *(int *)(cl + 0x18);
         if (ou && readable(ou + 0x18, 8)) { ui = *(int *)(ou + 0x18); un = *(int *)(ou + 0x1C); }
     }
-    if (s && readable(s + 0x10, 8)) { uintptr_t node = *(uintptr_t *)(s + 0x10); if (node && readable(node + 0x18, 4)) fi = *(int *)(node + 0x18); }
+    // (11-27 09:36 host start crash, the same IsValidIndex assert as 09:24) no calling-function name here: for calls from native
+    // code the frame's Node is not a function, its +0x18 is not a name index, and CoopProbe's FName(index) asserts on it
+    (void)fi;
     char a[88]; st_arg(s, a, sizeof a, &ni);
     logf_("ST %s ctx=0x%llX%s%s%s", g_st_name[i], (unsigned long long)o, a[0] ? " arg \"" : "", a, a[0] ? "\"" : "");
     char p[MAX_PATH + 32];
@@ -5093,8 +5095,11 @@ static DWORD WINAPI worker(LPVOID unused) {
             "\xE9\x1B\xCF\x93\x05\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_lock_release, (void **)&g_orig_lock_release);
     install("PlayMemoryResidueImpl", 0x14090B120ULL,
             "\xE9\xAB\x7B\x76\x06\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_play_memory, (void **)&g_orig_play_memory);
-    install("AssertFatal", 0x140C3EEC0ULL,
-            "\xE9\x5B\xAE\x8B\x08\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_assert_fatal, (void **)&g_orig_assert_fatal);
+    // (11-27 09:40) 0x140C3EEC0 is only a jump to the real FDebug::AssertFailed at 0x1494F9D20 (it builds "Assertion failed: %s
+    // [File:%s] [Line: %i]", 0x143025E00); the obfuscated inlined checks call the real function directly, past a hook on the jump,
+    // so the guard hooks the real function now (first instruction mov [rsp+20h],r9 = 5 bytes): every caller, the same detour
+    install("AssertFatal", 0x1494F9D20ULL,
+            "\x4C\x89\x4C\x24\x20\x53\x55\x56\x41\x56\xB8\x68\x29\x00\x00\xE8", (void *)detour_assert_fatal, (void **)&g_orig_assert_fatal);
     install("AppearFinish", 0x1405B07B0ULL,
             "\xE9\x1B\x39\xD9\x05\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC\xCC", (void *)detour_appear_finish, (void **)&g_orig_appear_finish);
     install("LoadingInProgressCheck", 0x1407ACD30ULL,
