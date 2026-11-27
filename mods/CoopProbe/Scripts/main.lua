@@ -3573,12 +3573,28 @@ function pvSceneTick()
     local okm, em = pcall(function() pc:ClearAllTemporaryInputMask() end)
     log("partner vote: the scene's input lock cleared (ClearAllTemporaryInputMask) " .. (okm and "ok" or tostring(em):sub(1, 80)))
     if not valid(s.sa) then log("partner vote: the scene is gone"); return end
+    -- (11-27 08:20) after ChangeBuddy the Louis talk ends only from the host's spawn event (OnSpawnPlayer -> JumpToSequence Complete),
+    -- so nothing read its abort flag again: the scene stayed alive, its End (ClearTemporaryInputMask Scenario + FinishScenario) never
+    -- ran, and the game still counted a scene as playing (the guest could open doors and chests through our prompts, but no longer
+    -- rest at a Mistle). It is now ended the game's own way: JumpToSequence("Abort") runs its Abort -> End sequences; if a scene still
+    -- counts as playing 1 s later, ScenarioManager:FinishScenario(the scene), as its End does.
     local ab = try(function() return s.sa:IsAborted() end)
-    if ab == true then log("partner vote: the scene reports aborted"); return end
+    local okj, ej = pcall(function() s.sa:JumpToSequence(FName("Abort")) end)
+    log("partner vote: the scene is still there (aborted " .. tostring(ab) .. ") -> its own Abort sequence (JumpToSequence) " .. (okj and "ok" or tostring(ej):sub(1, 60)))
+    pvSceneEnd = { sa = s.sa, at = os.clock() }
+end
+pvSceneEnd = nil
+function pvSceneEndTick()
+    local e = pvSceneEnd
+    if not e or os.clock() - e.at < 1 then return end
+    pvSceneEnd = nil
     local sm = StaticFindObject("/Script/Extensions.Default__ScenarioManager")
-    local gs = FindFirstOf("BP_AppGameState_C")
-    local ok, r = pcall(function() return sm:FinishScenario(gs) end)
-    log("partner vote: the scene still runs 2 s after the abort (aborted " .. tostring(ab) .. ") -> FinishScenario " .. (ok and tostring(r) or tostring(r):sub(1, 60)))
+    local ctx = valid(e.sa) and e.sa or FindFirstOf("BP_AppGameState_C")
+    local playing = try(function() return sm:IsScenarioPlaying(ctx) end)
+    if playing ~= true then log("partner vote: the scene has ended (its own End ran; scene playing " .. tostring(playing) .. ")"); return end
+    local ok, r = pcall(function() return sm:FinishScenario(ctx) end)
+    log("partner vote: a scene still counts as playing 1 s after the Abort sequence -> FinishScenario " .. (ok and tostring(r) or tostring(r):sub(1, 60)) ..
+        ", now playing " .. tostring(try(function() return sm:IsScenarioPlaying(ctx) end)))
 end
 function pvStoryOutcome(me)
     local sm = StaticFindObject("/Script/Extensions.Default__AppSaveManager")
@@ -3645,9 +3661,30 @@ function memIntroGuestTick()
             local bound = try(function() return m.bBinding end)
             local un = bound == true and pcall(function() m:UnbindPlayer() end)
             if bound == true then pcall(function() m.bBinding = false end) end
+            -- (11-27 08:25) UnbindPlayer has no guard: when the intro sequence stops (its OnStop -> OnExStopped, e.g. at a skip) it
+            -- writes back what BindPlayer saved. With the binding skipped nothing was saved, so it would give his character a zero
+            -- mesh transform (scale 0), no collision and movement "None". The saved values are filled from his character now, so
+            -- that write-back changes nothing: mesh transform and animation mode as they are, collision as it is (query and physics
+            -- if off), movement Walking.
+            local pawn = try(function() return localPC().Pawn end)
+            local mesh = valid(pawn) and try(function() return pawn.Mesh end)
+            local cap = valid(pawn) and try(function() return pawn.CapsuleComponent end)
+            local filled = {}
+            if valid(mesh) then
+                local tr = try(function() return mesh:GetRelativeTransform() end)
+                if tr and pcall(function() m.MeshTransform = tr end) then filled[#filled + 1] = "mesh transform" end
+                local am = try(function() return mesh:GetAnimationMode() end)
+                if am and pcall(function() m.AnimationMode = am end) then filled[#filled + 1] = "animation mode " .. tostring(am) end
+            end
+            local ce = valid(cap) and try(function() return cap:GetCollisionEnabled() end) or nil
+            if ce == nil or ce == 0 then ce = 3 end
+            if pcall(function() m.CollisionEnabled = ce end) then filled[#filled + 1] = "collision " .. tostring(ce) end
+            if pcall(function() m.MovementMode = 1 end) then filled[#filled + 1] = "movement Walking" end
+            local sc = try(function() return m.MeshTransform.Scale3D.X end)
             local ok = pcall(function() m.bPlayerValidity = true end)
             log("memory intro (guest): " .. name(m) .. " host-character check " .. (was == true and "had already passed" or "marked as passed") ..
-                (bound == true and (", binding undone " .. tostring(un)) or ", not bound") .. " (" .. tostring(ok) .. ")")
+                (bound == true and (", binding undone " .. tostring(un)) or ", not bound") .. " (" .. tostring(ok) .. "); unbind values filled: " ..
+                (#filled > 0 and table.concat(filled, ", ") or "none") .. " (mesh scale now " .. tostring(sc) .. ")")
         end
     end
 end
@@ -3680,6 +3717,7 @@ end
 function partnerTick()
     local now = os.clock()
     pcall(pvSceneTick)
+    pcall(pvSceneEndTick)
     pcall(partnerTalkScenes, now)
     -- the Mistle's partner menu: a change there is a choice (CoopNative holds it for the vote)
     if iniHas("partner_vote=1") and now - pvMenuAt > 1 then
@@ -4254,6 +4292,10 @@ function hostDoorIn(kind, data)
         local g, dist = hostGuestPawnNear(try(function() return tr:K2_GetActorLocation() end))
         if not valid(g) then hostSay("interaction: the guest's character is not here"); return end
         hostSay(string.format("interaction: the guest uses %s (%.1f m away) -> his animation on our copy of him: %s", name(tr), dist or -1, playInteraction(tr, g)))
+        -- (11-27 08:23, owner: the map reveal came ~2 s after his animation) the game releases the map ~0.5 s after the press
+        -- (host's own purification 11-26 19:21:26.77 press -> 27.39 released and saved), not at the end of the animation: so the
+        -- host releases it 0.5 s after his interaction arrives; his 4-s fallback (kind 27) stays as the safety net
+        if clsCode == 2 then rmPending[hash] = os.clock() + 0.5 end
     elseif kind == 27 then
         -- (11-26) the guest purified a rotten Mistle: released here as the game does it after its animation (MulticastReleaseMap runs
         -- on every PC; bMapReleased is replicated), then its save event; the guest's own world gets it through the progress mirror
@@ -4283,7 +4325,15 @@ function hostDoorIn(kind, data)
             tostring(try(function() return m.HoldStateFlagName:ToString() end))))
     end
 end
+rmPending = {}
+function hostRottenTick()
+    local now = os.clock()
+    for h, at in pairs(rmPending) do
+        if now >= at then rmPending[h] = nil; pcall(hostDoorIn, 27, h) end
+    end
+end
 function hostDoorTick()
+    pcall(hostRottenTick)
     local now = os.clock()
     for n, p in pairs(hdPending) do
         local st = valid(p.d) and try(function() return p.d.DoorState end)

@@ -190,8 +190,22 @@ end
 -- Save backup, once per game run, before the first write. Copies every .sav under SaveGames (byte for byte, with io)
 -- to backups\<time>\ in the mod folder. Any failure means no backup, and then nothing is written.
 local backupDone = nil
+-- (11-27) CoopNative makes this backup at game start without console windows (the dir / mkdir below each flashed one) and leaves
+-- plugins\CoopNative.savebackup = "ok <files> <unix time> <dest>". It counts only when written during this game run (os.clock is
+-- the time since the game started); otherwise the old way below runs.
+local function nativeBackup()
+    local w64 = MOD_DIR:match("^(.*)[/\\]ue4ss[/\\]Mods[/\\]")
+    local f = w64 and io.open(w64 .. "\\plugins\\CoopNative.savebackup", "r")
+    if not f then return false end
+    local l = f:read("*l") or ""; f:close()
+    local n, at, dest = l:match("^ok (%d+) (%d+) (.+)$")
+    if not n or tonumber(at) < os.time() - os.clock() - 10 then return false end
+    journal("BACKUP", n .. " save files -> " .. dest .. " (CoopNative, at game start)")
+    return true
+end
 local function ensureBackup()
     if backupDone ~= nil then return backupDone end
+    if nativeBackup() then backupDone = true; return true end
     backupDone = false
     local root = (os.getenv("LOCALAPPDATA") or "") .. "\\CodeVein\\Saved\\SaveGames"
     local dest = MOD_DIR .. "\\backups\\" .. os.date("%Y%m%d-%H%M%S")

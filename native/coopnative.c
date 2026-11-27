@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <shlobj.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdint.h>
 #include <share.h>
 #include <string.h>
@@ -4594,6 +4595,23 @@ static LONG CALLBACK cw_handler(PEXCEPTION_POINTERS ep) {
         }
     }
     logf_("CRASH stack (exe values from rsp):%s", st);
+    // (11-27 08:25) a stack overflow showed only exe data pointers; for one, also every value that points into another module
+    // (ntdll, UE4SS, CoopNative, ...) as module+offset, so the function that recursed can be named next time
+    if (code == 0xC00000FD || code == 0xC0000005) {
+        st[0] = 0; k = 0;
+        for (size_t i = 0; i < 0x6000 && k < 24; i += 8) {
+            if (!readable(c->Rsp + i, 8)) break;
+            uintptr_t v = *(uintptr_t *)(c->Rsp + i);
+            if (v >= 0x140000000ULL && v < 0x160000000ULL) continue;
+            HMODULE hm = NULL;
+            if (v < 0x10000 || !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)v, &hm) || !hm) continue;
+            char mp[MAX_PATH]; if (!GetModuleFileNameA(hm, mp, sizeof mp)) continue;
+            const char *b = strrchr(mp, '\\'); b = b ? b + 1 : mp;
+            char one[64]; snprintf(one, sizeof one, " %s+0x%llX", b, (unsigned long long)(v - (uintptr_t)hm));
+            strcat_s(st, sizeof st, one); k++;
+        }
+        logf_("CRASH stack (other modules from rsp):%s", st);
+    }
     if (n == 1 && g_game_tid) {   // names only once the engine runs
         g_ac_regs[0] = c->Rbx; g_ac_regs[1] = c->Rsi; g_ac_regs[2] = c->Rdi; g_ac_regs[3] = c->Rbp;
         g_ac_regs[4] = c->R12; g_ac_regs[5] = c->R13; g_ac_regs[6] = c->R14; g_ac_regs[7] = c->R15;
@@ -4702,8 +4720,64 @@ static DWORD WINAPI live_thread(LPVOID unused) {
     }
     return 0;
 }
+// Save backup for CoopProgress (owner 11-27: "why do 3 terminal boxes open ... whenever he joins?"): CoopProgress backed the saves up
+// before its first write with io.popen("dir ...") and os.execute("mkdir ...") = one console window each (one dir + one mkdir per save
+// folder). Now CoopNative copies every .sav under the game's SaveGames folder (CodeVein\Saved\SaveGames in the user's local
+// application data folder, two folder levels) to
+// <Win64>\ue4ss\Mods\CoopProgress\backups\<date-time>\ at game start with plain file calls (no window), checks the sizes, and writes
+// plugins\CoopNative.savebackup = "ok <files> <unix time> <dest>" (or "failed ..."); CoopProgress uses it when it is from this run.
+static int sb_copy_dir(const char *src, const char *dst, int depth, int *n) {
+    char pat[MAX_PATH * 2]; WIN32_FIND_DATAA fd;
+    snprintf(pat, sizeof pat, "%s\\*", src);
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 1;
+    int ok = 1;
+    do {
+        if (fd.cFileName[0] == '.') continue;
+        char s[MAX_PATH * 2], d[MAX_PATH * 2];
+        snprintf(s, sizeof s, "%s\\%s", src, fd.cFileName); snprintf(d, sizeof d, "%s\\%s", dst, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (depth < 2) ok &= sb_copy_dir(s, d, depth + 1, n);
+            continue;
+        }
+        size_t L = strlen(fd.cFileName);
+        if (L < 4 || _stricmp(fd.cFileName + L - 4, ".sav") != 0) continue;
+        CreateDirectoryA(dst, NULL);
+        WIN32_FILE_ATTRIBUTE_DATA a1, a2;
+        if (!CopyFileA(s, d, FALSE) || !GetFileAttributesExA(s, GetFileExInfoStandard, &a1) || !GetFileAttributesExA(d, GetFileExInfoStandard, &a2) ||
+            a1.nFileSizeLow != a2.nFileSizeLow || a1.nFileSizeHigh != a2.nFileSizeHigh) { ok = 0; continue; }
+        (*n)++;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return ok;
+}
+static void save_backup_for_progress(void) {
+    char marker[MAX_PATH + 32], mods[MAX_PATH * 2], src[MAX_PATH * 2], dst[MAX_PATH * 2], la[MAX_PATH];
+    snprintf(marker, sizeof marker, "%sCoopNative.savebackup", g_dir);
+    DeleteFileA(marker);
+    snprintf(mods, sizeof mods, "%s..\\ue4ss\\Mods\\CoopProgress\\Scripts", g_dir);
+    if (GetFileAttributesA(mods) == INVALID_FILE_ATTRIBUTES) return;   // CoopProgress not installed
+    FILE *f;
+    // 0x001C = the local application data folder (Windows folder id), where the game keeps CodeVein\Saved
+    if (SHGetFolderPathA(NULL, 0x001C, NULL, 0, la) != S_OK) { if ((f = fopen(marker, "w"))) { fputs("failed: no local application data folder\n", f); fclose(f); } return; }
+    snprintf(src, sizeof src, "%s\\CodeVein\\Saved\\SaveGames", la);
+    SYSTEMTIME t; GetLocalTime(&t);
+    snprintf(dst, sizeof dst, "%s..\\ue4ss\\Mods\\CoopProgress\\backups", g_dir);
+    CreateDirectoryA(dst, NULL);
+    size_t dl = strlen(dst);
+    snprintf(dst + dl, sizeof dst - dl, "\\%04u%02u%02u-%02u%02u%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    CreateDirectoryA(dst, NULL);
+    int n = 0, ok = sb_copy_dir(src, dst, 0, &n);
+    if ((f = fopen(marker, "w"))) {
+        if (ok && n > 0) fprintf(f, "ok %d %lld %s\n", n, (long long)time(NULL), dst);
+        else fprintf(f, "failed %d file(s) copied, %s\n", n, ok ? "none found" : "a copy failed");
+        fclose(f);
+    }
+    logf_("save backup for CoopProgress: %d save file(s) %s (no console window)", n, ok && n > 0 ? "copied" : "NOT complete");
+}
 static DWORD WINAPI worker(LPVOID unused) {
     (void)unused;
+    save_backup_for_progress();
     Sleep(2000);   // let the engine finish its own startup first
     MH_STATUS s = MH_Initialize();
     logf_("MH_Initialize -> %s", MH_StatusToString(s));
