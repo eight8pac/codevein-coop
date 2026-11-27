@@ -105,6 +105,7 @@ static volatile LONG g_guest_story_partner_skip;   // guest_story_partner_skip=1
 static volatile LONG g_guest_flow_dedupe;          // guest_flow_dedupe=1 (guest only; 11-27 co-op chain trace)
 static volatile LONG g_coop_keep;                  // coop_keep=1 (both roles; 11-27 owner: the connection should persist)
 static volatile LONG g_guest_skip_bc;              // guest_skip_bc_scene=1 (guest only; fallback B, 11-27)
+static volatile LONG g_mem_solo;                   // memory_solo_setup=1 (both roles, 11-27): memory characters take the solo setup, v5 off
 static volatile ULONGLONG g_own_death_at, g_keep_veto_at;
 static volatile ULONGLONG g_window_processed_at, g_buddymenu_at, g_partner_hold_at;
 static volatile uintptr_t g_talk_scenes[16];   // talk/menu scenes for the partner vote (defined again further down)
@@ -590,6 +591,14 @@ static uint64_t detour_assert_fatal(void *a, void *b, void *c, void *d, void *e,
         if (n <= 50) logf_("appear lock: engine check in the lock code skipped (from 0x%llX, count %d, +0xB84 holders %d, %ld so far)",
                            (unsigned long long)ret, *(volatile int *)0x14413C404ULL, *(volatile int *)0x14413C40CULL, n);
         return 0;
+    }
+    {
+        // (11-27) any check that reaches the original is logged first, with its text and caller, so a new source can be named
+        uintptr_t ex = (uintptr_t)a;
+        char t[100] = "?";
+        if (ex && readable(ex, 1)) { size_t k = 0; while (k < sizeof t - 1 && readable(ex + k, 1) && ((const char *)ex)[k]) { t[k] = ((const char *)ex)[k]; k++; } t[k] = 0; }
+        logf_("engine check failed, not skipped: \"%s\" (text at 0x%llX) from 0x%llX (setup count %d, +0xB84 holders %d)", t, (unsigned long long)ex,
+              (unsigned long long)ret, *(volatile int *)0x14413C404ULL, *(volatile int *)0x14413C40CULL);
     }
     return g_orig_assert_fatal(a, b, c, d, e, f, g, h);
 }
@@ -1837,6 +1846,19 @@ static uint8_t detour_multiplay(void *ctx) {
             logf_("hb: NPC 0x%llX takes the solo setup (reports %d)", (unsigned long long)(uintptr_t)ctx, readable((uintptr_t)ctx + 0xB9C, 4) ? *(int *)((uintptr_t)ctx + 0xB9C) : -1);
         return 0;
     }
+    // (11-27 15:09 both PCs crashed at the memory skip: "NumInCharacterSetup > 0") v5 had set the setup counter to 0 while 3
+    // characters were still in setup (host 15:08:48.7, guest 15:08:55.1); when they finished at the memory end the counter went below 0.
+    // Why they hang: online, each character stays in setup until every other PC has reported it (above), and in the memory those reports
+    // do not come. With memory_solo_setup=1 every character in the memory window (15 min from PlayMemoryResidue, on each PC) takes the
+    // solo setup, as the Home Base NPCs do: it finishes at once and the game counts the counter down itself. v5 is off then.
+    if (r && caller == 0x145DA0630ULL && g_mem_solo && g_memory_start_at && GetTickCount64() - g_memory_start_at < 900000 && ctx) {
+        static volatile LONG mem_solo_n;
+        LONG k = InterlockedIncrement(&mem_solo_n);
+        if (k <= 60)
+            logf_("memory: character 0x%llX takes the solo setup (reports %d, setup count %d, %ld so far)", (unsigned long long)(uintptr_t)ctx,
+                  readable((uintptr_t)ctx + 0xB9C, 4) ? *(int *)((uintptr_t)ctx + 0xB9C) : -1, *(volatile int *)0x14413C404ULL, k);
+        return 0;
+    }
     // option A (session 10): the outro keeps the game's own sync (outro_partner_override=0); from the memory start on (15 min:
     // memory, its scenes, the cutscene out of it) the checks are answered again, so neither game waits for the other's copy
     int memwin = g_memory_start_at && GetTickCount64() - g_memory_start_at < 900000;
@@ -2824,6 +2846,8 @@ static void read_settings(void) {
     LONG gfd = have_ini && as_guest && strstr(buf, "guest_flow_dedupe=1") != NULL;
     LONG ckp = have_ini && strstr(buf, "coop_keep=1") != NULL;
     LONG gsb = have_ini && as_guest && strstr(buf, "guest_skip_bc_scene=1") != NULL;
+    LONG mss = have_ini && strstr(buf, "memory_solo_setup=1") != NULL;
+    if (InterlockedExchange(&g_mem_solo, mss) != mss) logf_("setting memory_solo_setup = %ld", mss);
     if (InterlockedExchange(&g_guest_skip_bc, gsb) != gsb) logf_("setting guest_skip_bc_scene = %ld", gsb);
     if (InterlockedExchange(&g_coop_keep, ckp) != ckp) logf_("setting coop_keep = %ld", ckp);
     if (InterlockedExchange(&g_guest_flow_dedupe, gfd) != gfd) logf_("setting guest_flow_dedupe = %ld", gfd);
@@ -5260,7 +5284,7 @@ static DWORD WINAPI worker(LPVOID unused) {
             static ULONGLONG v5_last;
             ULONGLONG now5 = GetTickCount64();
             uintptr_t hpc = g_host_pc, hp = 0;
-            if (g_keep_outro && g_memory_at && now5 - g_memory_at > 2000 && now5 - g_memory_at < 180000 && now5 - v5_last > 2000 && hpc &&
+            if (!g_mem_solo && g_keep_outro && g_memory_at && now5 - g_memory_at > 2000 && now5 - g_memory_at < 180000 && now5 - v5_last > 2000 && hpc &&
                 readable(hpc + 0x388, 8) && (hp = *(uintptr_t *)(hpc + 0x388)) && readable(hp + 0x28, 0x10) && readable(hp + 0xB80, 8) &&
                 *(volatile uint8_t *)(hp + 0x35) == 0 && *(volatile int *)0x14413C408ULL <= 0 && *(volatile int *)0x14413C404ULL <= 3) {
                 v5_last = now5;
@@ -5270,6 +5294,19 @@ static DWORD WINAPI worker(LPVOID unused) {
                 *(volatile int *)0x14413C404ULL = 0; clear_player_lock_flags();
                 *(volatile int *)0x14413C40CULL = 0;
                 *(volatile uint64_t *)0x14413C410ULL = *(volatile uint64_t *)0x144194140ULL;
+            }
+        }
+        // with memory_solo_setup: v5 is off; log (once per memory) if the host's memory character is still unstarted 3 s in
+        {
+            static ULONGLONG v5d_for;
+            uintptr_t hpc = g_host_pc, hp = 0;
+            ULONGLONG nowd = GetTickCount64();
+            if (g_mem_solo && g_memory_at && v5d_for != g_memory_at && nowd - g_memory_at > 3000 && hpc && readable(hpc + 0x388, 8) &&
+                (hp = *(uintptr_t *)(hpc + 0x388)) && readable(hp + 0x28, 0x10) && readable(hp + 0xB80, 8)) {
+                v5d_for = g_memory_at;
+                logf_("memory (solo setup): host memory character 0x%llX 3 s in: tick +0x35 %u b83 %u (count %d, +0xB84 holders %d) %s",
+                      (unsigned long long)hp, *(volatile uint8_t *)(hp + 0x35), *(volatile uint8_t *)(hp + 0xB83), *(volatile int *)0x14413C404ULL,
+                      *(volatile int *)0x14413C40CULL, *(volatile uint8_t *)(hp + 0x35) ? "started" : "STILL UNSTARTED (no v5 reset)");
             }
         }
         // v7 (11-13): the same stuck lock after a Mistle group teleport, from 10 s after the host's arrival (lock_reset_tp=1)
@@ -5403,7 +5440,7 @@ static DWORD WINAPI worker(LPVOID unused) {
                                   *(volatile uint8_t *)(op + 0xB83), readable(op + 0xC12, 1) ? *(volatile uint8_t *)(op + 0xC12) : 255,
                                   readable(op + 0x3C8, 1) ? *(volatile uint8_t *)(op + 0x3C8) : 255);
                         if (*(volatile uint8_t *)(op + 0x35) != 0) { other_since[slot] = nowv; continue; }
-                        if (!other_reset[slot] && nowv - other_since[slot] > 2000 && *(volatile int *)0x14413C408ULL <= 0) {
+                        if (!g_mem_solo && !other_reset[slot] && nowv - other_since[slot] > 2000 && *(volatile int *)0x14413C408ULL <= 0) {
                             other_reset[slot] = 1;
                             logf_("appear lock v5 (guest): other player character 0x%llX unstarted (b83 %u, count %d) -> lock reset",
                                   (unsigned long long)op, *(volatile uint8_t *)(op + 0xB83), *(volatile int *)0x14413C404ULL);
@@ -5425,7 +5462,7 @@ static DWORD WINAPI worker(LPVOID unused) {
                           *(volatile uint64_t *)0x14413C410ULL == ~0ULL ? "forever" : "no");
                 }
                 if (t35 != 0) gv5_since = nowv;
-                else if (nowv - gv5_since > 2000 && gv5_count < 3 && *(volatile int *)0x14413C408ULL <= 0) {
+                else if (!g_mem_solo && nowv - gv5_since > 2000 && gv5_count < 3 && *(volatile int *)0x14413C408ULL <= 0) {
                     gv5_count++; gv5_since = nowv;
                     logf_("appear lock v5 (guest): our memory character 0x%llX unstarted (b83 %u, count %d) -> lock reset (%d)", (unsigned long long)mp,
                           b83, *(volatile int *)0x14413C404ULL, gv5_count);

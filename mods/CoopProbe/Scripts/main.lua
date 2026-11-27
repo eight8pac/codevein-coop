@@ -4573,6 +4573,29 @@ function chainFollowTick()
     local double = valid(p) and try(function() return p:GetAddress() end) ~= cfLastCtl and try(function() return p.bHidden end) == true and
         try(function() return sm:IsScenarioPlaying(p) end) == true
     if placeholder or double then
+        -- (11-27 15:08 owner: "he was constantly phasing in and out of existence on my side") a new character at about our spot (boss
+        -- outro, vestige scene) does not park him: he stays free. Only one more than 40 m away from a guest (memory start/end, the trip
+        -- to Home Base), where he would fall, parks him.
+        local pa = try(function() return p:GetAddress() end)
+        if pa and pa == cfNearAddr then return end
+        local tl = try(function() return p:K2_GetActorLocation() end)
+        local far, md = (tl == nil), nil
+        if tl then
+            for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+                local g = valid(c) and not try(function() return c:IsLocalController() end) and try(function() return c.Pawn end) or nil
+                local gl = valid(g) and name(g):find("BP_Player_C", 1, true) and try(function() return g:K2_GetActorLocation() end)
+                if gl then
+                    local d = math.sqrt((tl.X - gl.X) ^ 2 + (tl.Y - gl.Y) ^ 2 + (tl.Z - gl.Z) ^ 2) / 100
+                    md = math.max(md or 0, d)
+                    if d > 40 then far = true end
+                end
+            end
+        end
+        if not far then
+            cfNearAddr = pa
+            log(string.format("chain follow: our character was replaced (%s) at about our spot (%.0f m from the guest) -> he stays free", pn, md or -1))
+            return
+        end
         cfArmed = false
         local f = io.open(TELEPORT_PATH, "w")
         if f then f:write("start quiet chain nofade"); f:close() end
@@ -4656,9 +4679,12 @@ local function groupTeleport()
             end
             tpHidden = tpHidden or {}
             local heldSet = {}
+            -- (11-27) chain follow / memory end: held where he is but stays visible (no hiding, no blinking on our screen)
             for _, g in ipairs(pendingTp.held) do
-                if pcall(function() g:SetActorHiddenInGame(true) end) then tpHidden[#tpHidden + 1] = g end
-                heldSet[name(g)] = true
+                if not cfOn then
+                    if pcall(function() g:SetActorHiddenInGame(true) end) then tpHidden[#tpHidden + 1] = g end
+                    heldSet[name(g)] = true
+                end
             end
             local eq = 0
             for _, e in ipairs(FindAllOf("EquipmentBase") or {}) do
@@ -4671,7 +4697,7 @@ local function groupTeleport()
                 end
             end
             if eq > 0 then log("group teleport: " .. eq .. " equipment actor(s) of the held guests hidden too (weapons)") end
-            log("group teleport: " .. #pendingTp.held .. " guest character(s) held in the air (hidden) until they are brought")
+            log("group teleport: " .. #pendingTp.held .. " guest character(s) held in the air " .. (cfOn and "(visible)" or "(hidden)") .. " until they are brought")
         end
         -- (11-27) synced creation (sync_spawn=1): each new character our game creates for us during the chain (cutscene doubles
         -- included) gets one for every guest at the same moment, next to it, parked (hidden, held). His PC then has a fresh character
