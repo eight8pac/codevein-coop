@@ -3796,7 +3796,7 @@ function namesTick()
         local sl, soi, son, sci, sfi, sui, sun, sni, sarg = l:match("^STORY:(%S+) (%-?%d+) (%-?%d+) (%-?%d+) (%-?%d+) (%-?%d+) (%-?%d+) (%-?%d+) (.*)$")
         if sl then
             log("story: " .. sl .. " on " .. nm(soi, son) .. " (" .. nm(sci) .. ") of " .. nm(sui, sun) .. " from " .. nm(sfi) ..
-                (tonumber(sni) and tonumber(sni) > 0 and (" name '" .. nm(sni) .. "'") or "") .. (sarg ~= "-" and (' arg "' .. sarg .. '"') or ""))
+                (sarg ~= "-" and (' arg "' .. sarg .. '"') or ""))   -- (11-27) no FName(index) for the guessed name argument: an invalid index asserts
             goto continue
         end
         -- (11-26) trigger trace lines carry the object a function ran on, its class, its owner and the calling script function

@@ -555,6 +555,26 @@ static assert_fn g_orig_assert_fatal;
 static volatile LONG g_assert_skips;
 static uint64_t detour_assert_fatal(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) {
     uintptr_t ret = (uintptr_t)__builtin_return_address(0);
+    // (11-27 09:28 guest, after skipping memory e01900: CodeVein.log "Assertion failed: NumInCharacterSetup > 0 [AppCharacter.cpp]
+    // [Line: 823]" = the same check the guard skips, raised from an inlined copy in the obfuscated code (lea of the check's text at
+    // 0x149F040A5 / 0x14808EDE9 / 0x146928FC2; their return addresses cannot be listed). The guard recognises the check by its text
+    // (first argument = the expression string) as well: same treatment as below, the counter it tests is set to 1 first so the
+    // decrement after it ends at 0. Texts: "NumInCharacterSetup > 0" 0x142C96DF8/0x142C96F20/0x142C971C0/0x142C97278 ->
+    // [0x14413C404]; "NumInCharacterSetupBeforeAppBeginPlay > 0" 0x142C97570/0x142C97720 -> [0x14413C40C].
+    if (!(ret >= 0x145D78000ULL && ret < 0x145D86200ULL)) {
+        uintptr_t ex = (uintptr_t)a;
+        int nis = ex == 0x142C96DF8ULL || ex == 0x142C96F20ULL || ex == 0x142C971C0ULL || ex == 0x142C97278ULL;
+        int nib = ex == 0x142C97570ULL || ex == 0x142C97720ULL;
+        if (nis || nib) {
+            volatile int *ctr = (volatile int *)(nis ? 0x14413C404ULL : 0x14413C40CULL);
+            int before = *ctr;
+            if (before <= 0) *ctr = 1;
+            LONG n = InterlockedIncrement(&g_assert_skips);
+            if (n <= 50) logf_("appear lock: engine check \"%s\" skipped by its text (from 0x%llX outside the lock code, counter %d -> %d, %ld so far)",
+                               nis ? "NumInCharacterSetup > 0" : "NumInCharacterSetupBeforeAppBeginPlay > 0", (unsigned long long)ret, before, *ctr, n);
+            return 0;
+        }
+    }
     if (ret >= 0x145D78000ULL && ret < 0x145D86200ULL) {
         // 2026-11-03 (both PCs crashed with "BitArrayIndex" right after a negative counter): the failing check is followed by a
         // plain DEC of the counter it tested. Set exactly that counter to 1 first, so the decrement ends at 0, never below:
@@ -3864,10 +3884,10 @@ static void st_arg(uintptr_t s, char *str, size_t n, int *nidx) {
             int L = 0;
             while (k + 1 + L < 96 && p[k + 1 + L] >= 0x20 && p[k + 1 + L] < 0x7F && L < 80) L++;
             if (L >= 2 && k + 1 + L < 96 && p[k + 1 + L] == 0) { size_t m = (size_t)L < n - 1 ? (size_t)L : n - 1; memcpy(str, p + k + 1, m); str[m] = 0; return; }
-        } else if (p[k] == 0x21 && k + 13 <= 96) {
-            int idx = *(const int *)(p + k + 1);
-            if (idx > 0 && idx < 4000000) { *nidx = idx; return; }
         }
+        // (11-27 09:24: both games died at the title on "Assertion failed: IsValidIndex(Index)" in NameTypes.h, called from UE4SS)
+        // the EX_NameConst guess could pick random bytes as a name index, and CoopProbe's FName(index) asserts on an invalid one:
+        // only string arguments are read now (plain bytes, nothing is looked up)
     }
 }
 static void st_note(int i, void *c, void *st) {
