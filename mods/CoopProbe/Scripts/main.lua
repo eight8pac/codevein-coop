@@ -3759,12 +3759,61 @@ function namesTick()
         return s
     end
     for _, l in ipairs(lines) do
+        -- (11-27) story trace lines: as the trigger trace, plus the call's first literal argument (an FName index or a string)
+        local sl, soi, son, sci, sfi, sui, sun, sni, sarg = l:match("^STORY:(%S+) (%-?%d+) (%-?%d+) (%-?%d+) (%-?%d+) (%-?%d+) (%-?%d+) (%-?%d+) (.*)$")
+        if sl then
+            log("story: " .. sl .. " on " .. nm(soi, son) .. " (" .. nm(sci) .. ") of " .. nm(sui, sun) .. " from " .. nm(sfi) ..
+                (tonumber(sni) and tonumber(sni) > 0 and (" name '" .. nm(sni) .. "'") or "") .. (sarg ~= "-" and (' arg "' .. sarg .. '"') or ""))
+            goto continue
+        end
         -- (11-26) trigger trace lines carry the object a function ran on, its class, its owner and the calling script function
         local tl, toi, ton, tci, tfi, tui, tun = l:match("^(%S+) (%-?%d+) (%-?%d+) (%-?%d+) (%-?%d+) (%-?%d+) (%-?%d+)$")
         local label, oi, on, ci, fi = l:match("^(%S+) (%-?%d+) (%-?%d+) (%-?%d+) (%-?%d+)")
         if tl then log("trace: " .. tl .. " on " .. nm(toi, ton) .. " (" .. nm(tci) .. ") of " .. nm(tui, tun) .. " from " .. nm(tfi))
         elseif label then log("trace: " .. label .. " called by " .. nm(oi, on) .. " (" .. nm(ci) .. ") in " .. nm(fi)) end
+        ::continue::
     end
+end
+-- (11-27) story timeline (story_trace=1): every 0.5 s one line when something changed: our character (name, place in metres,
+-- movement mode, hidden), the player characters, the story actors alive (flow diagrams, scenes, memory actors), whether a scene
+-- counts as playing, and how many streamed levels are loaded / visible. Read with the native "ST" lines for the whole chain.
+stlAt, stlLast = -1000, nil
+function storyTimelineTick()
+    if not iniHas("story_trace=1") then return end
+    local now = os.clock()
+    if now - stlAt < 0.5 then return end
+    stlAt = now
+    local pc = localPC()
+    local me = valid(pc) and try(function() return pc.Pawn end) or nil
+    local mine = "none"
+    if valid(me) then
+        local l = try(function() return me:K2_GetActorLocation() end)
+        local cm = try(function() return me.CharacterMovement end)
+        mine = name(me) .. (l and string.format(" at %d,%d,%d", math.floor(l.X / 100), math.floor(l.Y / 100), math.floor(l.Z / 100)) or "") ..
+            " mode " .. tostring(valid(cm) and try(function() return cm.MovementMode end)) .. (try(function() return me.bHidden end) == true and " hidden" or "")
+    end
+    local players = {}
+    for _, p in ipairs(FindAllOf("BP_Player_C") or {}) do if valid(p) then players[#players + 1] = name(p) end end
+    local story = {}
+    for _, sa in ipairs(FindAllOf("ScenarioActor") or {}) do
+        if valid(sa) and #story < 8 then story[#story + 1] = name(sa) .. "(r" .. tostring(try(function() return sa.Role end)) .. ")" end
+    end
+    local mus = {}
+    for _, m in ipairs(FindAllOf("MuseumUtilityActor") or {}) do if valid(m) then mus[#mus + 1] = name(m) end end
+    local sm = StaticFindObject("/Script/Extensions.Default__ScenarioManager")
+    local playing = valid(me) and try(function() return sm:IsScenarioPlaying(me) end)
+    local ld, vis = 0, 0
+    for _, ls in ipairs(FindAllOf("LevelStreamingKismet") or {}) do
+        if valid(ls) then
+            if try(function() return ls:IsLevelLoaded() end) == true then ld = ld + 1 end
+            if try(function() return ls:IsLevelVisible() end) == true then vis = vis + 1 end
+        end
+    end
+    local line = "us " .. mine .. " | players " .. table.concat(players, ",") .. " | scenes " .. (#story > 0 and table.concat(story, ",") or "none") ..
+        (#mus > 0 and (" | memory " .. table.concat(mus, ",")) or "") .. " | playing " .. tostring(playing) .. " | levels " .. ld .. " loaded " .. vis .. " visible"
+    -- the place changes all the time while walking: compare without it
+    local key = line:gsub(" at %-?%d+,%-?%d+,%-?%d+", "")
+    if key ~= stlLast then stlLast = key; log("story timeline: " .. line) end
 end
 rcState = nil
 function restCensusSnap(tag)
@@ -9308,6 +9357,7 @@ LoopAsync(200, function()
         pcall(rvTick)
         pcall(partnerTick)
         pcall(memIntroGuestTick)
+        pcall(storyTimelineTick)
         pcall(namesTick)
         pcall(enemyStateTick)
         pcall(difficultyTick)
