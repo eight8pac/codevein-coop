@@ -3730,6 +3730,7 @@ function myDeathTick()
     end
 end
 busyAt, busySent, waitShown = -1000, nil, nil
+os.remove(WIN64 .. "\\plugins\\CoopNative.waiting")   -- (11-27) a file from the last run showed the message at the title
 function busyTick()
     if not iniHas("scene_busy_wait=1") then return end
     local now = os.clock()

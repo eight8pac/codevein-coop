@@ -3867,7 +3867,9 @@ static void tt_note(int i, void *c, void *st) {
         if (cl && readable(cl + 0x18, 4)) ci = *(int *)(cl + 0x18);
         if (ou && readable(ou + 0x18, 8)) { ui = *(int *)(ou + 0x18); un = *(int *)(ou + 0x1C); }
     }
-    if (s && readable(s + 0x10, 8)) { uintptr_t node = *(uintptr_t *)(s + 0x10); if (node && readable(node + 0x18, 4)) fi = *(int *)(node + 0x18); }
+    // (11-27 15:03 host start crash: the same IsValidIndex assert) no calling-function name here either: our own Lua call of
+    // UIHelper:ShowPopupMessage reached this hook with a frame whose Node +0x18 is no name index, and CoopProbe's FName(index) asserts
+    (void)s;
     logf_("TT %s ctx=0x%llX", g_tt_name[i], (unsigned long long)o);
     char p[MAX_PATH + 32];
     snprintf(p, sizeof p, "%sCoopNative.names", g_dir);
@@ -4968,6 +4970,12 @@ static int sb_copy_dir(const char *src, const char *dst, int depth, int *n) {
     FindClose(h);
     return ok;
 }
+static void clear_stale_files(void) {
+    // (11-27 15:03) CoopNative.waiting from the last run made CoopProbe show "Waiting for the other player" at the title
+    char p[MAX_PATH + 32];
+    snprintf(p, sizeof p, "%sCoopNative.waiting", g_dir);
+    DeleteFileA(p);
+}
 static void save_backup_for_progress(void) {
     char marker[MAX_PATH + 32], mods[MAX_PATH * 2], src[MAX_PATH * 2], dst[MAX_PATH * 2], la[MAX_PATH];
     snprintf(marker, sizeof marker, "%sCoopNative.savebackup", g_dir);
@@ -4994,6 +5002,7 @@ static void save_backup_for_progress(void) {
 }
 static DWORD WINAPI worker(LPVOID unused) {
     (void)unused;
+    clear_stale_files();
     save_backup_for_progress();
     Sleep(2000);   // let the engine finish its own startup first
     MH_STATUS s = MH_Initialize();
