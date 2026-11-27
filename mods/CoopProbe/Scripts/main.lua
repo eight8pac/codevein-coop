@@ -3699,6 +3699,39 @@ function guestWalkRelease()
     local ok, e = pcall(function() hlp:ClearRestrictedActionInBaseInfo(mine) end)
     log("walk release (guest): the host's memory started -> action limits lifted as the vestige scene does (" .. (ok and "ok" or tostring(e):sub(1, 80)) .. ")")
 end
+-- (11-27) blood-code prompt sync (scene_busy_wait=1): while our blood-code scene runs (BP_ScenarioGetBC, the black screen with the
+-- "blood code acquired" prompt that goes on only when this player presses continue), the other player's game is told every second
+-- (guest -> host: kind 30; host -> guests: ClientMessage CoopBusy:1), once more with 0 when it ends. Its CoopNative then keeps the
+-- next cutscene's start waiting (the game's own "both ready" sync) until we are through. CoopNative.waiting -> a message here.
+busyAt, busySent, waitShown = -1000, nil, nil
+function busyTick()
+    if not iniHas("scene_busy_wait=1") then return end
+    local now = os.clock()
+    if now - busyAt < 1 then return end
+    busyAt = now
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not valid(gs) then return end
+    local isHost = try(function() return gs.Role end) == 3
+    local mine = false
+    for _, s in ipairs(FindAllOf("BP_ScenarioGetBC_C") or {}) do if valid(s) then mine = true; break end end
+    if mine or busySent == true then
+        local v = mine and 1 or 0
+        if isHost then
+            for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+                if valid(c) and not try(function() return c:IsLocalController() end) then pcall(function() c:ClientMessage("CoopBusy:" .. v, FName("None"), 0) end) end
+            end
+        else
+            pcall(fsToHost, 30, v)
+        end
+        if busySent ~= mine then log("blood-code sync: our blood-code scene " .. (mine and "runs -> the other player's next cutscene waits for us" or "has ended -> told the other player")) end
+        busySent = mine
+    end
+    local f = io.open(WIN64 .. "\\plugins\\CoopNative.waiting", "r")
+    if f then
+        local w = f:read("*l") or ""; f:close()
+        if w ~= waitShown then waitShown = w; votePopup("Waiting for the other player to continue"); log("blood-code sync: waiting for the other player (message shown)") end
+    end
+end
 ptsAt, ptsLast = -1000, nil
 function partnerTalkScenes(now)
     if now - ptsAt < 0.5 then return end
@@ -4957,6 +4990,8 @@ pcall(function()
         local text = try(function() return s:get():ToString() end)
         if text == "CoopTeleportFade" then tpfMessageAt = os.clock() end
         if text == "CoopTeleportCancel" then tpfCancelAt = os.clock() end
+        local busy = text and text:match("^CoopBusy:(%d)$")
+        if busy then vmCmd("otherbusy " .. busy) end
     end)
 end)
 local function tpfadeSend(ctx, on)
@@ -6533,6 +6568,8 @@ function fsHostIn()
                     pcall(pvApply, pty, pstory)
                 elseif voteState then voteSendAll("CoopVoteEnd:0,another vote is running")
                 else pcall(pvStart, pty, true, pstory) end
+            elseif kind == 30 then
+                vmCmd("otherbusy " .. tostring(data))
             elseif kind == 24 or kind == 25 or kind == 26 or kind == 27 or kind == 29 then
                 local okd, ed = pcall(hostDoorIn, kind, data)
                 if not okd then log("door/Mistle relay ERROR " .. tostring(ed):sub(1, 160)) end
@@ -9357,6 +9394,7 @@ LoopAsync(200, function()
         pcall(rvTick)
         pcall(partnerTick)
         pcall(memIntroGuestTick)
+        pcall(busyTick)
         pcall(storyTimelineTick)
         pcall(namesTick)
         pcall(enemyStateTick)

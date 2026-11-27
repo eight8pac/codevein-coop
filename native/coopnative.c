@@ -157,6 +157,11 @@ static int class_name_is(uintptr_t cls, LONG idx) { return idx > 0 && cls && rea
 static volatile LONG g_guest_mem_block;   // guest_memory_block=1: block the guest's own memory copy (step a); off = both run it (step 2)
 static volatile LONG g_partner_override = 1;
 static volatile LONG g_scene_wait = 1;   // scene_start_wait=0: scenes in the memory window start without waiting for the other player
+// (11-27, owner: the blood-code prompt goes on only when each player presses continue, so the next cutscene could start on one PC
+// while the other still reads the prompt) CoopProbe sends "otherbusy 1" every second while the OTHER player's game reports that
+// its blood-code scene still runs ("otherbusy 0" when it ends); the scene-start wait then goes on past its 10 s for as long as those
+// reports stay fresh (4 s), 2 minutes at most, and writes plugins\CoopNative.waiting "1 <tick>" so CoopProbe shows a message.
+static volatile ULONGLONG g_other_busy_at;
 static volatile ULONGLONG g_memory_start_at;   // PlayMemoryResidue seen (both PCs): option A answers the partner checks for 15 min
 static volatile LONG g_memstart_tp = 1;   // memory_start_teleport=0: no group teleport of the guest at the memory start (step 2)   // outro_partner_override=0: the four "partner ready" answers off (session 10)
 // Player 0 on the host (session 10): the museum (memory) asks GetPlayerController(ctx, 0) whether "the player" is ready and stayed
@@ -1793,10 +1798,21 @@ static uint8_t detour_multiplay(void *ctx) {
     if (r && g_keep_outro && g_scene_wait && memwin && caller == OUTRO_POLY_CALLER) {
         static ULONGLONG start, lastp; static int gaveup;
         ULONGLONG now = GetTickCount64();
-        if (now - lastp > 3000) { start = now; gaveup = 0; logf_("scene start: waiting for the other player (game's own sync, 10 s at most)"); }
+        static int ext;
+        if (now - lastp > 3000) { start = now; gaveup = 0; ext = 0; logf_("scene start: waiting for the other player (game's own sync, 10 s at most)"); }
         lastp = now;
         if (now - start < 10000) return r;
-        if (!gaveup) { gaveup = 1; logf_("scene start: no report after 10 s -> not waiting any longer"); }
+        ULONGLONG ob = g_other_busy_at;
+        if (ob && now - ob < 4000 && now - start < 120000) {
+            if (!ext) {
+                ext = 1;
+                logf_("scene start: the other player is still in the blood-code scene -> waiting on (up to 2 minutes, while his reports come)");
+                char wp[MAX_PATH + 32]; snprintf(wp, sizeof wp, "%sCoopNative.waiting", g_dir);
+                FILE *wf = fopen(wp, "w"); if (wf) { fprintf(wf, "1 %llu\n", (unsigned long long)now); fclose(wf); }
+            }
+            return r;
+        }
+        if (!gaveup) { gaveup = 1; logf_("scene start: %s -> not waiting any longer", ext ? "the other player's reports stopped (or 2 minutes passed)" : "no report after 10 s"); }
     }
     if (r && g_keep_outro && (g_partner_override || memwin) && (caller == OUTRO_POLY_CALLER || caller == OUTRO_POLY_END_CALLER || caller == OUTRO_POLY_FIN_CALLER ||
                               caller == OUTRO_POLY_X_CALLER)) {
@@ -2582,6 +2598,11 @@ static void run_command(char *buf) {
     } else if (strncmp(buf, "partnerunfade ", 14) == 0) {
         unsigned long long pw = 0, sc = 0;
         if (sscanf(buf + 14, "%llx %llx", &pw, &sc) >= 1) { g_punfade_ctx = (uintptr_t)pw; g_punfade_caller = (uintptr_t)sc; InterlockedExchange(&g_punfade_pending, 1); }
+    } else if (strncmp(buf, "otherbusy ", 10) == 0) {
+        int b = atoi(buf + 10);
+        ULONGLONG was = g_other_busy_at;
+        g_other_busy_at = b ? GetTickCount64() : 0;
+        if (!was != !b) logf_("scene start: the other player's blood-code scene %s", b ? "runs (his reports come)" : "has ended");
     } else if (strncmp(buf, "talkscenes", 10) == 0) {
         uintptr_t v[16]; int n = 0; const char *q = buf + 10;
         while (n < 16 && q && *q) { char *end; unsigned long long x = strtoull(q, &end, 16); if (end == q) break; if (x) v[n++] = (uintptr_t)x; q = end; }
