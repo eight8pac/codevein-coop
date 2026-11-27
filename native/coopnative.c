@@ -104,6 +104,7 @@ static volatile LONG g_partner_vote;   // partner vote (defined again with its c
 static volatile LONG g_guest_story_partner_skip;   // guest_story_partner_skip=1 (guest only; story audit 11-27)
 static volatile LONG g_guest_flow_dedupe;          // guest_flow_dedupe=1 (guest only; 11-27 co-op chain trace)
 static volatile LONG g_coop_keep;                  // coop_keep=1 (both roles; 11-27 owner: the connection should persist)
+static volatile LONG g_guest_skip_bc;              // guest_skip_bc_scene=1 (guest only; fallback B, 11-27)
 static volatile ULONGLONG g_own_death_at, g_keep_veto_at;
 static volatile ULONGLONG g_window_processed_at, g_buddymenu_at, g_partner_hold_at;
 static volatile uintptr_t g_talk_scenes[16];   // talk/menu scenes for the partner vote (defined again further down)
@@ -2822,6 +2823,8 @@ static void read_settings(void) {
     LONG gsps = have_ini && as_guest && strstr(buf, "guest_story_partner_skip=1") != NULL;
     LONG gfd = have_ini && as_guest && strstr(buf, "guest_flow_dedupe=1") != NULL;
     LONG ckp = have_ini && strstr(buf, "coop_keep=1") != NULL;
+    LONG gsb = have_ini && as_guest && strstr(buf, "guest_skip_bc_scene=1") != NULL;
+    if (InterlockedExchange(&g_guest_skip_bc, gsb) != gsb) logf_("setting guest_skip_bc_scene = %ld", gsb);
     if (InterlockedExchange(&g_coop_keep, ckp) != ckp) logf_("setting coop_keep = %ld", ckp);
     if (InterlockedExchange(&g_guest_flow_dedupe, gfd) != gfd) logf_("setting guest_flow_dedupe = %ld", gfd);
     if (InterlockedExchange(&g_guest_story_partner_skip, gsps) != gsps) logf_("setting guest_story_partner_skip = %ld", gsps);
@@ -3948,7 +3951,26 @@ static void st_note(int i, void *c, void *st) {
 // own copy -> two registered flows of one class; 2.5 s later his game thread overflowed its stack (the same overflow at the same
 // stack spot as 08:25; round 6's crash had ..._e02000_e02100_C_1 on its stack). guest_flow_dedupe=1: on the guest, InitAsFlowDiagram
 // on a flow whose Role (AActor +0x118) is not Authority (3) is not run, so only his own copy (which plays the chain) is registered.
-static int st_hold(int i, void *c, void *st) {
+static int st_hold(int i, void *c, void *st, void *r) {
+    // fallback B (guest_skip_bc_scene=1): on the guest his own blood-code special poly is not played (it crashed twice on his
+    // parked body). Only when the script bytes are exactly PlaySpecialPoly(self, "GetBC_...", false): EX_Self 0x17, EX_StringConst
+    // 0x1F <text> 0, EX_False 0x28, EX_EndFunctionParms 0x16; Code is moved past them and the call answers false (his flow then
+    // ends there: no Home Base cutscene on his PC; the host's game brings him there).
+    if (g_guest_skip_bc && !g_coop_host && coop_fresh() && strcmp(g_st_name[i], "ScenarioManager:PlaySpecialPoly") == 0) {
+        uintptr_t s = (uintptr_t)st;
+        if (s && readable(s + 0x20, 8)) {
+            uint8_t *code = *(uint8_t **)(s + 0x20);
+            if (code && readable((uintptr_t)code, 96) && code[0] == 0x17 && code[1] == 0x1F && memcmp(code + 2, "GetBC_", 6) == 0) {
+                size_t L = strnlen((const char *)code + 2, 80);
+                if (L < 80 && code[2 + L] == 0 && code[3 + L] == 0x28 && code[4 + L] == 0x16) {
+                    *(uintptr_t *)(s + 0x20) += 5 + L;
+                    if (r) *(uint8_t *)r = 0;
+                    logf_("blood-code scene: PlaySpecialPoly(\"%.*s\") not played on the guest (guest_skip_bc_scene) -> answered false", (int)L, (const char *)code + 2);
+                    return 1;
+                }
+            }
+        }
+    }
     if (!g_guest_flow_dedupe || g_coop_host || !coop_fresh()) return 0;
     if (strcmp(g_st_name[i], "ScenarioActor:InitAsFlowDiagram") != 0) return 0;
     uintptr_t o = (uintptr_t)c, s = (uintptr_t)st;
@@ -3959,7 +3981,7 @@ static int st_hold(int i, void *c, void *st) {
     logf_("flow dedupe: InitAsFlowDiagram on 0x%llX (role %u = the host's copy) -> not registered on the guest (guest_flow_dedupe)", (unsigned long long)o, role);
     return 1;
 }
-#define ST_DETOUR(i) static void st_det_##i(void *c, void *st, void *r) { st_note(i, c, st); if (st_hold(i, c, st)) return; g_st_orig[i](c, st, r); }
+#define ST_DETOUR(i) static void st_det_##i(void *c, void *st, void *r) { st_note(i, c, st); if (st_hold(i, c, st, r)) return; g_st_orig[i](c, st, r); }
 ST_DETOUR(0)
 ST_DETOUR(1)
 ST_DETOUR(2)
@@ -5090,8 +5112,10 @@ static DWORD WINAPI worker(LPVOID unused) {
             // finally ends up on the home base") log-only, entry stubs only (st_gen.py), each call with its object and first literal argument
             logf_("story trace: installing %d hooks (log only)", ST_N);
             for (int i = 0; i < ST_N; i++) install(g_st_name[i], g_st_addr[i], g_st_expect[i], g_st_det[i], (void **)&g_st_orig[i]);
-        } else if (strstr(ini, "guest_flow_dedupe=1")) {
-            for (int i = 0; i < ST_N; i++) if (strcmp(g_st_name[i], "ScenarioActor:InitAsFlowDiagram") == 0) install(g_st_name[i], g_st_addr[i], g_st_expect[i], g_st_det[i], (void **)&g_st_orig[i]);
+        } else if (strstr(ini, "guest_flow_dedupe=1") || strstr(ini, "guest_skip_bc_scene=1")) {
+            for (int i = 0; i < ST_N; i++)
+                if (strcmp(g_st_name[i], "ScenarioActor:InitAsFlowDiagram") == 0 || strcmp(g_st_name[i], "ScenarioManager:PlaySpecialPoly") == 0)
+                    install(g_st_name[i], g_st_addr[i], g_st_expect[i], g_st_det[i], (void **)&g_st_orig[i]);
         }
         if (strstr(ini, "trigger_trace=1")) {
             logf_("trigger trace: installing %d hooks (log only)", TT_N);

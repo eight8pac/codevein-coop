@@ -4672,6 +4672,38 @@ local function groupTeleport()
             if eq > 0 then log("group teleport: " .. eq .. " equipment actor(s) of the held guests hidden too (weapons)") end
             log("group teleport: " .. #pendingTp.held .. " guest character(s) held in the air (hidden) until they are brought")
         end
+        -- (11-27) synced creation (sync_spawn=1): each new character our game creates for us during the chain (cutscene doubles
+        -- included) gets one for every guest at the same moment, next to it, parked (hidden, held). His PC then has a fresh character
+        -- for each of its own cutscenes as ours does: his blood-code scene crashed twice (11-26 20:56, 11-27 10:59, the same stack) on
+        -- the old, parked body from before the memory.
+        if cfOn and iniHas("sync_spawn=1") then
+            local hp = try(function() return localPC().Pawn end)
+            local ha = valid(hp) and name(hp):find("BP_Player_C", 1, true) and try(function() return hp:GetAddress() end)
+            if ha and ha ~= pendingTp.syncHost and ha ~= pendingTp.oldHost then
+                pendingTp.syncHost = ha
+                if not hostInControlNow() then
+                    local helper2 = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+                    for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+                        local g = valid(c) and not try(function() return c:IsLocalController() end) and try(function() return c.Pawn end) or nil
+                        if valid(g) and name(g):find("BP_Player_C", 1, true) and not try(function() return helper2:IsDeath(g) end) then
+                            if respawnGuest(helper2, g, hp, false) then oldPawns[#oldPawns + 1] = { p = g, n = name(g), at = os.clock() } end
+                            log("sync spawn: our game made us a new character (" .. name(hp) .. ") -> a new one for the guest next to it (was " .. name(g) .. "), parked")
+                        end
+                    end
+                end
+            end
+            -- every new guest character (ours or the game's) is parked too
+            pendingTp.heldSet = pendingTp.heldSet or {}
+            for _, g in ipairs(pendingTp.held) do if valid(g) then pendingTp.heldSet[name(g)] = true end end
+            for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+                local g = valid(c) and not try(function() return c:IsLocalController() end) and try(function() return c.Pawn end) or nil
+                if valid(g) and name(g):find("BP_Player_C", 1, true) and not pendingTp.heldSet[name(g)] then
+                    pendingTp.held[#pendingTp.held + 1] = g; pendingTp.heldSet[name(g)] = true
+                    if pcall(function() g:SetActorHiddenInGame(true) end) then tpHidden = tpHidden or {}; tpHidden[#tpHidden + 1] = g end
+                    log("sync spawn: " .. name(g) .. " parked (hidden, held) until we have control")
+                end
+            end
+        end
         for _, g in ipairs(pendingTp.held) do
             local gm = valid(g) and try(function() return g.CharacterMovement end) or nil
             if valid(gm) and try(function() return gm.MovementMode end) ~= 5 then
@@ -4732,10 +4764,21 @@ local function groupTeleport()
         -- a short fade on their side first, so his arrival hold covers the new character until his levels are there
         if pendingTp.chain and not pendingTp.fadeAt then
             pendingTp.fadeAt = os.clock()
+            -- (11-27 10:58 owner: "really awkward for him to have that spawn effect on him right after the boss fight") a guest who is
+            -- already within 40 m of us is un-parked where he is at the bring (no fade, no new character); only the others get the fade
+            local hp = try(function() return localPC().Pawn end)
+            local hl = valid(hp) and try(function() return hp:K2_GetActorLocation() end)
+            pendingTp.near = {}
             for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
                 if valid(c) and not try(function() return c:IsLocalController() end) then
-                    pcall(function() c:ClientMessage("CoopFadeMode:" .. (iniHas("tp_loading=1") and "64" or "48"), FName("None"), 0) end)
-                    pcall(function() c:ClientMessage("CoopTeleportFade", FName("None"), 0) end)
+                    local g = try(function() return c.Pawn end)
+                    local gl = valid(g) and try(function() return g:K2_GetActorLocation() end)
+                    local near = hl and gl and ((hl.X - gl.X) ^ 2 + (hl.Y - gl.Y) ^ 2 + (hl.Z - gl.Z) ^ 2) < 4000 * 4000
+                    pendingTp.near[name(c)] = near and true or false
+                    if not near then
+                        pcall(function() c:ClientMessage("CoopFadeMode:" .. (iniHas("tp_loading=1") and "64" or "48"), FName("None"), 0) end)
+                        pcall(function() c:ClientMessage("CoopTeleportFade", FName("None"), 0) end)
+                    end
                 end
             end
             return
@@ -4758,6 +4801,7 @@ local function groupTeleport()
         memendBring = true
     end
     local cfHome = iniHas("chain_follow=1") and (pendingTp.chain or pendingTp.memend) and hbInBase()
+    local cfB = iniHas("chain_follow=1") and (pendingTp.chain or pendingTp.memend)
     pendingTp = nil
     if cfHome and os.clock() >= hbUntil then hbUntil = os.clock() + 1; log("chain follow: we are in Home Base -> his character is moved, not re-created (Home Base rule)") end
     -- Home Base (2026-11-06): RequestPlayerSpawn gave his new character a teleport driver that hung for good (state 7, no level to wait for: the
@@ -4793,7 +4837,22 @@ local function groupTeleport()
             local isPlayer = valid(p) and name(p):find("BP_Player_C", 1, true) ~= nil
             if isPlayer and not try(function() return helper:IsDeath(p) end) then
                 -- leaving Home Base (owner 11-07): he went through the spawn effect twice; he is behind his fade there, which then lifts from black
-                if respawnGuest(helper, p, mine, not hbLeave and not iniHas("tp_anim=1")) then
+                local dd = nil
+                if cfB then
+                    local a, b = try(function() return p:K2_GetActorLocation() end), try(function() return mine:K2_GetActorLocation() end)
+                    dd = a and b and ((a.X - b.X) ^ 2 + (a.Y - b.Y) ^ 2 + (a.Z - b.Z) ^ 2) or nil
+                end
+                if cfB and dd and dd < 4000 * 4000 then
+                    -- (11-27) un-parked where he is: no new character, no appear effect (he was already with us)
+                    if dd > 500 * 500 then
+                        local hl, right = try(function() return mine:K2_GetActorLocation() end), try(function() return mine:GetActorRightVector() end)
+                        if hl and right then pcall(function() p:K2_TeleportTo({ X = hl.X + right.X * 150, Y = hl.Y + right.Y * 150, Z = hl.Z + 5 }, mine:K2_GetActorRotation()) end) end
+                    end
+                    local gm = try(function() return p.CharacterMovement end)
+                    if valid(gm) then pcall(function() gm:SetMovementMode(1, 0) end) end
+                    log(string.format("chain follow: %s un-parked where he is (%.0f m from us, no new character)", name(p), math.sqrt(dd) / 100))
+                    n = n + 1
+                elseif respawnGuest(helper, p, mine, (not cfB) and not hbLeave and not iniHas("tp_anim=1")) then
                     oldPawns[#oldPawns + 1] = { p = p, n = name(p), at = os.clock() }
                     n = n + 1
                 end
