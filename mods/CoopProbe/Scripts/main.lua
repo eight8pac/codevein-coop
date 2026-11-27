@@ -3621,6 +3621,47 @@ function pvApply(ty, story)
     if story then pcall(pvStoryOutcome, me); pcall(pvHideJoiner, ty) end
     votePopup(partnerName(ty) .. " is the partner now")
 end
+-- Story audit (11-27): Memory_e01900 (the vestige after Oliver Collins) is the only memory with this intro. Every frame until it passes,
+-- its ReceiveTick calls CheckPlayer = CharacterHelper:GetHostActor -> ScenarioCharacterIF:IsPrepared (the HOST's character), then
+-- BindPlayer binds the LOCAL pawn into the "ex" sequence (capsule collision off, animation mode 2, movement mode saved and restored
+-- by UnbindPlayer when the sequence stops). On the guest the check reads his copy of the host's character, which the memory start
+-- re-spawns (11-26 20:37:24 crash in CheckPlayer -> IsPrepared, bad pointer), and the binding moves his server-owned character
+-- ("stuck in the air"). guest_memory_intro_skip=1: while his memory window is open, the guest marks the check as passed
+-- (bPlayerValidity = true) so CheckPlayer, BindPlayer and the intro sequence never run there; the memory goes on as after the intro.
+-- If the binding already happened, UnbindPlayer restores his character first.
+mintroDone = {}
+function memIntroGuestTick()
+    if not iniHas("guest_memory_intro_skip=1") then return end
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not valid(gs) or try(function() return gs.Role end) == 3 then return end
+    local f = io.open(WIN64 .. "\\plugins\\CoopNative.guestmem", "r"); if not f then return end
+    local w = f:read("*l"); f:close()
+    if w ~= "1" then return end
+    for _, m in ipairs(FindAllOf("Memory_e01900_C") or {}) do
+        local a = valid(m) and try(function() return m:GetAddress() end)
+        if a and not mintroDone[a] then
+            mintroDone[a] = true
+            local was = try(function() return m.bPlayerValidity end)
+            local bound = try(function() return m.bBinding end)
+            local un = bound == true and pcall(function() m:UnbindPlayer() end)
+            if bound == true then pcall(function() m.bBinding = false end) end
+            local ok = pcall(function() m.bPlayerValidity = true end)
+            log("memory intro (guest): " .. name(m) .. " host-character check " .. (was == true and "had already passed" or "marked as passed") ..
+                (bound == true and (", binding undone " .. tostring(un)) or ", not bound") .. " (" .. tostring(ok) .. ")")
+        end
+    end
+end
+-- (11-27) e01803 (after Oliver Collins) puts every PC into walk-only (no dash / attack / step / field menu) and only e01806 (the
+-- vestige scene) lifts it, right before its PlayMemoryResidue. A guest whose own vestige scene does not run kept it. With
+-- guest_walk_release=1 the guest lifts it the same way when the host's memory starts (relay CoopMemoryStart).
+function guestWalkRelease()
+    if not iniHas("guest_walk_release=1") then return end
+    local mine = try(function() return localPC().Pawn end)
+    local hlp = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+    if not valid(mine) or not valid(hlp) then log("walk release (guest): no character / helper"); return end
+    local ok, e = pcall(function() hlp:ClearRestrictedActionInBaseInfo(mine) end)
+    log("walk release (guest): the host's memory started -> action limits lifted as the vestige scene does (" .. (ok and "ok" or tostring(e):sub(1, 80)) .. ")")
+end
 ptsAt, ptsLast = -1000, nil
 function partnerTalkScenes(now)
     if now - ptsAt < 0.5 then return end
@@ -5336,6 +5377,7 @@ local function sceneRelay()
             -- (11-26 20:56) after the memory our character was let go in the air when our screen came back for the final scene (the
             -- host brings us only after it), fell and died: until we stand next to the host (3 minutes at most) the hold stays
             if text == "CoopMemoryEnd" then memEndHoldUntil = os.clock() + 180 end
+            if text == "CoopMemoryStart" then pcall(guestWalkRelease) end
         elseif text == "CoopSkip" then
             local comp = FindFirstOf("SkipEventUIComponent")
             if on and valid(comp) then local af = io.open(WIN64 .. "\\plugins\\CoopNative.allowskip", "w"); if af then af:write("1"); af:close() end end
@@ -9215,6 +9257,7 @@ LoopAsync(200, function()
         pcall(restUiTick)
         pcall(rvTick)
         pcall(partnerTick)
+        pcall(memIntroGuestTick)
         pcall(namesTick)
         pcall(enemyStateTick)
         pcall(difficultyTick)

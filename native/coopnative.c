@@ -100,6 +100,7 @@ static volatile LONG g_coop_on;
 static volatile LONG g_coop_host;
 static volatile ULONGLONG g_coop_at, g_vest_menu_at;
 static volatile LONG g_partner_vote;   // partner vote (defined again with its code further down)
+static volatile LONG g_guest_story_partner_skip;   // guest_story_partner_skip=1 (guest only; story audit 11-27)
 static volatile ULONGLONG g_window_processed_at, g_buddymenu_at, g_partner_hold_at;
 static volatile uintptr_t g_talk_scenes[16];   // talk/menu scenes for the partner vote (defined again further down)
 static volatile LONG g_talk_scene_n;
@@ -2745,6 +2746,8 @@ static void read_settings(void) {
     LONG gdoor = have_ini && as_guest && strstr(buf, "guest_doors=1") != NULL;
     if (InterlockedExchange(&g_guest_doors, gdoor) != gdoor) logf_("setting guest_doors = %ld", gdoor);
     LONG pvote = have_ini && strstr(buf, "partner_vote=1") != NULL;
+    LONG gsps = have_ini && as_guest && strstr(buf, "guest_story_partner_skip=1") != NULL;
+    if (InterlockedExchange(&g_guest_story_partner_skip, gsps) != gsps) logf_("setting guest_story_partner_skip = %ld", gsps);
     if (InterlockedExchange(&g_partner_vote, pvote) != pvote) logf_("setting partner_vote = %ld", pvote);
     LONG grel = have_ini && as_guest && strstr(buf, "guest_releasers=1") != NULL;
     if (InterlockedExchange(&g_guest_releasers, grel) != grel) logf_("setting guest_releasers = %ld", grel);
@@ -3654,6 +3657,26 @@ static int partner_hold(int i, void *ctx, void *st) {
     int is_set = strcmp(n, "CharacterHelper:SetBuddy") == 0;
     int is_follow = strcmp(n, "CharacterHelper:BuddyInstanceDestroy") == 0 || strcmp(n, "CharacterHelper:RemoveBuddyVolatileSave") == 0 ||
                     strcmp(n, "CharacterHelper:BuddySpawn") == 0;
+    int is_reset = strcmp(n, "CharacterHelper:ResetBuddy") == 0;
+    // Story audit (11-27): field story flows run on every PC and change the LOCAL player's partner (e01803 ResetBuddy, e01806 SetBuddy
+    // Louis after Oliver Collins; prologue e01203/e01206 ResetBuddy, e01300 ResetBuddy + SetBuddy Oliver). On a guest nothing can spawn
+    // that partner (the spawn needs the GameMode, host only), so his game holds "partner = Louis" with no partner: the 11-26 20:56 crash
+    // in the blood-code scene had the partner interface on the stack. With guest_story_partner_skip=1 the guest skips them (the host
+    // owns the one shared partner). Round 5 (20:37, skipped) vs round 6 (20:53, run): his memory ended 2 s after its start in both, so
+    // the skip did not end it early; the round-5 crash was the memory's own check of the host's character (Memory_e01900 CheckPlayer).
+    if (is_reset) {
+        if (g_coop_host || !g_guest_story_partner_skip || !coop_fresh()) return 0;
+        uintptr_t s0 = (uintptr_t)st;
+        if (!s0 || !readable(s0 + 0x18, 0x18) || *(uintptr_t *)(s0 + 0x20) == 0) return 0;
+        void *o0 = *(void **)(s0 + 0x18);
+        if (talk_scene_listed((uintptr_t)o0)) return 0;   // a menu's dismiss: runs as before
+        uintptr_t target = 0;
+        ((frame_step_fn)ADDR_FRAME_STEP)(st, o0, &target);
+        *(uintptr_t *)(s0 + 0x20) += 1;   // P_FINISH
+        logf_("partner: ResetBuddy(0x%llX) on the guest from a story scene (0x%llX) -> skipped (guest_story_partner_skip; the host owns the partner)",
+              (unsigned long long)target, (unsigned long long)(uintptr_t)o0);
+        return 1;
+    }
     // a guest's change never runs on his PC in co-op (it hangs there); partner_vote only decides whether the host asks everyone first
     if ((!is_set && !is_follow) || !coop_fresh() || (g_coop_host && !g_partner_vote)) return 0;
     uintptr_t s = (uintptr_t)st;
@@ -3663,9 +3686,17 @@ static int partner_hold(int i, void *ctx, void *st) {
     void *obj = *(void **)(s + 0x18);
     int choice = talk_scene_listed((uintptr_t)obj) || (g_buddymenu_at && now - g_buddymenu_at < 3000);
     if (is_set) {
-        // (11-26 20:37) forced story changes run on every PC, guests included: skipping one inside the memory scene after the first
-        // boss left the guest's memory inconsistent (it ended at once) and his game crashed on the memory's first player check
-        if (!choice) { logf_("partner: SetBuddy on the %s without a choice just before (story) -> runs as always", guest ? "guest" : "host"); return 0; }
+        // forced story changes: on the host they run as always; on a guest they run unless guest_story_partner_skip=1 (see above)
+        if (!choice && !(guest && g_guest_story_partner_skip)) { logf_("partner: SetBuddy on the %s without a choice just before (story) -> runs as always", guest ? "guest" : "host"); return 0; }
+        if (!choice) {
+            uintptr_t target = 0; uint64_t type = 0;
+            ((frame_step_fn)ADDR_FRAME_STEP)(st, obj, &target);
+            ((frame_step_fn)ADDR_FRAME_STEP)(st, obj, &type);
+            *(uintptr_t *)(s + 0x20) += 1;   // P_FINISH
+            logf_("partner: SetBuddy(0x%llX, type %u) on the guest from a story scene (0x%llX) -> skipped (guest_story_partner_skip; the host owns the partner)",
+                  (unsigned long long)target, (unsigned)(type & 0xFF), (unsigned long long)(uintptr_t)obj);
+            return 1;
+        }
         uintptr_t target = 0; uint64_t type = 0;
         ((frame_step_fn)ADDR_FRAME_STEP)(st, obj, &target);
         ((frame_step_fn)ADDR_FRAME_STEP)(st, obj, &type);
