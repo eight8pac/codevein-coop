@@ -718,7 +718,19 @@ local function groupRespawn(rested)
                 downed[n] = d
                 log("group respawn: " .. n .. " died in the field -> respawns " .. (lastMistle and "at the last Mistle" or "next to the host (no Mistle used yet)") .. " after " .. RESPAWN_DELAY .. " s")
             end
-            if os.clock() - d.at >= RESPAWN_DELAY and not d.done then d.done = true; respawnGuest(helper, p, hostPawn, true, lastMistle) end   -- one try per death
+            -- (11-27) chain_follow: not while we have no control (he was put next to our hidden cutscene character at a spot without
+            -- floor and died again); the last Mistle only when it is near us (the story may have taken us elsewhere)
+            local cfWait = iniHas("chain_follow=1") and (not hostInControl(1.0) or gtPending == true)
+            if cfWait and not d.waitLogged then d.waitLogged = true; log("group respawn: " .. n .. " waits until we have control of our character") end
+            if os.clock() - d.at >= RESPAWN_DELAY and not d.done and not cfWait then
+                d.done = true
+                local m = lastMistle
+                if m and iniHas("chain_follow=1") then
+                    local hl = try(function() return hostPawn:K2_GetActorLocation() end)
+                    if not hl or ((hl.X - m.X) ^ 2 + (hl.Y - m.Y) ^ 2 + (hl.Z - m.Z) ^ 2) > 20000 * 20000 then m = nil end
+                end
+                respawnGuest(helper, p, hostPawn, true, m)
+            end   -- one try per death
         end
     end
     for n in pairs(downed) do if not seen[n] then downed[n] = nil end end
@@ -3703,6 +3715,20 @@ end
 -- "blood code acquired" prompt that goes on only when this player presses continue), the other player's game is told every second
 -- (guest -> host: kind 30; host -> guests: ClientMessage CoopBusy:1), once more with 0 when it ends. Its CoopNative then keeps the
 -- next cutscene's start waiting (the game's own "both ready" sync) until we are through. CoopNative.waiting -> a message here.
+-- (11-27, coop_keep=1) our character died: CoopNative blocks the game's death end of co-op for 60 s (the group respawn brings us back)
+mdLast = nil
+function myDeathTick()
+    if not iniHas("coop_keep=1") then return end
+    local p = try(function() return localPC().Pawn end)
+    if not valid(p) then return end
+    local a = try(function() return p:GetAddress() end)
+    local h = StaticFindObject("/Script/Extensions.Default__CharacterHelper")
+    if a and a ~= mdLast and try(function() return h:IsDeath(p) end) == true then
+        mdLast = a
+        vmCmd("mydeath")
+        log("coop keep: our character died -> the game's death end of co-op is blocked for 60 s")
+    end
+end
 busyAt, busySent, waitShown = -1000, nil, nil
 function busyTick()
     if not iniHas("scene_busy_wait=1") then return end
@@ -3713,7 +3739,9 @@ function busyTick()
     if not valid(gs) then return end
     local isHost = try(function() return gs.Role end) == 3
     local mine = false
-    for _, s in ipairs(FindAllOf("BP_ScenarioGetBC_C") or {}) do if valid(s) then mine = true; break end end
+    -- (11-27 09:50) only our OWN blood-code scene (Role 3): his game also has a network copy of the host's (Role 1), which made
+    -- the host wait for its own scene
+    for _, s in ipairs(FindAllOf("BP_ScenarioGetBC_C") or {}) do if valid(s) and try(function() return s.Role end) == 3 then mine = true; break end end
     if mine or busySent == true then
         local v = mine and 1 or 0
         if isHost then
@@ -4499,7 +4527,61 @@ function hpRefillTick()
         end
     end
 end
+-- Chain follow (chain_follow=1, host; owner 11-27: "anytime my character is created and I get control of it, the guest should get to
+-- move his too"). Solo chain trace 11-27: during a story chain the host's game swaps its character for a PlayerSpawner placeholder
+-- at the target (no body, no physics), streams the target's levels and only then creates the new character (8 times from the
+-- boss kill to Home Base); the guest's game cannot create characters, so his body stayed where it was and fell when the levels
+-- under it went away (11-27 09:50:15 at the memory end), which also ended his own copy of the story chain.
+-- Now: when our character is replaced by a placeholder or a hidden cutscene double, the guests are parked (held in the air, hidden:
+-- the group-teleport hold, no fade, so their own copies of the cutscenes stay visible); once we have had control of our new
+-- character for 1 s (a player character, visible, walking, no scene playing, move input not ignored), each guest gets a short fade
+-- and a new character next to us (his arrival hold waits for his levels). The memory end follows the same rule.
+function hostInControlNow()
+    local pc = localPC()
+    local p = valid(pc) and try(function() return pc.Pawn end) or nil
+    if not valid(p) or not name(p):find("BP_Player_C", 1, true) then return false end
+    if try(function() return p.bHidden end) == true then return false end
+    local cm = try(function() return p.CharacterMovement end)
+    if not valid(cm) or try(function() return cm.MovementMode end) ~= 1 then return false end
+    local sm = StaticFindObject("/Script/Extensions.Default__ScenarioManager")
+    if try(function() return sm:IsScenarioPlaying(p) end) == true then return false end
+    if try(function() return pc:IsMoveInputIgnored() end) == true then return false end
+    return true
+end
+hicSince = nil
+function hostInControl(sec) return hicSince ~= nil and os.clock() - hicSince >= (sec or 1.0) end
+cfArmed, cfLastCtl = true, nil
+function chainFollowTick()
+    if hostInControlNow() then hicSince = hicSince or os.clock() else hicSince = nil end
+    if not iniHas("chain_follow=1") or not iniHas("group_teleport=1") then return end
+    local gs = FindFirstOf("BP_AppGameState_C")
+    if not valid(gs) or try(function() return gs.Role end) ~= 3 then return end
+    local pc = localPC()
+    local p = valid(pc) and try(function() return pc.Pawn end) or nil
+    if hostInControl(0.2) then cfArmed = true; cfLastCtl = try(function() return p:GetAddress() end); return end
+    if not cfArmed or pendingTp or not cfLastCtl then return end
+    local guests = 0
+    for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+        local g = valid(c) and not try(function() return c:IsLocalController() end) and try(function() return c.Pawn end) or nil
+        if valid(g) and name(g):find("BP_Player_C", 1, true) then guests = guests + 1 end
+    end
+    if guests == 0 then return end
+    local pn = valid(p) and name(p) or "none"
+    local sm = StaticFindObject("/Script/Extensions.Default__ScenarioManager")
+    local placeholder = pn:find("PlayerSpawner", 1, true) ~= nil
+    local double = valid(p) and try(function() return p:GetAddress() end) ~= cfLastCtl and try(function() return p.bHidden end) == true and
+        try(function() return sm:IsScenarioPlaying(p) end) == true
+    if placeholder or double then
+        cfArmed = false
+        local f = io.open(TELEPORT_PATH, "w")
+        if f then f:write("start quiet chain nofade"); f:close() end
+        log("chain follow: our character was replaced (" .. pn .. (placeholder and ", placeholder" or ", cutscene double") .. ") -> " .. guests ..
+            " guest(s) parked until we have control of our new character")
+    end
+end
 local function groupTeleport()
+    gtPending = pendingTp ~= nil   -- (global copy for groupRespawn, which sits above the pendingTp local)
+    pcall(chainFollowTick)
     pcall(progressMirrorTick)
     pcall(fallVoiceTick)
     pcall(itemCensusTick)
@@ -4519,7 +4601,7 @@ local function groupTeleport()
             -- ground at the cutscene spot). For the memory-end teleport ("start memend") the guests follow only once the host can
             -- move again (cutscene over: move input not ignored for 2 s), up to 3 minutes.
             pendingTp = { at = os.clock(), oldHost = valid(m0) and try(function() return m0:GetAddress() end) or nil, memend = what:find("memend") ~= nil,
-                          quiet = what:find("quiet") ~= nil, nofade = what:find("nofade") ~= nil, warp = what:find("warp") ~= nil,
+                          quiet = what:find("quiet") ~= nil, nofade = what:find("nofade") ~= nil, warp = what:find("warp") ~= nil, chain = what:find("chain") ~= nil,
                           hostStart = valid(m0) and try(function() return m0:K2_GetActorLocation() end) or nil }
             -- (kit 252) "quiet" = a restoration memory's teleport: no Mistle teleport animation and no loading-screen gate (the game's own
             -- deferred teleport covers the host); "nofade" = a memory vote runs, his screen stays visible for the vote dialog
@@ -4562,7 +4644,9 @@ local function groupTeleport()
         tpHidden = {}
     end
     if not pendingTp then return end
-    if iniHas("tp_hold=1") and not pendingTp.memend and os.clock() >= hbUntil and not hbLeave and os.clock() - pendingTp.at >= 1.2 then
+    -- (11-27) with chain_follow also at the memory end: his body was not held there and fell when the memory level went away
+    local cfOn = iniHas("chain_follow=1") and (pendingTp.chain or pendingTp.memend)
+    if iniHas("tp_hold=1") and (not pendingTp.memend or cfOn) and os.clock() >= hbUntil and not hbLeave and os.clock() - pendingTp.at >= (pendingTp.chain and 0 or 1.2) then
         if not pendingTp.held then
             pendingTp.held = {}
             for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
@@ -4596,9 +4680,11 @@ local function groupTeleport()
             end
         end
     end
-    local limit = pendingTp.memend and 300 or ((arrHold and arrHold.gate) and 150 or 60)
+    local limit = (pendingTp.memend or pendingTp.chain) and 300 or ((arrHold and arrHold.gate) and 150 or 60)
     if os.clock() - pendingTp.at > limit then
-        if pendingTp.memend and not pendingTp.finishedAt then
+        if pendingTp.chain and not pendingTp.forceBring then
+            log("chain follow: no control of a new character within " .. limit .. " s -> bringing the guests anyway"); pendingTp.forceBring = true
+        elseif pendingTp.memend and not pendingTp.finishedAt then
             log("group teleport: no finished report within " .. limit .. " s -> bringing the guests anyway")
             pendingTp.finishedAt = os.clock() - 2
         elseif not pendingTp.memend then
@@ -4635,6 +4721,27 @@ local function groupTeleport()
         end
     end
     -- arrived: CoopNative saw the characters re-spawn, and the host's pawn is a new one (the address alone changed during loading)
+    -- (11-27) chain follow: the guests come only once we have had control of our new character for 1 s (never to a cutscene spot)
+    if iniHas("chain_follow=1") and (pendingTp.chain or pendingTp.memend) then
+        if not hostInControl(1.0) and not pendingTp.forceBring then return end
+        pendingTp.arrivedAt = pendingTp.arrivedAt or os.clock()
+        pendingTp.oldHost = -1
+        pendingTp.newSeenAt = pendingTp.newSeenAt or (os.clock() - 3)
+        pendingTp.finishedAt = pendingTp.finishedAt or (os.clock() - 2)
+        if not pendingTp.ctlLogged then pendingTp.ctlLogged = true; log("chain follow: we have control of our new character -> bringing the guests") end
+        -- a short fade on their side first, so his arrival hold covers the new character until his levels are there
+        if pendingTp.chain and not pendingTp.fadeAt then
+            pendingTp.fadeAt = os.clock()
+            for _, c in ipairs(FindAllOf("ActionPlayerController_C") or {}) do
+                if valid(c) and not try(function() return c:IsLocalController() end) then
+                    pcall(function() c:ClientMessage("CoopFadeMode:" .. (iniHas("tp_loading=1") and "64" or "48"), FName("None"), 0) end)
+                    pcall(function() c:ClientMessage("CoopTeleportFade", FName("None"), 0) end)
+                end
+            end
+            return
+        end
+        if pendingTp.chain and os.clock() - pendingTp.fadeAt < 0.6 then return end
+    end
     local arrived = pendingTp.arrivedAt and addr and (addr ~= pendingTp.oldHost or pendingTp.warpMoved)
     if not arrived then return end
     pendingTp.newSeenAt = pendingTp.newSeenAt or os.clock()
@@ -4650,7 +4757,9 @@ local function groupTeleport()
         log("group teleport: the final cutscene finished -> bringing the guests")
         memendBring = true
     end
+    local cfHome = iniHas("chain_follow=1") and (pendingTp.chain or pendingTp.memend) and hbInBase()
     pendingTp = nil
+    if cfHome and os.clock() >= hbUntil then hbUntil = os.clock() + 1; log("chain follow: we are in Home Base -> his character is moved, not re-created (Home Base rule)") end
     -- Home Base (2026-11-06): RequestPlayerSpawn gave his new character a teleport driver that hung for good (state 7, no level to wait for: the
     -- host had already loaded everything), with the host behind a loading screen. Move his existing character instead, as the memory
     -- follow does: no driver. His PC loads Home Base itself; he hovers until his geometry is there (CoopHB -> hbWatch on his side).
@@ -9395,6 +9504,7 @@ LoopAsync(200, function()
         pcall(partnerTick)
         pcall(memIntroGuestTick)
         pcall(busyTick)
+        pcall(myDeathTick)
         pcall(storyTimelineTick)
         pcall(namesTick)
         pcall(enemyStateTick)

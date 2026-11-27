@@ -103,6 +103,8 @@ static volatile ULONGLONG g_coop_at, g_vest_menu_at;
 static volatile LONG g_partner_vote;   // partner vote (defined again with its code further down)
 static volatile LONG g_guest_story_partner_skip;   // guest_story_partner_skip=1 (guest only; story audit 11-27)
 static volatile LONG g_guest_flow_dedupe;          // guest_flow_dedupe=1 (guest only; 11-27 co-op chain trace)
+static volatile LONG g_coop_keep;                  // coop_keep=1 (both roles; 11-27 owner: the connection should persist)
+static volatile ULONGLONG g_own_death_at, g_keep_veto_at;
 static volatile ULONGLONG g_window_processed_at, g_buddymenu_at, g_partner_hold_at;
 static volatile uintptr_t g_talk_scenes[16];   // talk/menu scenes for the partner vote (defined again further down)
 static volatile LONG g_talk_scene_n;
@@ -1146,6 +1148,12 @@ static int window_now(void) {
 
 static void detour_end_coop(void *sm) {
     uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    // (11-27, coop_keep=1) EndCooperativeMode's only direct caller is the player-death handler: a death no longer ends co-op
+    if (g_coop_keep) {
+        g_keep_veto_at = GetTickCount64();
+        logf_("EndCooperativeMode from 0x%llX  *** VETOED (coop_keep: a death does not end co-op) ***", (unsigned long long)caller);
+        return;
+    }
     if (g_veto_enabled && window_now()) {
         logf_("EndCooperativeMode from 0x%llX  *** VETOED (spectate window) ***", (unsigned long long)caller);
         g_vetoed_sm = sm; InterlockedExchange(&g_vetoed_kind, 2);
@@ -1268,8 +1276,8 @@ static areanotify_fn g_orig_area_notify;
 static int in_teleport_window(void);
 static uint64_t detour_area_notify(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h, void *i, void *j, void *k, void *l) {
     if ((uintptr_t)__builtin_return_address(0) == CALLER_AREA_NOTIFY) {
-        if ((g_group_teleport || g_keep_outro || g_fog_free) && in_teleport_window()) {
-            logf_("teleport: area-entry \"no multiplayer here\" step skipped (group_teleport)");
+        if (((g_group_teleport || g_keep_outro || g_fog_free) && in_teleport_window()) || g_coop_keep) {
+            logf_("teleport: area-entry \"no multiplayer here\" step skipped (%s)", g_coop_keep ? "coop_keep" : "group_teleport");
             return 0;
         }
         logf_("area-entry \"no multiplayer here\" step (allowed)");
@@ -1311,6 +1319,25 @@ static void detour_switch_end_coop(void *sm) {
             logf_("SwitchToEndCoop from 0x%llX  *** VETOED (group_teleport: area entry, %ld so far) ***", (unsigned long long)caller, n);
         }
         return;
+    }
+    // (11-27, owner: "the network connection should persist at all times, and the games functions to call them off are disabled unless
+    // the guest specifically leaves the game or the host ceases cooperation") coop_keep=1: the game-logic ends are blocked: entering
+    // another area (0x146D627CF), a Mistle teleport (0x146678D02), the death end (0x14633CFA0, within 60 s of our own death: 11-27
+    // 09:50:32 his death sent him home) and any end within 10 s after a blocked one (its follow-up steps, e.g. 0x14082BEDC). Always
+    // open: the session monitor's "no other player left" (0x146E653C0: the other player is really gone), and every other path (his
+    // own leaving, the title, the join reset 0x14082BEDC about 35 s after every start).
+    if (g_coop_keep && caller != CALLER_NO_PLAYERS_LEFT) {
+        ULONGLONG now = GetTickCount64();
+        const char *why = NULL;
+        if (caller == CALLER_AREA_END_COOP) why = "entering another area";
+        else if (caller == CALLER_TELEPORT_END_COOP) why = "Mistle teleport";
+        else if (caller == 0x14633CFA0ULL && g_own_death_at && now - g_own_death_at < 60000) why = "death";
+        else if (g_keep_veto_at && now - g_keep_veto_at < 10000) why = "follow-up of a blocked end";
+        if (why) {
+            g_keep_veto_at = now;
+            logf_("SwitchToEndCoop from 0x%llX  *** VETOED (coop_keep: %s) ***", (unsigned long long)caller, why);
+            return;
+        }
     }
     if (g_veto_enabled && caller != CALLER_NO_PLAYERS_LEFT && window_now()) {
         logf_("SwitchToEndCoop from 0x%llX  *** VETOED (spectate window) ***", (unsigned long long)caller);
@@ -2618,6 +2645,9 @@ static void run_command(char *buf) {
     } else if (strncmp(buf, "partnerunfade ", 14) == 0) {
         unsigned long long pw = 0, sc = 0;
         if (sscanf(buf + 14, "%llx %llx", &pw, &sc) >= 1) { g_punfade_ctx = (uintptr_t)pw; g_punfade_caller = (uintptr_t)sc; InterlockedExchange(&g_punfade_pending, 1); }
+    } else if (strncmp(buf, "mydeath", 7) == 0) {
+        g_own_death_at = GetTickCount64();
+        logf_("coop keep: our character died -> the death end of co-op is blocked for 60 s");
     } else if (strncmp(buf, "otherbusy ", 10) == 0) {
         int b = atoi(buf + 10);
         ULONGLONG was = g_other_busy_at;
@@ -2791,6 +2821,8 @@ static void read_settings(void) {
     LONG pvote = have_ini && strstr(buf, "partner_vote=1") != NULL;
     LONG gsps = have_ini && as_guest && strstr(buf, "guest_story_partner_skip=1") != NULL;
     LONG gfd = have_ini && as_guest && strstr(buf, "guest_flow_dedupe=1") != NULL;
+    LONG ckp = have_ini && strstr(buf, "coop_keep=1") != NULL;
+    if (InterlockedExchange(&g_coop_keep, ckp) != ckp) logf_("setting coop_keep = %ld", ckp);
     if (InterlockedExchange(&g_guest_flow_dedupe, gfd) != gfd) logf_("setting guest_flow_dedupe = %ld", gfd);
     if (InterlockedExchange(&g_guest_story_partner_skip, gsps) != gsps) logf_("setting guest_story_partner_skip = %ld", gsps);
     if (InterlockedExchange(&g_partner_vote, pvote) != pvote) logf_("setting partner_vote = %ld", pvote);
